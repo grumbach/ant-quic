@@ -120,6 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `connect_peer_with_addrs` after a fast pre-pass failure, complete after the
   gate opens. Guards check that the pre-pass path still completes and that
   dials to a silent target stay bounded (no second full wait).
+- **`simultaneous_connect_dedup::test_tiebreaker_deterministic` waits for both
+  ends to settle (#317).** It read `connected_peers()` as soon as both
+  `connect_addr` calls returned. At that moment the end that must register the
+  winner as an inbound connection has not yet done so, so the test saw each end
+  holding its own outbound connection and failed in 45–75% of runs. The
+  tiebreaker chose the same winner on both ends in every diagnosed run. The
+  test now waits (up to 10 s) until both ends keep the same QUIC connection,
+  then checks that they hold opposite sides of it.
 
 ## [0.27.57] - 2026-10-09
 
