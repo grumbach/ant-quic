@@ -15288,10 +15288,10 @@ mod tests {
             .expect("coordination accepted is handled");
         assert!(handled, "coordination accepted must be consumed");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !endpoint
+        while endpoint
             .active_sessions
             .get(&target_peer)
-            .is_some_and(|session| session.session_state.connection.is_some())
+            .is_none_or(|session| session.session_state.connection.is_none())
         {
             assert!(
                 std::time::Instant::now() < deadline,
