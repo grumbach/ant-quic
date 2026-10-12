@@ -10,17 +10,22 @@
 //!
 //! A loopback UDP gate sits between the dialer and the target. While the gate
 //! is closed it holds every datagram from the dialer, so the QUIC handshake
-//! cannot complete before the test opens the gate. The gate opens after
-//! [`GATE_HOLD`], which is longer than the adaptive direct-stage budget
-//! (4 x 333 ms + 750 ms = 2.082 s at the default initial RTT). This is a
-//! controlled model of a slow handshake under CPU contention: the handshake
-//! cannot finish early, and the caller's establishment budget is much longer
-//! than the hold. The result does not depend on scheduler luck.
+//! cannot complete before the test opens the gate. The hold starts when the
+//! gate holds the first datagram of the tested attempt, and it lasts
+//! [`GATE_HOLD`]. That is longer than the adaptive direct-stage budget
+//! (4 x 333 ms + 750 ms = 2.082 s at the default initial RTT), which starts
+//! before the attempt sends that datagram. A delay before the tested attempt
+//! (task start, a failed pre-pass) therefore cannot shorten the hold below
+//! the budget under test. This is a controlled model of a slow handshake
+//! under CPU contention: the handshake cannot finish early, and the caller's
+//! establishment budget is much longer than the hold.
 //!
 //! In "reject first" mode the gate answers the first connection attempt with
-//! a Version Negotiation packet that lists only a reserved version. The
-//! dialer then fails that attempt fast, which models a direct pre-pass that
-//! fails for a transient reason before the fallback ladder re-dials.
+//! a Version Negotiation packet that lists only a reserved version, and it
+//! does not hold those datagrams. The dialer then fails that attempt fast,
+//! which models a direct pre-pass that fails for a transient reason before
+//! the fallback ladder re-dials. The first held datagram, and so the start of
+//! the hold, then belongs to the re-dial.
 //!
 //! All sockets bind to 127.0.0.1 with OS-assigned ports.
 
@@ -118,6 +123,8 @@ fn version_negotiation(client_dcid: &[u8], client_scid: &[u8]) -> Vec<u8> {
 struct HandshakeGate {
     addr: SocketAddr,
     open: watch::Sender<bool>,
+    /// When the gate held its first datagram (the start of the tested attempt).
+    first_held: watch::Receiver<Option<tokio::time::Instant>>,
     held: Arc<AtomicUsize>,
     rejected: Arc<AtomicUsize>,
     forwarder: JoinHandle<()>,
@@ -133,6 +140,7 @@ impl HandshakeGate {
             .expect("gate back socket binds");
         let addr = front.local_addr().expect("gate front address");
         let (open, mut open_rx) = watch::channel(false);
+        let (first_held_tx, first_held) = watch::channel(None);
         let held = Arc::new(AtomicUsize::new(0));
         let rejected = Arc::new(AtomicUsize::new(0));
         let held_count = Arc::clone(&held);
@@ -165,7 +173,9 @@ impl HandshakeGate {
                         if is_open {
                             let _ = back.send_to(datagram, target).await;
                         } else if queue.len() < MAX_HELD_DATAGRAMS {
-                            held_count.fetch_add(1, Ordering::SeqCst);
+                            if held_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                                first_held_tx.send_replace(Some(tokio::time::Instant::now()));
+                            }
                             queue.push(datagram.to_vec());
                         }
                     }
@@ -193,6 +203,7 @@ impl HandshakeGate {
         Self {
             addr,
             open,
+            first_held,
             held,
             rejected,
             forwarder,
@@ -201,6 +212,20 @@ impl HandshakeGate {
 
     fn open(&self) {
         self.open.send_replace(true);
+    }
+
+    /// Wait until the gate holds its first datagram, and return when that was.
+    /// `None` means the forwarder stopped before it held a datagram.
+    async fn first_held_at(&self) -> Option<tokio::time::Instant> {
+        let mut first_held = self.first_held.clone();
+        loop {
+            if let Some(at) = *first_held.borrow_and_update() {
+                return Some(at);
+            }
+            if first_held.changed().await.is_err() {
+                return *first_held.borrow();
+            }
+        }
     }
 
     fn held(&self) -> usize {
@@ -220,43 +245,61 @@ impl Drop for HandshakeGate {
 
 struct GatedDial<T> {
     returned_while_gated: bool,
-    /// Time from the dial start until the dial returned.
-    elapsed: Duration,
+    /// Time from the dial start until the tested attempt reached the gate.
+    attempt_started_after: Duration,
+    /// Time from the tested attempt's first held datagram until the dial
+    /// returned.
+    returned_after: Duration,
     result: Result<T, EndpointError>,
 }
 
 /// Run `dial` as a task that also reports when it returned.
-fn spawn_timed_dial<T, F>(
-    started: tokio::time::Instant,
-    dial: F,
-) -> JoinHandle<(Duration, Result<T, EndpointError>)>
+fn spawn_timed_dial<T, F>(dial: F) -> JoinHandle<(tokio::time::Instant, Result<T, EndpointError>)>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, EndpointError>> + Send + 'static,
 {
     tokio::spawn(async move {
         let result = dial.await;
-        (started.elapsed(), result)
+        (tokio::time::Instant::now(), result)
     })
 }
 
-/// Hold the gate closed for [`GATE_HOLD`], record whether the dial already
-/// returned, then open the gate and wait for the dial (bounded).
+/// Wait until the tested attempt sends its first datagram into the closed
+/// gate. Hold the gate closed for [`GATE_HOLD`] from that moment, record
+/// whether the dial already returned, then open the gate and wait for the
+/// dial (bounded).
 async fn finish_after_gate<T: Send + 'static>(
     gate: &HandshakeGate,
     started: tokio::time::Instant,
-    dial: JoinHandle<(Duration, Result<T, EndpointError>)>,
+    mut dial: JoinHandle<(tokio::time::Instant, Result<T, EndpointError>)>,
 ) -> GatedDial<T> {
-    tokio::time::sleep_until(started + GATE_HOLD).await;
+    let attempt_seen = timeout(ESTABLISHMENT_BUDGET, async {
+        tokio::select! {
+            seen = gate.first_held_at() => seen.expect("the gate forwarder holds a datagram"),
+            joined = &mut dial => {
+                let (_, result) = joined.expect("dial task joins");
+                panic!(
+                    "the dial returned before its tested attempt reached the gate: {:?}",
+                    result.err().map(|error| error.to_string())
+                );
+            }
+        }
+    })
+    .await
+    .expect("the tested attempt sends its handshake into the closed gate");
+
+    tokio::time::sleep_until(attempt_seen + GATE_HOLD).await;
     let returned_while_gated = dial.is_finished();
     gate.open();
-    let (elapsed, result) = timeout(ESTABLISHMENT_BUDGET + BOUND_SLACK, dial)
+    let (returned_at, result) = timeout(ESTABLISHMENT_BUDGET + BOUND_SLACK, dial)
         .await
         .expect("dial stays bounded by the establishment budget")
         .expect("dial task joins");
     GatedDial {
         returned_while_gated,
-        elapsed,
+        attempt_started_after: attempt_seen.saturating_duration_since(started),
+        returned_after: returned_at.saturating_duration_since(attempt_seen),
         result,
     }
 }
@@ -283,7 +326,7 @@ async fn fallback_peer_dial_survives_slow_direct_handshake() {
     let started = tokio::time::Instant::now();
     let dial = {
         let dialer = dialer.clone();
-        spawn_timed_dial(started, async move {
+        spawn_timed_dial(async move {
             dialer
                 .connect_with_fallback(Some(gate_addr), None, None, Some(target_id))
                 .await
@@ -302,10 +345,11 @@ async fn fallback_peer_dial_survives_slow_direct_handshake() {
             assert_eq!(method, ConnectionMethod::DirectIPv4);
         }
         Err(error) => panic!(
-            "PeerId fallback dial returned after {:?} (while gated: {}) with \
+            "PeerId fallback dial returned {:?} after its attempt reached the gate \
+             (attempt started {:?} after the dial; returned while gated: {}) with \
              `{error}`; its handshake could finish after {GATE_HOLD:?} and the \
              caller's {ESTABLISHMENT_BUDGET:?} budget had not expired",
-            outcome.elapsed, outcome.returned_while_gated
+            outcome.returned_after, outcome.attempt_started_after, outcome.returned_while_gated
         ),
     }
 
@@ -329,7 +373,7 @@ async fn peer_dial_redial_after_fast_prepass_failure_survives_slow_handshake() {
     let started = tokio::time::Instant::now();
     let dial = {
         let dialer = dialer.clone();
-        spawn_timed_dial(started, async move {
+        spawn_timed_dial(async move {
             dialer
                 .connect_peer_with_addrs(target_id, vec![gate_addr])
                 .await
@@ -351,10 +395,11 @@ async fn peer_dial_redial_after_fast_prepass_failure_survives_slow_handshake() {
             assert_eq!(connection.peer_id, target_id);
         }
         Err(error) => panic!(
-            "PeerId dial returned after {:?} (while gated: {}) with `{error}`; \
-             the fallback re-dial could finish after {GATE_HOLD:?} and the caller's \
-             {ESTABLISHMENT_BUDGET:?} budget had not expired",
-            outcome.elapsed, outcome.returned_while_gated
+            "PeerId dial returned {:?} after its fallback re-dial reached the gate \
+             (re-dial started {:?} after the dial; returned while gated: {}) with \
+             `{error}`; the re-dial could finish after {GATE_HOLD:?} and the \
+             caller's {ESTABLISHMENT_BUDGET:?} budget had not expired",
+            outcome.returned_after, outcome.attempt_started_after, outcome.returned_while_gated
         ),
     }
 
@@ -377,7 +422,7 @@ async fn peer_dial_prepass_survives_slow_handshake() {
     let started = tokio::time::Instant::now();
     let dial = {
         let dialer = dialer.clone();
-        spawn_timed_dial(started, async move {
+        spawn_timed_dial(async move {
             dialer
                 .connect_peer_with_addrs(target_id, vec![gate_addr])
                 .await
@@ -395,8 +440,9 @@ async fn peer_dial_prepass_survives_slow_handshake() {
             assert_eq!(connection.peer_id, target_id);
         }
         Err(error) => panic!(
-            "PeerId pre-pass dial returned after {:?} (while gated: {}) with `{error}`",
-            outcome.elapsed, outcome.returned_while_gated
+            "PeerId pre-pass dial returned {:?} after its attempt reached the gate \
+             (returned while gated: {}) with `{error}`",
+            outcome.returned_after, outcome.returned_while_gated
         ),
     }
 
