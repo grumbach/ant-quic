@@ -1,6 +1,6 @@
 # ADR-017: Single-Arbiter, Evidence-Gated Connection Retirement
 
-- **Status:** Proposed. Decided by the controller under David's delegation D259 (2026-10-12), decision C-313-3 (D1 = N1). The repository's ADR configuration (`.adr-kit.yaml`: `human_acceptance_required: true`, `ai_may_accept: false`) and `AGENTS.md` reserve the Accepted status for a human, so this file stays Proposed until a human commit marks it Accepted.
+- **Status:** Accepted (2026-10-13). Accepted by David Irvine, ruling D261 (2026-10-13): the ADR is accepted once Codex approves the code, and Codex approved it on 2026-10-13. Decided by the controller under David's delegation D259 (2026-10-12), decision C-313-3 (D1 = N1).
 - **Date:** 2026-10-12
 - **Decision owners:** David Irvine (delegated to the x0x controller, D259)
 - **Reviewers:** Codex (cross-model review), x0x controller
