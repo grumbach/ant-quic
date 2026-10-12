@@ -105,6 +105,25 @@ use crate::transport::{ProtocolEngine, TransportAddr, TransportRegistry};
 use crate::unified_config::{AutoConnectPolicy, P2pConfig, TrustPolicy};
 use crate::{ConnectionCloseReason, Side};
 
+/// #313 round 3 (ADR-017 A4.2): how long a reader restart waits for the
+/// stopped owner of a connection to exit before it aborts that owner.
+const RECOVERY_STOPPED_OWNER_GRACE: Duration = Duration::from_secs(5);
+
+/// #313 round 3: the longest pause between reader restart attempts.
+const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// #313 round 3: what owns a connection's reader slot, as a reader restart
+/// sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderOwnerCheck {
+    /// A running owner whose cancel has not fired: it accepts streams.
+    Accepting,
+    /// A running owner whose cancel has fired (the drain stopped it).
+    Stopped,
+    /// No running owner (exiting, exited, stopping or none).
+    Absent,
+}
+
 /// Event channel capacity
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Peer lifecycle event channel capacity.
@@ -9984,25 +10003,39 @@ impl P2pEndpoint {
         }
     }
 
-    /// #313 R2: restart the reader of a connection whose retirement was
-    /// aborted, or that a repromotion took back from a retirement claim. Its
-    /// previous owner was stopped by the drain; admission waits (bounded)
-    /// until that owner has exited and its record is reaped.
+    /// #313 R2 (ADR-017 A4.2): own the reader restart of a connection whose
+    /// retirement claim ended (an abort, or a repromotion that took it back)
+    /// until a reader that accepts streams runs on it, the connection
+    /// closes, or the endpoint shuts down. It never gives up while the
+    /// connection is open (#313 round 3, findings 1 and 2):
     ///
-    /// #313 round 2 (P1-2): an owner that is still running but whose cancel
-    /// already fired is the stopped one, so the restart waits for it too. In
-    /// every outcome the recovery then releases its claim on the restart.
+    /// - Success is only a running, unfinished owner whose cancel has not
+    ///   fired, seen under one reader lock: a reader this restart admitted,
+    ///   or one that another path started.
+    /// - A running owner whose cancel has fired is the one the drain
+    ///   stopped. It exits at its next accept boundary, and the restart
+    ///   waits for that and for its record to be reaped. It can wait inside
+    ///   an inline request for a FIN that does not come; after
+    ///   `RECOVERY_STOPPED_OWNER_GRACE` the restart aborts it, so that a new
+    ///   reader can be admitted.
+    /// - Exiting, exited, stopping and absent owners are retried.
+    ///
+    /// Retries back off from 20 ms to 1 s. On every attempt the restart
+    /// refreshes the lifecycle's pending mark, so repromotion and the #368
+    /// janitor do not close the connection as readerless meanwhile.
     async fn resume_reader_after_abort(
         &self,
         peer_id: PeerId,
         connection: crate::high_level::Connection,
     ) {
         let stable_id = connection.stable_id();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut backoff = Duration::from_millis(20);
+        let mut stopped_since: Option<Instant> = None;
         loop {
-            if connection.close_reason().is_some() {
+            if connection.close_reason().is_some() || self.shutdown.is_cancelled() {
                 break;
             }
+            self.inner.mark_reader_restart_pending(&peer_id, stable_id);
             match self
                 .start_reader(peer_id, connection.clone(), ReaderStartMode::Resume)
                 .await
@@ -10015,39 +10048,68 @@ impl P2pEndpoint {
                         retirement_test_hooks::Point::RecoveryAfterAlreadyOwned,
                     )
                     .await;
-                    if !self.reader_owner_stopping(&peer_id, stable_id).await {
-                        break;
+                    match self.reader_owner_state(&peer_id, stable_id).await {
+                        ReaderOwnerCheck::Accepting => break,
+                        ReaderOwnerCheck::Stopped => {
+                            let since = *stopped_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= RECOVERY_STOPPED_OWNER_GRACE {
+                                self.abort_stopped_reader_owner(&peer_id, stable_id).await;
+                            }
+                        }
+                        ReaderOwnerCheck::Absent => {}
                     }
                 }
                 ReaderStart::Blocked => {}
             }
-            if Instant::now() >= deadline {
-                warn!(
-                    peer_id = ?peer_id,
-                    stable_id,
-                    "could not restart the reader of an aborted retirement"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(RECOVERY_BACKOFF_MAX);
         }
         self.inner.clear_reader_restart_pending(&peer_id, stable_id);
     }
 
-    /// #313 round 2 (P1-2): true while the running owner of `stable_id` has
-    /// been cancelled (it exits at its next accept boundary).
-    async fn reader_owner_stopping(&self, peer_id: &PeerId, stable_id: usize) -> bool {
-        self.reader_handles
-            .read()
-            .await
-            .get(peer_id)
-            .is_some_and(|handles| {
-                handles.iter().any(|handle| {
-                    handle.conn_stable_id == stable_id
-                        && handle.is_running()
-                        && handle.cancel.is_cancelled()
-                })
-            })
+    /// #313 round 3: the reader owner of `stable_id`, seen under one lock.
+    async fn reader_owner_state(&self, peer_id: &PeerId, stable_id: usize) -> ReaderOwnerCheck {
+        let handles = self.reader_handles.read().await;
+        let owners = handles.get(peer_id).into_iter().flatten().filter(|handle| {
+            handle.conn_stable_id == stable_id
+                && handle.is_running()
+                && !handle.abort_handle.is_finished()
+        });
+        let mut stopped = false;
+        for owner in owners {
+            if !owner.cancel.is_cancelled() {
+                return ReaderOwnerCheck::Accepting;
+            }
+            stopped = true;
+        }
+        if stopped {
+            ReaderOwnerCheck::Stopped
+        } else {
+            ReaderOwnerCheck::Absent
+        }
+    }
+
+    /// #313 round 3 (finding 2): abort the stopped owner of `stable_id` (its
+    /// cancel has fired, and it still waits inside a stream). Its record
+    /// goes once the task has ended; the restart then admits a new reader.
+    /// The aborted task drops the stream it was reading.
+    async fn abort_stopped_reader_owner(&self, peer_id: &PeerId, stable_id: usize) {
+        let mut handles = self.reader_handles.write().await;
+        if let Some(entries) = handles.get_mut(peer_id) {
+            for handle in entries.iter_mut().filter(|handle| {
+                handle.conn_stable_id == stable_id
+                    && handle.is_running()
+                    && handle.cancel.is_cancelled()
+            }) {
+                warn!(
+                    peer_id = ?peer_id,
+                    stable_id,
+                    "aborting a stopped reader that did not exit, to restart the connection's reader"
+                );
+                handle.state = ReaderOwnerState::Stopping;
+                handle.abort_handle.abort();
+            }
+        }
     }
 
     /// #368 backstop janitor: every 5 s, close open tracked connections

@@ -428,12 +428,13 @@ pub(crate) struct TrackedConnection {
     /// #313 R2 (ADR-017 E2): a probe pinned to this connection, issued in the
     /// Live period with this epoch, was answered at this instant.
     confirmed: Option<(u64, Instant)>,
-    /// #313 round 2 (ADR-017 A4.1): a retirement recovery (abort, or the
+    /// #313 round 2 (ADR-017 A4.2): a retirement recovery (abort, or the
     /// repromotion of a Retiring entry) owns this connection's reader
-    /// restart since this time (Unix ms). Until the P2P layer admits a new
-    /// reader, or `READER_RESTART_GRACE_MS` passes, neither repromotion nor
-    /// the #368 janitor treats it as readerless.
-    reader_restart_pending_since_ms: Option<u64>,
+    /// restart. The recovery refreshes this time (monotonic) while it runs.
+    /// Until the P2P layer admits a new reader, or `READER_RESTART_GRACE`
+    /// passes without a refresh, neither repromotion nor the #368 janitor
+    /// treats the connection as readerless.
+    reader_restart_pending_since: Option<Instant>,
 }
 
 /// #313 R2: source of lifecycle epochs (Live periods and retirement
@@ -441,8 +442,10 @@ pub(crate) struct TrackedConnection {
 static LIFECYCLE_EPOCHS: AtomicU64 = AtomicU64::new(1);
 
 /// #313 round 2: how long a retirement recovery's pending reader restart
-/// keeps a connection out of the readerless cleanup.
-const READER_RESTART_GRACE_MS: u64 = 30_000;
+/// keeps a connection out of the readerless cleanup after the recovery last
+/// refreshed it (round 3: the recovery refreshes it at least every second
+/// while it runs, so this only expires if the recovery is gone).
+const READER_RESTART_GRACE: Duration = Duration::from_secs(30);
 
 fn next_lifecycle_epoch() -> u64 {
     LIFECYCLE_EPOCHS.fetch_add(1, Ordering::Relaxed)
@@ -481,9 +484,9 @@ impl TrackedConnection {
 
     /// #313 round 2: a retirement recovery owns this connection's reader
     /// restart, within the grace.
-    fn reader_restart_pending(&self, now_ms: u64) -> bool {
-        self.reader_restart_pending_since_ms
-            .is_some_and(|since| now_ms.saturating_sub(since) < READER_RESTART_GRACE_MS)
+    fn reader_restart_pending(&self) -> bool {
+        self.reader_restart_pending_since
+            .is_some_and(|since| since.elapsed() < READER_RESTART_GRACE)
     }
 
     fn snapshot(&self) -> ConnectionLifecycleSnapshot {
@@ -567,7 +570,7 @@ pub(crate) fn tracked_connection_with_sort_keys_for_test(
         obligation_epoch: None,
         live_period: Some((next_lifecycle_epoch(), Instant::now())),
         confirmed: None,
-        reader_restart_pending_since_ms: None,
+        reader_restart_pending_since: None,
     }
 }
 
@@ -8203,7 +8206,7 @@ impl NatTraversalEndpoint {
             obligation_epoch: None,
             live_period: Some((next_lifecycle_epoch(), Instant::now())),
             confirmed: None,
-            reader_restart_pending_since_ms: None,
+            reader_restart_pending_since: None,
         };
 
         /// How the locked decision treats the candidate.
@@ -8514,7 +8517,7 @@ impl NatTraversalEndpoint {
             obligation_epoch: Some(next_lifecycle_epoch()),
             live_period: None,
             confirmed: None,
-            reader_restart_pending_since_ms: None,
+            reader_restart_pending_since: None,
         };
         Self::log_lifecycle_transition(
             peer_id,
@@ -9039,7 +9042,7 @@ impl NatTraversalEndpoint {
             // #313 round 2 (P1-1): the drain stopped this reader; the abort
             // owns its restart, so repromotion and the janitor must not close
             // it as readerless meanwhile.
-            entry.reader_restart_pending_since_ms = Some(now_unix_ms());
+            entry.reader_restart_pending_since = Some(Instant::now());
             Self::log_lifecycle_transition(
                 peer_id,
                 entry.generation,
@@ -9089,7 +9092,21 @@ impl NatTraversalEndpoint {
                 .iter_mut()
                 .find(|entry| entry.stable_id() == stable_id)
         }) {
-            entry.reader_restart_pending_since_ms = None;
+            entry.reader_restart_pending_since = None;
+        }
+    }
+
+    /// #313 round 3: a recovery owns `stable_id`'s reader restart and is
+    /// still running. Set (or refresh) the pending mark; the recovery calls
+    /// this at least every second, and clears the mark when it ends.
+    pub(crate) fn mark_reader_restart_pending(&self, peer_id: &PeerId, stable_id: usize) {
+        let mut lifecycle = self.connection_lifecycle.write();
+        if let Some(entry) = lifecycle.get_mut(peer_id).and_then(|entries| {
+            entries
+                .iter_mut()
+                .find(|entry| entry.stable_id() == stable_id)
+        }) {
+            entry.reader_restart_pending_since = Some(Instant::now());
         }
     }
 
@@ -9383,7 +9400,7 @@ impl NatTraversalEndpoint {
                 }
                 // #313 round 2 (P1-1): a retirement recovery is restarting its
                 // reader.
-                if entry.reader_restart_pending(now_ms) {
+                if entry.reader_restart_pending() {
                     continue;
                 }
                 if !self.generation_has_live_reader(peer_id, entry.generation, entry.stable_id()) {
@@ -9514,7 +9531,7 @@ impl NatTraversalEndpoint {
                 entries[index].state,
                 ConnectionLifecycleState::Retiring { .. }
             );
-            let restart_pending = entries[index].reader_restart_pending(now_unix_ms());
+            let restart_pending = entries[index].reader_restart_pending();
             if !aged
                 || raw_live_winner
                 || retiring
@@ -9578,7 +9595,7 @@ impl NatTraversalEndpoint {
         if matches!(replacement.state, ConnectionLifecycleState::Retiring { .. }) {
             // #313 round 2 (P1-1, P1-3): this promotion ends a retirement
             // claim; the drain owns the reader restart.
-            replacement.reader_restart_pending_since_ms = Some(now_unix_ms());
+            replacement.reader_restart_pending_since = Some(Instant::now());
         }
         if !matches!(replacement.state, ConnectionLifecycleState::Live) {
             info!(
@@ -17486,7 +17503,7 @@ mod tests {
                 obligation_epoch: None,
                 live_period: None,
                 confirmed: None,
-                reader_restart_pending_since_ms: None,
+                reader_restart_pending_since: None,
             }],
         );
     }
@@ -17633,7 +17650,7 @@ mod tests {
                 obligation_epoch: None,
                 live_period: None,
                 confirmed: None,
-                reader_restart_pending_since_ms: None,
+                reader_restart_pending_since: None,
             }],
         );
         dead_conn.close(VarInt::from_u32(0), b"#277-dead-live");
@@ -17761,7 +17778,7 @@ mod tests {
                         obligation_epoch: None,
                         live_period: None,
                         confirmed: None,
-                        reader_restart_pending_since_ms: None,
+                        reader_restart_pending_since: None,
                     },
                     TrackedConnection {
                         connection: conn2.clone(),
@@ -17775,7 +17792,7 @@ mod tests {
                         obligation_epoch: None,
                         live_period: None,
                         confirmed: None,
-                        reader_restart_pending_since_ms: None,
+                        reader_restart_pending_since: None,
                     },
                 ],
             );
@@ -18059,7 +18076,7 @@ mod tests {
                     obligation_epoch: None,
                     live_period: None,
                     confirmed: None,
-                    reader_restart_pending_since_ms: None,
+                    reader_restart_pending_since: None,
                 },
                 TrackedConnection {
                     connection: w_conn.clone(),
@@ -18073,7 +18090,7 @@ mod tests {
                     obligation_epoch: None,
                     live_period: None,
                     confirmed: None,
-                    reader_restart_pending_since_ms: None,
+                    reader_restart_pending_since: None,
                 },
             ],
         );
@@ -18180,7 +18197,7 @@ mod tests {
                     obligation_epoch: None,
                     live_period: None,
                     confirmed: None,
-                    reader_restart_pending_since_ms: None,
+                    reader_restart_pending_since: None,
                 },
                 TrackedConnection {
                     connection: g2_a_conn.clone(),
@@ -18194,7 +18211,7 @@ mod tests {
                     obligation_epoch: None,
                     live_period: None,
                     confirmed: None,
-                    reader_restart_pending_since_ms: None,
+                    reader_restart_pending_since: None,
                 },
             ],
         );
@@ -18215,7 +18232,7 @@ mod tests {
                 obligation_epoch: None,
                 live_period: None,
                 confirmed: None,
-                reader_restart_pending_since_ms: None,
+                reader_restart_pending_since: None,
             }],
         );
         endpoint.connections.insert(peer_b, g2_b_conn.clone());

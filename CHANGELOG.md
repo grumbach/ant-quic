@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection back, the retirement is aborted: the connection is kept (it is
   never closed as readerless while its reader restarts), a stale drain never
   stops the reader of a connection it no longer holds, and the restarted
-  reader is seen as live by the #368 cleanup. The other end (the **follower**) never retires; when the arbiter
+  reader is seen as live by the #368 cleanup. The reader restart does not
+  give up while the connection is open: it waits for the stopped reader to
+  exit (it aborts that reader after 5 s if it still waits inside a stream)
+  and succeeds only when a reader that accepts streams runs. The other end (the **follower**) never retires; when the arbiter
   probes a connection, the follower confirms it with its own probe and makes
   it its winner. Neither end pre-cancels a reader that starts late on a
   superseded connection any more: that reader reads it until the arbiter
