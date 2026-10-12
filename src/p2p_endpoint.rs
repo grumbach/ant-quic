@@ -745,6 +745,127 @@ pub(crate) mod reader_test_hooks {
             hooks.wait_released().await;
         }
     }
+
+    /// #313 Part 2 (R2): a pause, per `(endpoint key, stable_id)`, inside the
+    /// reader's accept loop just before it handles an inbound bidi stream, so
+    /// a test can hold inline ACK-v2 handling in flight.
+    #[derive(Default)]
+    pub(crate) struct BidiPause {
+        pub(crate) paused: AtomicBool,
+        released: AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl BidiPause {
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        pub(crate) async fn wait_until_paused(&self) {
+            while !self.paused.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    type BidiPauseMap = HashMap<(usize, usize), Arc<BidiPause>>;
+    static BIDI_PAUSES: LazyLock<parking_lot::Mutex<BidiPauseMap>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    pub(crate) fn arm_bidi_pause(endpoint_key: usize, stable_id: usize) -> Arc<BidiPause> {
+        let pause = Arc::new(BidiPause::default());
+        BIDI_PAUSES
+            .lock()
+            .insert((endpoint_key, stable_id), Arc::clone(&pause));
+        pause
+    }
+
+    pub(crate) async fn bidi_point(endpoint_key: usize, stable_id: usize) {
+        let pause = BIDI_PAUSES.lock().remove(&(endpoint_key, stable_id));
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.paused.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let notified = pause.notify.notified();
+            if pause.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// #313 Part 2 (R2) test-only controls of the retirement policy, keyed by the
+/// endpoint (its `reader_handles` pointer, like [`reader_test_hooks`]). Inert
+/// unless a test sets them.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) mod retirement_test_hooks {
+    // The R2 retirement executor reads these controls; until it exists they
+    // are only written by tests.
+    #![allow(dead_code)]
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+
+    /// Retirement timing for one endpoint (see `RetirementTiming`).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Timing {
+        pub(crate) quiet: Duration,
+        pub(crate) freshness: Duration,
+        pub(crate) tick: Duration,
+        pub(crate) probe_interval: Duration,
+        pub(crate) drain_cap: Duration,
+    }
+
+    impl Timing {
+        /// Short timings for loopback tests.
+        pub(crate) fn fast() -> Self {
+            Self {
+                quiet: Duration::from_millis(1500),
+                freshness: Duration::from_secs(3),
+                tick: Duration::from_millis(200),
+                probe_interval: Duration::from_millis(300),
+                drain_cap: Duration::from_secs(10),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub(crate) struct EndpointHooks {
+        pub(crate) timing: parking_lot::Mutex<Option<Timing>>,
+        /// Emulate a peer that runs master's retirement: the 5 s supersede
+        /// timers of the finalize, relay and accept re-key paths, no
+        /// retirement executor, and no follow.
+        pub(crate) legacy: AtomicBool,
+        /// The follower never follows the arbiter's winner.
+        pub(crate) follow_suppressed: AtomicBool,
+        /// Retirement claims this endpoint made.
+        pub(crate) claims: AtomicUsize,
+        /// Retirements this endpoint completed (closed).
+        pub(crate) completions: AtomicUsize,
+        /// Retirements this endpoint aborted (the replacement died).
+        pub(crate) aborts: AtomicUsize,
+        /// Follows this endpoint committed as a follower.
+        pub(crate) follows: AtomicUsize,
+    }
+
+    static HOOKS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<EndpointHooks>>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// The hooks of `endpoint_key`, created on first use.
+    pub(crate) fn hooks(endpoint_key: usize) -> Arc<EndpointHooks> {
+        Arc::clone(HOOKS.lock().entry(endpoint_key).or_default())
+    }
+
+    pub(crate) fn get(endpoint_key: usize) -> Option<Arc<EndpointHooks>> {
+        HOOKS.lock().get(&endpoint_key).cloned()
+    }
 }
 
 impl PeerHintRecord {
@@ -10160,10 +10281,10 @@ impl P2pEndpoint {
         let app_bi_tx = self.app_bi_tx.clone();
         let conn_stable_id = connection.stable_id();
         #[cfg(all(test, feature = "network-discovery"))]
-        let (test_hooks, test_attempt) = reader_test_hooks::note_start(
-            Arc::as_ptr(&self.reader_handles) as usize,
-            conn_stable_id,
-        );
+        let test_endpoint_key = Arc::as_ptr(&self.reader_handles) as usize;
+        #[cfg(all(test, feature = "network-discovery"))]
+        let (test_hooks, test_attempt) =
+            reader_test_hooks::note_start(test_endpoint_key, conn_stable_id);
         let lifecycle_snapshot = self
             .inner
             .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
@@ -10344,6 +10465,8 @@ impl P2pEndpoint {
                 reader_test_hooks::note_accept(task_test_hooks.as_ref(), test_attempt);
                 let recv_stream = match incoming {
                     IncomingStream::AckBidi { send, recv } => {
+                        #[cfg(all(test, feature = "network-discovery"))]
+                        reader_test_hooks::bidi_point(test_endpoint_key, conn_stable_id).await;
                         if !Self::handle_bidi_stream_inline(
                             &ack_bidi_serialization,
                             &inner,
@@ -20147,6 +20270,1274 @@ mod tests {
                     h.close_reason()
                 );
 
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+        }
+
+        /// #313 Part 2, slice R2: retirement under ADR-017 (N1). The arbiter
+        /// of a peer pair (the end with the greater PeerId) is the only end
+        /// that retires, and only on evidence that the follower reads the
+        /// connection it keeps. Each test runs with short retirement timings
+        /// (`retirement_test_hooks::Timing::fast`, Q = 1.5 s) unless it says
+        /// otherwise.
+        mod retirement_n1_313 {
+            use super::*;
+            use crate::connection_lifecycle::ConnectionLifecycleState as State;
+            use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
+
+            type Keypair = (MlDsaPublicKey, MlDsaSecretKey);
+
+            /// Generous bound for a retirement: Q, a few executor passes, the
+            /// probe exchanges and close propagation.
+            const RETIRE_WITHIN: Duration = Duration::from_secs(15);
+
+            fn identity() -> (Keypair, PeerId) {
+                let (public_key, secret_key) =
+                    crate::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair()
+                        .expect("keypair");
+                let peer_id = crate::crypto::raw_public_keys::pqc::derive_peer_id_from_public_key(
+                    &public_key,
+                );
+                ((public_key, secret_key), peer_id)
+            }
+
+            /// Two identities, the first with the greater PeerId: the
+            /// arbiter of the pair.
+            fn ordered_identities() -> ((Keypair, PeerId), (Keypair, PeerId)) {
+                let first = identity();
+                let second = identity();
+                if first.1.0 > second.1.0 {
+                    (first, second)
+                } else {
+                    (second, first)
+                }
+            }
+
+            async fn keyed_node(keypair: &Keypair) -> Arc<P2pEndpoint> {
+                let node = Arc::new(
+                    P2pEndpoint::new(
+                        P2pConfig::builder()
+                            .bind_addr(std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                0,
+                            ))
+                            .nat(crate::NatConfig {
+                                enable_relay_fallback: false,
+                                ..Default::default()
+                            })
+                            .pqc(crate::PqcConfig::default())
+                            .keypair(keypair.0.clone(), keypair.1.clone())
+                            .build()
+                            .expect("test config"),
+                    )
+                    .await
+                    .expect("node"),
+                );
+                set_timing(&node, retirement_test_hooks::Timing::fast());
+                node
+            }
+
+            fn set_timing(node: &P2pEndpoint, timing: retirement_test_hooks::Timing) {
+                *retirement_test_hooks::hooks(node.reader_hooks_key())
+                    .timing
+                    .lock() = Some(timing);
+            }
+
+            fn hooks(node: &P2pEndpoint) -> Arc<retirement_test_hooks::EndpointHooks> {
+                retirement_test_hooks::hooks(node.reader_hooks_key())
+            }
+
+            fn claims(node: &P2pEndpoint) -> usize {
+                hooks(node).claims.load(AtomicOrdering::SeqCst)
+            }
+
+            fn completions(node: &P2pEndpoint) -> usize {
+                hooks(node).completions.load(AtomicOrdering::SeqCst)
+            }
+
+            fn follows(node: &P2pEndpoint) -> usize {
+                hooks(node).follows.load(AtomicOrdering::SeqCst)
+            }
+
+            /// `(lifecycle connection id, state)` of every open connection
+            /// `node` tracks for `peer`.
+            fn open_ids(node: &P2pEndpoint, peer: &PeerId) -> Vec<([u8; 32], State)> {
+                node.inner
+                    .open_lifecycle_entries_for_test(peer)
+                    .into_iter()
+                    .map(|(_, connection_id, state)| (connection_id, state))
+                    .collect()
+            }
+
+            fn connection_id_of(node: &P2pEndpoint, peer: &PeerId, stable_id: usize) -> [u8; 32] {
+                node.inner
+                    .connection_snapshot_by_stable_id(peer, stable_id)
+                    .expect("tracked")
+                    .connection_id
+            }
+
+            async fn wait_until(within: Duration, what: &str, mut condition: impl FnMut() -> bool) {
+                let deadline = tokio::time::Instant::now() + within;
+                while !condition() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "timed out waiting until {what}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+
+            /// The application close the remote end saw on `connection`.
+            fn remote_close_reason(connection: &QuicConnection) -> Option<ConnectionCloseReason> {
+                match connection.close_reason() {
+                    Some(crate::ConnectionError::ApplicationClosed(frame)) => {
+                        ConnectionCloseReason::from_app_error_code(frame.error_code)
+                    }
+                    _ => None,
+                }
+            }
+
+            /// Wait until both ends track exactly one open connection for the
+            /// pair, the same one, and return its lifecycle connection id.
+            async fn wait_for_convergence(
+                a: &P2pEndpoint,
+                b: &P2pEndpoint,
+                within: Duration,
+            ) -> [u8; 32] {
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let deadline = tokio::time::Instant::now() + within;
+                loop {
+                    let at_a = open_ids(a, &b_peer);
+                    let at_b = open_ids(b, &a_peer);
+                    if at_a.len() == 1 && at_b.len() == 1 && at_a[0].0 == at_b[0].0 {
+                        return at_a[0].0;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the pair did not converge on one connection: A tracks {} open \
+                         ({:?}), B tracks {} open ({:?})",
+                        at_a.len(),
+                        at_a.iter()
+                            .map(|(_, state)| state.name())
+                            .collect::<Vec<_>>(),
+                        at_b.len(),
+                        at_b.iter()
+                            .map(|(_, state)| state.name())
+                            .collect::<Vec<_>>()
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            /// Messages travel both ways between `a` and `b`.
+            async fn assert_delivery_both_ways(a: &P2pEndpoint, b: &P2pEndpoint, tag: &str) {
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let to_b = format!("{tag}: A to B");
+                a.send(&b_peer, to_b.as_bytes()).await.expect("A sends");
+                assert!(
+                    recv_within(b, a_peer, to_b.as_bytes(), RECV_WINDOW).await,
+                    "{tag}: A to B not delivered"
+                );
+                let to_a = format!("{tag}: B to A");
+                b.send(&a_peer, to_a.as_bytes()).await.expect("B sends");
+                assert!(
+                    recv_within(a, b_peer, to_a.as_bytes(), RECV_WINDOW).await,
+                    "{tag}: B to A not delivered"
+                );
+            }
+
+            /// RED on R1 and master (#315). B and B' share one identity and
+            /// both dial the arbiter A, so at A the two inbound connections
+            /// are one initiator family and C2 supersedes C1. Only the
+            /// outbound paths ever closed a superseded generation, so C1 stayed
+            /// open. Under N1 the arbiter A retires C1 once B' reads C2.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_arbiter_retires_an_inbound_superseded_connection() {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                let a_addr = shim_addr(&a);
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                let _accept_b2 = shim_accept(&b2);
+
+                tokio::time::timeout(Duration::from_secs(10), b.connect_addr(a_addr))
+                    .await
+                    .expect("C1 connect timeout")
+                    .expect("C1 connect");
+                let a_c1 = wait_for_winner(&a, &b_peer, "A registers C1", |_| true).await;
+                let b_c1 = wait_for_winner(&b, &a_peer, "B's C1", |_| true).await;
+                tokio::time::timeout(Duration::from_secs(10), b2.connect_addr(a_addr))
+                    .await
+                    .expect("C2 connect timeout")
+                    .expect("C2 connect");
+                let a_c2 = wait_for_winner(&a, &b_peer, "C2 supersedes C1 at A", |connection| {
+                    connection.stable_id() != a_c1.stable_id()
+                })
+                .await;
+                let b2_c2 = wait_for_winner(&b2, &a_peer, "B''s C2", |_| true).await;
+
+                wait_until(RETIRE_WITHIN, "the arbiter A retires C1", || {
+                    b_c1.close_reason().is_some()
+                })
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_c1),
+                    Some(ConnectionCloseReason::Superseded),
+                    "C1 is retired with the reserved Superseded code"
+                );
+                assert!(b2_c2.close_reason().is_none(), "C2 stays open");
+                assert!(a_c2.close_reason().is_none(), "A's winner C2 stays open");
+                assert_eq!(claims(&b), 0, "the follower B claims nothing");
+                assert_eq!(claims(&b2), 0, "the follower B' claims nothing");
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// Control, GREEN on R1 and master (role mirror of the test
+            /// above). When A is the follower it never retires: the inbound
+            /// superseded C1 stays open and A still reads it.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_follower_keeps_an_inbound_superseded_connection() {
+                let ((b_key, b_peer), (a_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                let a_addr = shim_addr(&a);
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                let _accept_b2 = shim_accept(&b2);
+
+                tokio::time::timeout(Duration::from_secs(10), b.connect_addr(a_addr))
+                    .await
+                    .expect("C1 connect timeout")
+                    .expect("C1 connect");
+                let a_c1 = wait_for_winner(&a, &b_peer, "A registers C1", |_| true).await;
+                let b_c1 = wait_for_winner(&b, &a_peer, "B's C1", |_| true).await;
+                tokio::time::timeout(Duration::from_secs(10), b2.connect_addr(a_addr))
+                    .await
+                    .expect("C2 connect timeout")
+                    .expect("C2 connect");
+                wait_for_winner(&a, &b_peer, "C2 supersedes C1 at A", |connection| {
+                    connection.stable_id() != a_c1.stable_id()
+                })
+                .await;
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "the follower A must not retire C1: {:?}",
+                    b_c1.close_reason()
+                );
+                let payload = b"313 n1: B to the follower A on C1";
+                b.send(&a_peer, payload)
+                    .await
+                    .expect("B sends on its only connection C1");
+                assert!(
+                    recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                    "the follower A still reads C1"
+                );
+                assert_eq!(claims(&a), 0, "the follower A claims nothing");
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// RED on R1 and master (#315 G1/G2/G3, Codex P2-4). G1 is
+            /// accepted and read. G2 and G3 (B' and B'', B's identity)
+            /// register while A's accept loop is stopped, so G2 is a stale
+            /// pending accept. While the winner G3 has no reader at A, the
+            /// arbiter must not retire anything (E1). Once A accepts and reads
+            /// G3, it retires G1 and G2: their obligations live in the
+            /// lifecycle, not in the accept queue.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_stale_pending_accepts_are_retired_only_after_the_winner_is_read() {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let b3 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                let a_addr = shim_addr(&a);
+                let _accept_b = shim_accept(&b);
+                let _accept_b2 = shim_accept(&b2);
+                let _accept_b3 = shim_accept(&b3);
+
+                tokio::time::timeout(Duration::from_secs(10), b.connect_addr(a_addr))
+                    .await
+                    .expect("G1 connect timeout")
+                    .expect("G1 connect");
+                tokio::time::timeout(Duration::from_secs(10), a.accept())
+                    .await
+                    .expect("A accepts G1")
+                    .expect("G1 accepted");
+                let a_g1 = wait_for_winner(&a, &b_peer, "A's G1", |_| true).await;
+                wait_for_reader(&a, &b_peer, a_g1.stable_id(), "A's reader on G1").await;
+                let b_g1 = wait_for_winner(&b, &a_peer, "B's G1", |_| true).await;
+
+                for (node, what) in [(&b2, "G2"), (&b3, "G3")] {
+                    let before = winner(&a, &b_peer).await.map(|c| c.stable_id());
+                    tokio::time::timeout(Duration::from_secs(10), node.connect_addr(a_addr))
+                        .await
+                        .expect("connect timeout")
+                        .expect("connect");
+                    wait_for_winner(&a, &b_peer, what, |connection| {
+                        Some(connection.stable_id()) != before
+                    })
+                    .await;
+                }
+                let b2_g2 = wait_for_winner(&b2, &a_peer, "B''s G2", |_| true).await;
+                let b3_g3 = wait_for_winner(&b3, &a_peer, "B'''s G3", |_| true).await;
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                assert!(
+                    b_g1.close_reason().is_none() && b2_g2.close_reason().is_none(),
+                    "nothing may be retired while the winner G3 has no reader at A"
+                );
+                assert_eq!(claims(&a), 0, "no claim before the winner is read");
+
+                let _accept_a = shim_accept(&a);
+                wait_until(RETIRE_WITHIN, "A retires G1 and G2", || {
+                    b_g1.close_reason().is_some() && b2_g2.close_reason().is_some()
+                })
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_g1),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert_eq!(
+                    remote_close_reason(&b2_g2),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert!(b3_g3.close_reason().is_none(), "the winner G3 stays open");
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+                b3.shutdown().await;
+            }
+
+            /// RED on R1 and master (plan R2.3: a reader exit never retires;
+            /// Codex Q9). At the arbiter A, Y supersedes X before X's reader
+            /// starts. Master and R1 pre-cancel that late reader, and its exit
+            /// closes X at once, without a claim and without evidence on the
+            /// winner Y. Under ADR-017 the late reader reads X, and only a
+            /// retirement claim closes X, after B has read Y.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_arbiter_reads_a_late_started_superseded_connection() {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b_addr = shim_addr(&b);
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+
+                let x = raw_dial(&a, b_addr).await;
+                a.inner
+                    .add_connection(b_peer, x.clone())
+                    .expect("register X");
+                let y = raw_dial(&a, b_addr).await;
+                a.inner
+                    .add_connection(b_peer, y.clone())
+                    .expect("register Y");
+                wait_for_winner(&a, &b_peer, "Y supersedes X at A", |connection| {
+                    connection.stable_id() == y.stable_id()
+                })
+                .await;
+                a.spawn_reader_task(b_peer, y.clone()).await;
+
+                // X's reader starts late, on a Superseded connection.
+                a.spawn_reader_task(b_peer, x.clone()).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(
+                    x.close_reason().is_none(),
+                    "a late reader start must not close X: {:?}",
+                    x.close_reason()
+                );
+                wait_for_reader(&a, &b_peer, x.stable_id(), "A's late reader on X").await;
+                assert_eq!(claims(&a), 0, "nothing is claimed before the evidence");
+
+                wait_until(RETIRE_WITHIN, "A retires X", || x.close_reason().is_some()).await;
+                assert!(claims(&a) >= 1, "a retirement claim closed X");
+                assert!(y.close_reason().is_none(), "the winner Y stays open");
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// RED on R1 and master (Codex #315: same-peer, two-ended). A's
+            /// waiter finalises the hole-punch winner H, with its reader,
+            /// before the accepted-coordination dial C completes between the
+            /// same two endpoints. Both ends keep C. In both role
+            /// assignments, after the drain deadline: H is retired (the peer
+            /// of the arbiter sees the Superseded close), each end tracks one
+            /// open connection for the pair (C), each end has one reader and
+            /// the peer in `connected_peers`, the current generation is C's,
+            /// and messages travel both ways on C.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_same_peer_two_ended_race_retires_the_displaced_connection() {
+                for a_is_arbiter in [true, false] {
+                    let ((first_key, _), (second_key, _)) = ordered_identities();
+                    let (a_key, b_key) = if a_is_arbiter {
+                        (first_key, second_key)
+                    } else {
+                        (second_key, first_key)
+                    };
+                    let a = keyed_node(&a_key).await;
+                    let b = keyed_node(&b_key).await;
+                    let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                    let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                    let _accept_a = shim_accept(&a);
+                    let _accept_b = shim_accept(&b);
+
+                    a.inner
+                        .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                        .expect("start hole-punch H");
+                    let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                        .await
+                        .expect("A's waiter finalises H");
+                    let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                    wait_for_reader(&a, &b_peer, h.stable_id(), "A's reader on H").await;
+                    let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |_| true).await;
+                    wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+
+                    let handled = a
+                        .inner
+                        .inject_accepted_coordination_for_test(
+                            h.clone(),
+                            a_peer,
+                            b_peer,
+                            vec![a_addr],
+                            vec![b_addr],
+                        )
+                        .await
+                        .expect("CoordinationAccepted handled");
+                    assert!(handled);
+                    let c = wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                        connection.stable_id() != h.stable_id()
+                    })
+                    .await;
+                    let b_c = wait_for_winner(&b, &a_peer, "C is B's winner", |connection| {
+                        connection.stable_id() != b_h.stable_id()
+                    })
+                    .await;
+
+                    let kept = wait_for_convergence(&a, &b, RETIRE_WITHIN).await;
+                    assert_eq!(
+                        kept,
+                        connection_id_of(&a, &b_peer, c.stable_id()),
+                        "C is kept"
+                    );
+                    let arbiter_peer_view_of_h = if a_is_arbiter { &b_h } else { &h };
+                    wait_until(
+                        Duration::from_secs(5),
+                        "H's close reaches the follower",
+                        || arbiter_peer_view_of_h.close_reason().is_some(),
+                    )
+                    .await;
+                    assert_eq!(
+                        remote_close_reason(arbiter_peer_view_of_h),
+                        Some(ConnectionCloseReason::Superseded),
+                        "a_is_arbiter={a_is_arbiter}: H is retired with the Superseded code"
+                    );
+                    assert!(c.close_reason().is_none() && b_c.close_reason().is_none());
+                    assert!(a.connected_peers.read().await.contains_key(&b_peer));
+                    assert!(b.connected_peers.read().await.contains_key(&a_peer));
+                    wait_until(Duration::from_secs(5), "one reader per end", || {
+                        a.reader_handles.try_read().is_ok_and(|handles| {
+                            handles.get(&b_peer).is_some_and(|entries| {
+                                entries.iter().filter(|entry| entry.is_running()).count() == 1
+                            })
+                        }) && b.reader_handles.try_read().is_ok_and(|handles| {
+                            handles.get(&a_peer).is_some_and(|entries| {
+                                entries.iter().filter(|entry| entry.is_running()).count() == 1
+                            })
+                        })
+                    })
+                    .await;
+                    assert_eq!(
+                        a.inner.current_connection_generation(&b_peer),
+                        a.inner
+                            .connection_snapshot_by_stable_id(&b_peer, c.stable_id())
+                            .map(|snapshot| snapshot.generation)
+                    );
+                    assert_delivery_both_ways(&a, &b, "313 n1 two-ended").await;
+                    let (arbiter, follower) = if a_is_arbiter { (&a, &b) } else { (&b, &a) };
+                    assert!(completions(arbiter) >= 1, "the arbiter retired H");
+                    assert_eq!(claims(follower), 0, "the follower claims nothing");
+
+                    a.shutdown().await;
+                    b.shutdown().await;
+                }
+            }
+
+            /// RED on R1 and master (Codex P2-1): the two ends keep opposite
+            /// winners. A registers H then C (A keeps C); B registers C then
+            /// H (B keeps H). Round 1 let both ends retire on timers, which
+            /// could close both. Under N1, in both role assignments, the
+            /// follower follows the arbiter's winner (A6), only the arbiter
+            /// retires, a common connection survives, and the pair converges.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_opposite_choices_keep_a_survivor_and_converge() {
+                for a_is_arbiter in [true, false] {
+                    let ((first_key, _), (second_key, _)) = ordered_identities();
+                    let (a_key, b_key) = if a_is_arbiter {
+                        (first_key, second_key)
+                    } else {
+                        (second_key, first_key)
+                    };
+                    let a = keyed_node(&a_key).await;
+                    let b = keyed_node(&b_key).await;
+                    let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                    let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                    let _accept_a = shim_accept(&a);
+                    let _accept_b = shim_accept(&b);
+                    let gate = b.inner.arm_first_registration_gate_for_test();
+
+                    a.inner
+                        .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                        .expect("start hole-punch H");
+                    let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                        .await
+                        .expect("A's waiter finalises H");
+                    let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                        .await
+                        .expect("B's registration of H parks");
+                    let handled = a
+                        .inner
+                        .inject_accepted_coordination_for_test(
+                            h.clone(),
+                            a_peer,
+                            b_peer,
+                            vec![a_addr],
+                            vec![b_addr],
+                        )
+                        .await
+                        .expect("CoordinationAccepted handled");
+                    assert!(handled);
+                    let c = wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                        connection.stable_id() != h.stable_id()
+                    })
+                    .await;
+                    let b_c = wait_for_winner(&b, &a_peer, "B registers C first", |_| true).await;
+                    wait_for_reader(&b, &a_peer, b_c.stable_id(), "B's reader on C").await;
+                    gate.release();
+                    let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |connection| {
+                        connection.stable_id() != b_c.stable_id()
+                    })
+                    .await;
+                    assert_ne!(
+                        connection_id_of(&a, &b_peer, c.stable_id()),
+                        connection_id_of(&b, &a_peer, b_h.stable_id()),
+                        "fixture: the two ends keep opposite winners"
+                    );
+
+                    let kept = wait_for_convergence(&a, &b, RETIRE_WITHIN).await;
+                    let (arbiter, follower) = if a_is_arbiter { (&a, &b) } else { (&b, &a) };
+                    let arbiter_winner = if a_is_arbiter {
+                        connection_id_of(&a, &b_peer, c.stable_id())
+                    } else {
+                        connection_id_of(&b, &a_peer, b_h.stable_id())
+                    };
+                    assert_eq!(kept, arbiter_winner, "the pair keeps the arbiter's winner");
+                    assert!(
+                        follows(follower) >= 1,
+                        "the follower followed the arbiter's winner"
+                    );
+                    assert_eq!(claims(follower), 0, "the follower claims nothing");
+                    assert!(
+                        completions(arbiter) >= 1,
+                        "the arbiter retired the other connection"
+                    );
+                    assert_delivery_both_ways(&a, &b, "313 n1 opposite choices").await;
+
+                    drop(gate);
+                    a.shutdown().await;
+                    b.shutdown().await;
+                }
+            }
+
+            /// RED on R1 and master (Codex P2-2, corrected schedule). H and C
+            /// are A-initiated, D is B-initiated, with forced lifecycle ids
+            /// id(H) > id(D) > id(C). A registers H, C, D and keeps D; B
+            /// registers D, H, C and keeps C. Every connection loses at one
+            /// end, so retirement at both ends can leave nothing. Under N1, in
+            /// both role assignments, only the arbiter decides, a common
+            /// connection survives, and the pair converges on the arbiter's
+            /// winner.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_three_candidate_cycle_keeps_a_survivor() {
+                fn exporter_id(connection: &QuicConnection) -> [u8; 32] {
+                    let mut exporter = [0u8; 32];
+                    connection
+                        .export_keying_material(
+                            &mut exporter,
+                            b"ant-quic/lifecycle-connection-id/v1",
+                            b"canonical",
+                        )
+                        .expect("exporter");
+                    exporter
+                }
+
+                for a_is_arbiter in [true, false] {
+                    let ((first_key, _), (second_key, _)) = ordered_identities();
+                    let (a_key, b_key) = if a_is_arbiter {
+                        (first_key, second_key)
+                    } else {
+                        (second_key, first_key)
+                    };
+                    let a = keyed_node(&a_key).await;
+                    let b = keyed_node(&b_key).await;
+                    let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                    let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                    let _accept_a = shim_accept(&a);
+                    let _accept_b = shim_accept(&b);
+                    let hold = b.inner.arm_inbound_hold_for_test();
+                    // Hold the follow at both ends while the cycle is built,
+                    // so the fixture check below sees the registration order.
+                    for node in [&a, &b] {
+                        hooks(node)
+                            .follow_suppressed
+                            .store(true, AtomicOrdering::SeqCst);
+                    }
+
+                    let forced = [(0xF0u8, "H"), (0x10u8, "C")];
+                    let mut a_side = Vec::new();
+                    for (byte, name) in forced {
+                        let connection = raw_dial(&a, b_addr).await;
+                        crate::nat_traversal_api::lifecycle_points::override_connection_id(
+                            exporter_id(&connection),
+                            [byte; 32],
+                        );
+                        a.inner
+                            .add_connection(b_peer, connection.clone())
+                            .unwrap_or_else(|e| panic!("A registers {name}: {e}"));
+                        a.spawn_reader_task(b_peer, connection.clone()).await;
+                        a_side.push(connection);
+                    }
+                    let held = hold.wait_for_held(2).await;
+
+                    let d = raw_dial(&b, a_addr).await;
+                    crate::nat_traversal_api::lifecycle_points::override_connection_id(
+                        exporter_id(&d),
+                        [0x80; 32],
+                    );
+                    b.inner
+                        .add_connection(a_peer, d.clone())
+                        .expect("B registers D");
+                    b.spawn_reader_task(a_peer, d.clone()).await;
+                    wait_until(Duration::from_secs(10), "A registers D last", || {
+                        a.inner.open_lifecycle_entries_for_test(&b_peer).len() == 3
+                    })
+                    .await;
+                    for (stable_id, _) in held {
+                        let before = b.inner.lifecycle_entries_for_test(&a_peer).len();
+                        hold.release(stable_id);
+                        wait_until(
+                            Duration::from_secs(10),
+                            "B registers the released one",
+                            || b.inner.lifecycle_entries_for_test(&a_peer).len() > before,
+                        )
+                        .await;
+                    }
+
+                    let live_id = |node: &P2pEndpoint, peer: &PeerId| {
+                        open_ids(node, peer)
+                            .into_iter()
+                            .find(|(_, state)| matches!(state, State::Live))
+                            .map(|(id, _)| id)
+                    };
+                    assert_eq!(live_id(&a, &b_peer), Some([0x80; 32]), "fixture: A keeps D");
+                    assert_eq!(live_id(&b, &a_peer), Some([0x10; 32]), "fixture: B keeps C");
+                    for node in [&a, &b] {
+                        hooks(node)
+                            .follow_suppressed
+                            .store(false, AtomicOrdering::SeqCst);
+                    }
+
+                    let kept = wait_for_convergence(&a, &b, RETIRE_WITHIN).await;
+                    let expected = if a_is_arbiter { [0x80; 32] } else { [0x10; 32] };
+                    assert_eq!(kept, expected, "the pair keeps the arbiter's winner");
+                    let follower = if a_is_arbiter { &b } else { &a };
+                    assert_eq!(claims(follower), 0, "the follower claims nothing");
+                    assert_delivery_both_ways(&a, &b, "313 n1 three candidates").await;
+
+                    drop(hold);
+                    drop(a_side);
+                    a.shutdown().await;
+                    b.shutdown().await;
+                }
+            }
+
+            /// RED on R1 and master (Codex P2-4, delayed reader). The
+            /// coordinator winner C has no reader at the arbiter A yet (its
+            /// adoption is held). A must not retire the displaced H while it
+            /// cannot read C (E1). Once C's reader starts, A retires H.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn n1_unread_winner_does_not_authorize_retirement() {
+                let ((a_key, _), (b_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                    .await
+                    .expect("A's waiter finalises H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                wait_for_reader(&a, &b_peer, h.stable_id(), "A's reader on H").await;
+                let b_h = wait_for_winner(&b, &a_peer, "B's H", |_| true).await;
+                wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), true);
+                let handled = a
+                    .inner
+                    .inject_accepted_coordination_for_test(
+                        h.clone(),
+                        a_peer,
+                        b_peer,
+                        vec![a_addr],
+                        vec![b_addr],
+                    )
+                    .await
+                    .expect("CoordinationAccepted handled");
+                assert!(handled);
+                let c = wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                    connection.stable_id() != h.stable_id()
+                })
+                .await;
+                assert!(!a.live_reader_for_test(&b_peer, c.stable_id()).await);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                assert!(
+                    b_h.close_reason().is_none(),
+                    "the arbiter must not retire H while it has no reader on its winner C"
+                );
+                assert_eq!(claims(&a), 0);
+
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), false);
+                a.inner.send_reader_adoption_for_test(b_peer, c.clone());
+                wait_for_reader(&a, &b_peer, c.stable_id(), "A's adopted reader on C").await;
+                wait_until(RETIRE_WITHIN, "A retires H once C is read", || {
+                    b_h.close_reason().is_some()
+                })
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_h),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert!(c.close_reason().is_none());
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// RED on R1 and master (Codex P2-4: retirement passes run on a
+            /// timer between E2 and E3). The follower B does not follow
+            /// (switch) and keeps sending on its own winner H, which the
+            /// arbiter A has superseded. Every pass must see that B still uses
+            /// H, so A never retires it. When B follows A's winner C and
+            /// stops using H, A retires H.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_traffic_on_the_superseded_connection_blocks_retirement() {
+                let ((a_key, _), (b_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                hooks(&b)
+                    .follow_suppressed
+                    .store(true, AtomicOrdering::SeqCst);
+                let gate = b.inner.arm_first_registration_gate_for_test();
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                    .await
+                    .expect("A's waiter finalises H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                    .await
+                    .expect("B's registration of H parks");
+                let handled = a
+                    .inner
+                    .inject_accepted_coordination_for_test(
+                        h.clone(),
+                        a_peer,
+                        b_peer,
+                        vec![a_addr],
+                        vec![b_addr],
+                    )
+                    .await
+                    .expect("CoordinationAccepted handled");
+                assert!(handled);
+                wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                    connection.stable_id() != h.stable_id()
+                })
+                .await;
+                let b_c = wait_for_winner(&b, &a_peer, "B registers C first", |_| true).await;
+                wait_for_reader(&b, &a_peer, b_c.stable_id(), "B's reader on C").await;
+                gate.release();
+                let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |connection| {
+                    connection.stable_id() != b_c.stable_id()
+                })
+                .await;
+
+                let busy_until = tokio::time::Instant::now() + Duration::from_secs(5);
+                let mut round = 0u32;
+                while tokio::time::Instant::now() < busy_until {
+                    let payload = format!("313 n1 busy {round}");
+                    b.send(&a_peer, payload.as_bytes())
+                        .await
+                        .expect("B sends on H");
+                    round += 1;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                assert!(
+                    b_h.close_reason().is_none(),
+                    "the arbiter retired H while the follower used it"
+                );
+                assert_eq!(claims(&a), 0, "no claim while H is in use");
+
+                hooks(&b)
+                    .follow_suppressed
+                    .store(false, AtomicOrdering::SeqCst);
+                wait_until(
+                    RETIRE_WITHIN,
+                    "A retires H after B follows and goes quiet",
+                    || b_h.close_reason().is_some(),
+                )
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_h),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert!(follows(&b) >= 1);
+
+                drop(gate);
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Opens C1 from A to B, then C2 from A to B' (B's identity on
+            /// another port), so C2 supersedes C1 at A on A's finalize path,
+            /// which schedules the 5 s supersede timer before N1. Returns
+            /// `(a, b, b2, a_c1, b_c1, a_c2)`.
+            async fn finalize_supersede_fixture() -> (
+                Arc<P2pEndpoint>,
+                Arc<P2pEndpoint>,
+                Arc<P2pEndpoint>,
+                QuicConnection,
+                QuicConnection,
+                QuicConnection,
+            ) {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                for node in [&a, &b, &b2] {
+                    std::mem::forget(shim_accept(node));
+                }
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b)))
+                    .await
+                    .expect("C1 connect timeout")
+                    .expect("C1 connect");
+                let a_c1 = wait_for_winner(&a, &b_peer, "A's C1", |_| true).await;
+                let b_c1 = wait_for_winner(&b, &a_peer, "B's C1", |_| true).await;
+                wait_for_reader(&b, &a_peer, b_c1.stable_id(), "B's reader on C1").await;
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b2)))
+                    .await
+                    .expect("C2 connect timeout")
+                    .expect("C2 connect");
+                let a_c2 = wait_for_winner(&a, &b_peer, "C2 supersedes C1 at A", |connection| {
+                    connection.stable_id() != a_c1.stable_id()
+                })
+                .await;
+                (a, b, b2, a_c1, b_c1, a_c2)
+            }
+
+            /// RED on R1 and master (Codex P2-5). B writes the first half of
+            /// a stream on C1, which A's reader accepts, then the rest after
+            /// 6.5 s. Before N1, A's finalize timer closed C1 at 5 s and the
+            /// stream was cut. Under N1 the arbiter claims C1 while the stream
+            /// is in flight, stops C1's reader, waits for the stream (C1 stays
+            /// open after its reader has exited), delivers it whole, and then
+            /// closes C1.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_slow_stream_on_a_retiring_connection_completes() {
+                let (a, b, b2, a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                let b_peer = b.peer_id();
+                let mut stream = b_c1.open_uni().await.expect("open a stream on C1");
+                stream
+                    .write_all(b"313 n1 slow stream: first half, ")
+                    .await
+                    .expect("write the first half");
+                let wrote_first_at = tokio::time::Instant::now();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                // Under N1: the claim lands while the stream is in flight, and
+                // C1's reader stops at its next accept boundary.
+                let claim_deadline = wrote_first_at + Duration::from_secs(6);
+                while claims(&a) == 0 && tokio::time::Instant::now() < claim_deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if claims(&a) > 0 {
+                    wait_until(Duration::from_secs(3), "C1's reader stops", || {
+                        a.reader_handles.try_read().is_ok_and(|handles| {
+                            !handles.get(&b_peer).is_some_and(|entries| {
+                                entries.iter().any(|entry| {
+                                    entry.conn_stable_id == a_c1.stable_id() && entry.is_running()
+                                })
+                            })
+                        })
+                    })
+                    .await;
+                    assert!(
+                        b_c1.close_reason().is_none(),
+                        "a Retiring connection's reader exit closes nothing before completion"
+                    );
+                }
+                let rest_at = wrote_first_at + Duration::from_millis(6500);
+                tokio::time::sleep_until(rest_at).await;
+                let rest = stream.write_all(b"second half").await;
+                let finish = stream.finish();
+                assert!(
+                    rest.is_ok() && finish.is_ok(),
+                    "C1 was closed under the in-flight stream: {rest:?} {finish:?} (close {:?})",
+                    b_c1.close_reason()
+                );
+                assert!(
+                    recv_within(
+                        &a,
+                        b_peer,
+                        b"313 n1 slow stream: first half, second half",
+                        RECV_WINDOW
+                    )
+                    .await,
+                    "the slow stream on C1 must be delivered whole"
+                );
+                wait_until(RETIRE_WITHIN, "A completes C1's retirement", || {
+                    b_c1.close_reason().is_some()
+                })
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_c1),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert!(claims(&a) >= 1 && completions(&a) >= 1);
+                assert!(a_c2.close_reason().is_none(), "the winner C2 stays open");
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// RED on R1 and master (Codex P2-5, inline ACK-v2). B's
+            /// `send_with_receive_ack` on C1 is held inside A's reader, just
+            /// before the inline bidi handler, for 6 s. Before N1, A's
+            /// finalize timer closed C1 under it at 5 s after C2 superseded
+            /// it. Under N1 the arbiter's drain waits for the inline handler,
+            /// so B gets its ACK, and C1 is then closed.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_inline_ack_bidi_on_a_retiring_connection_finishes() {
+                let (a, b, b2, a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let superseded_at = tokio::time::Instant::now();
+                // Start the exchange at once: under N1 the arbiter claims C1
+                // only after it has been quiet for Q, so the exchange is in
+                // flight at the claim.
+                let pause =
+                    reader_test_hooks::arm_bidi_pause(a.reader_hooks_key(), a_c1.stable_id());
+                let sender = {
+                    let b = Arc::clone(&b);
+                    tokio::spawn(async move {
+                        b.send_with_receive_ack(
+                            &a_peer,
+                            b"313 n1 inline ack",
+                            Duration::from_secs(10),
+                        )
+                        .await
+                    })
+                };
+                tokio::time::timeout(Duration::from_secs(5), pause.wait_until_paused())
+                    .await
+                    .expect("A's reader holds the ACK-v2 stream");
+                tokio::time::sleep_until(superseded_at + Duration::from_secs(6)).await;
+                pause.release();
+                let acked = tokio::time::timeout(Duration::from_secs(15), sender)
+                    .await
+                    .expect("the ACK-v2 send finishes")
+                    .expect("the sender joins");
+                assert!(
+                    acked.is_ok(),
+                    "the inline ACK-v2 exchange on C1 must finish before C1 closes: {acked:?} \
+                     (C1 close {:?})",
+                    b_c1.close_reason()
+                );
+                assert!(
+                    recv_within(&a, b_peer, b"313 n1 inline ack", RECV_WINDOW).await,
+                    "the ACK-v2 payload is delivered"
+                );
+                wait_until(RETIRE_WITHIN, "A completes C1's retirement", || {
+                    b_c1.close_reason().is_some()
+                })
+                .await;
+                assert!(claims(&a) >= 1 && completions(&a) >= 1);
+                assert!(a_c2.close_reason().is_none());
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// RED on R1 and master (Codex P2-5, cap). A stream on C1 that
+            /// never finishes cannot hold the retirement open forever: the
+            /// arbiter claims C1 and closes it at the drain cap (2 s here).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_drain_cap_abandons_unfinished_work() {
+                let (a, b, b2, _a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                set_timing(
+                    &a,
+                    retirement_test_hooks::Timing {
+                        drain_cap: Duration::from_secs(2),
+                        ..retirement_test_hooks::Timing::fast()
+                    },
+                );
+                let mut stream = b_c1.open_uni().await.expect("open a stream on C1");
+                stream
+                    .write_all(b"313 n1 never finishes")
+                    .await
+                    .expect("write without finishing");
+                wait_until(RETIRE_WITHIN, "A claims C1", || claims(&a) >= 1).await;
+                let claimed_at = tokio::time::Instant::now();
+                wait_until(Duration::from_secs(8), "A closes C1 at the cap", || {
+                    b_c1.close_reason().is_some()
+                })
+                .await;
+                assert!(
+                    claimed_at.elapsed() >= Duration::from_millis(1500),
+                    "the drain waited for the unfinished stream until the cap"
+                );
+                assert_eq!(
+                    remote_close_reason(&b_c1),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+                assert!(a_c2.close_reason().is_none(), "the winner C2 stays open");
+                drop(stream);
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// Control, GREEN on R1 and master (Codex P2-6). The follower B
+            /// runs master's retirement (legacy mode), and its reader on the
+            /// arbiter's winner never starts (its target-side coordinator
+            /// dial's adoption is held). The arbiter's probe on that winner is
+            /// never answered, so A must not retire the connection B can still
+            /// read.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_legacy_follower_unread_winner_blocks_retirement() {
+                let ((a_key, _), (b_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let z = shim_node().await;
+                hooks(&b).legacy.store(true, AtomicOrdering::SeqCst);
+                let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                let _accept_z = shim_accept(&z);
+
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+                    .await
+                    .expect("C1 connect timeout")
+                    .expect("C1 connect");
+                let a_c1 = wait_for_winner(&a, &b_peer, "A's C1", |_| true).await;
+                let b_c1 = wait_for_winner(&b, &a_peer, "B's C1", |_| true).await;
+
+                reader_test_hooks::suppress_adoption(b.reader_hooks_key(), true);
+                // Hold W at A until its lifecycle id is forced above C1's, so
+                // A keeps W (the cross-family comparator), as B does (the
+                // coordinator connection always takes B's slot).
+                let hold = a.inner.arm_inbound_hold_for_test();
+                let unrelated = raw_dial(&b, shim_addr(&z)).await;
+                let handled = b
+                    .inner
+                    .inject_accepted_coordination_for_test(
+                        unrelated,
+                        a_peer,
+                        b_peer,
+                        vec![a_addr],
+                        vec![b_addr],
+                    )
+                    .await
+                    .expect("CoordinationAccepted handled");
+                assert!(handled);
+                let b_w = wait_for_winner(&b, &a_peer, "B's dial W", |connection| {
+                    connection.stable_id() != b_c1.stable_id()
+                })
+                .await;
+                let mut exporter = [0u8; 32];
+                b_w.export_keying_material(
+                    &mut exporter,
+                    b"ant-quic/lifecycle-connection-id/v1",
+                    b"canonical",
+                )
+                .expect("exporter");
+                crate::nat_traversal_api::lifecycle_points::override_connection_id(
+                    exporter, [0xFF; 32],
+                );
+                let held = hold.wait_for_held(1).await;
+                hold.release(held[0].0);
+                let a_w = wait_for_winner(&a, &b_peer, "A keeps W", |connection| {
+                    connection.stable_id() != a_c1.stable_id()
+                })
+                .await;
+                assert!(!b.live_reader_for_test(&a_peer, b_w.stable_id()).await);
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    a_c1.close_reason().is_none() && b_c1.close_reason().is_none(),
+                    "the arbiter retired C1 although its peer cannot read the winner W"
+                );
+                assert_eq!(claims(&a), 0);
+                drop((a_w, hold));
+
+                reader_test_hooks::suppress_adoption(b.reader_hooks_key(), false);
+                a.shutdown().await;
+                b.shutdown().await;
+                z.shutdown().await;
+            }
+
+            /// The Codex R2-P2-3 schedule with a legacy follower B (master's
+            /// retirement). B registers W then L (both B-initiated), so B
+            /// keeps L and its 5 s timer will close W. A registers L then W,
+            /// so A keeps W. B's reader-exit handling of L is held, so if A
+            /// retires L, B has not processed L's close (and cannot repromote
+            /// W) when its timer fires. Q is 8 s, more than the 5 s timer.
+            /// `weaken` runs on A before the race starts. Returns `(a, b, B's
+            /// W, B's L, L's lifecycle id, the exit hold of B's L)`.
+            async fn legacy_timer_race(
+                weaken: impl FnOnce(&P2pEndpoint),
+            ) -> (
+                Arc<P2pEndpoint>,
+                Arc<P2pEndpoint>,
+                QuicConnection,
+                QuicConnection,
+                [u8; 32],
+                Arc<reader_test_hooks::ReaderHooks>,
+            ) {
+                let ((a_key, _), (b_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                for node in [&a, &b] {
+                    set_timing(
+                        node,
+                        retirement_test_hooks::Timing {
+                            quiet: Duration::from_secs(8),
+                            ..retirement_test_hooks::Timing::fast()
+                        },
+                    );
+                }
+                hooks(&b).legacy.store(true, AtomicOrdering::SeqCst);
+                weaken(&a);
+                let a_addr = shim_addr(&a);
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                std::mem::forget(shim_accept(&a));
+                std::mem::forget(shim_accept(&b));
+                let gate = a.inner.arm_first_registration_gate_for_test();
+
+                let w = raw_dial(&b, a_addr).await;
+                b.inner
+                    .add_connection(a_peer, w.clone())
+                    .expect("B registers W");
+                b.spawn_reader_task(a_peer, w.clone()).await;
+                tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                    .await
+                    .expect("A's registration of W parks");
+                let w_generation = b.inner.current_connection_generation(&a_peer).expect("W");
+                let l = raw_dial(&b, a_addr).await;
+                let l_exit_hold = reader_test_hooks::arm(b.reader_hooks_key(), l.stable_id());
+                l_exit_hold
+                    .pause_exit_side_effects
+                    .store(true, AtomicOrdering::SeqCst);
+                let outcome = b
+                    .inner
+                    .add_connection_with_outcome(a_peer, l.clone())
+                    .expect("B registers L");
+                assert!(matches!(
+                    outcome,
+                    crate::nat_traversal_api::ConnectionRegistrationOutcome::Live {
+                        superseded_generation: Some(generation),
+                        ..
+                    } if generation == w_generation
+                ));
+                b.spawn_reader_task(a_peer, l.clone()).await;
+                // What a legacy finalize does: close the superseded W after 5 s.
+                b.schedule_reader_generation_cancel(a_peer, w_generation, Duration::from_secs(5));
+                wait_until(Duration::from_secs(10), "A registers L first", || {
+                    a.inner.open_lifecycle_entries_for_test(&b_peer).len() == 1
+                })
+                .await;
+                gate.release();
+                // Count every entry, open or not: a weakened rule may retire L
+                // at once.
+                wait_until(Duration::from_secs(10), "A registers W", || {
+                    a.inner.lifecycle_entries_for_test(&b_peer).len() >= 2
+                })
+                .await;
+                drop(gate);
+                let mut l_id = [0u8; 32];
+                l.export_keying_material(
+                    &mut l_id,
+                    b"ant-quic/lifecycle-connection-id/v1",
+                    b"canonical",
+                )
+                .expect("exporter");
+                (a, b, w, l, l_id, l_exit_hold)
+            }
+
+            /// Control, GREEN on R1 and master (Codex R2-P2-3 schedule, see
+            /// `legacy_timer_race`). The arbiter A must not retire L before
+            /// B's timer has closed W: an old follower never sends on W after
+            /// superseding it (E3(a)), and W must be A's winner for Q (E3(c)).
+            /// When B closes W, A repromotes L and the pair keeps L.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_legacy_follower_timer_race_keeps_a_survivor() {
+                let (a, b, w, l, l_id, l_exit_hold) = legacy_timer_race(|_| {}).await;
+                wait_until(Duration::from_secs(10), "B's legacy timer closes W", || {
+                    w.close_reason().is_some()
+                })
+                .await;
+                let kept = wait_for_convergence(&a, &b, RETIRE_WITHIN).await;
+                assert_eq!(kept, l_id, "the pair keeps L");
+                assert!(l.close_reason().is_none(), "L survives");
+                assert_delivery_both_ways(&a, &b, "313 n1 legacy timer race").await;
+                assert_eq!(claims(&a), 0, "A never claimed L");
+
+                l_exit_hold.release_exit();
+                reader_test_hooks::disarm(b.reader_hooks_key(), l.stable_id());
                 a.shutdown().await;
                 b.shutdown().await;
             }
