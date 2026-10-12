@@ -905,6 +905,110 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
+    /// #294: when a winner is found, every losing attempt must already be
+    /// stopped when `race_connect` returns. An abort that is only scheduled
+    /// leaves the losing dial running (and holding its resources) after the
+    /// caller has the winner. The winner itself must not be dropped.
+    ///
+    /// Deterministic: explicit gates on the current-thread runtime. The
+    /// winning attempt waits until the losing dial has entered, and the check
+    /// runs with no yield after the race returns, so a loser that is only
+    /// scheduled for cancellation is still alive at the check.
+    #[tokio::test]
+    async fn winner_return_stops_losing_attempts_before_handoff() {
+        let loser_entered = Arc::new(tokio::sync::Notify::new());
+        let loser_dropped = Arc::new(AtomicUsize::new(0));
+        let winner_dropped = Arc::new(AtomicUsize::new(0));
+        let loser_entered_for_attempt = Arc::clone(&loser_entered);
+        let loser_dropped_for_attempt = Arc::clone(&loser_dropped);
+        let winner_dropped_for_attempt = Arc::clone(&winner_dropped);
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        let race = race_connect(&addrs, &config, move |addr| {
+            let loser_entered = Arc::clone(&loser_entered_for_attempt);
+            let loser_dropped = Arc::clone(&loser_dropped_for_attempt);
+            let winner_dropped = Arc::clone(&winner_dropped_for_attempt);
+            async move {
+                if addr == v6("[::1]:80") {
+                    let _witness = DropWitness {
+                        count: loser_dropped,
+                        dropped: Arc::new(tokio::sync::Notify::new()),
+                    };
+                    loser_entered.notify_one();
+                    std::future::pending::<Result<DropWitness, String>>().await
+                } else {
+                    // Gate: win only after the losing dial is in flight.
+                    loser_entered.notified().await;
+                    Ok(DropWitness {
+                        count: winner_dropped,
+                        dropped: Arc::new(tokio::sync::Notify::new()),
+                    })
+                }
+            }
+        });
+        let (winner, addr) = tokio::time::timeout(Duration::from_secs(5), race)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(addr, v4("10.0.0.1:80"));
+        assert_eq!(
+            loser_dropped.load(Ordering::SeqCst),
+            1,
+            "the losing attempt must be stopped before the winner is returned"
+        );
+        assert_eq!(
+            winner_dropped.load(Ordering::SeqCst),
+            0,
+            "stopping the losers must not drop the winning connection"
+        );
+        drop(winner);
+        assert_eq!(winner_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// #294: an attempt task that panics must count as a failed attempt.
+    /// Before the fix the coordinator kept its own channel sender, so it
+    /// waited for a result that never came and the race hung until an outer
+    /// timeout cancelled it.
+    ///
+    /// Deterministic in outcome: the race uses no timer (one address), so a
+    /// correct race ends on the attempt's first poll and a broken race never
+    /// ends. The guard only bounds how long the failure takes to report.
+    #[tokio::test]
+    async fn panicking_attempt_is_a_failed_attempt_not_a_hang() {
+        let addrs = vec![v6("[::1]:80")];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            race_connect(&addrs, &HappyEyeballsConfig::default(), |addr| async move {
+                if addr.is_ipv6() {
+                    // `resume_unwind` skips the panic hook, so the test log stays clean.
+                    std::panic::resume_unwind(Box::new("injected attempt panic"));
+                }
+                Ok::<String, String>(format!("connected to {addr}"))
+            }),
+        )
+        .await;
+
+        match outcome {
+            Ok(Err(HappyEyeballsError::AllAttemptsFailed { errors })) => {
+                assert_eq!(errors.len(), 1, "one failed attempt expected: {errors:?}");
+                assert_eq!(errors[0].0, v6("[::1]:80"));
+                assert!(
+                    errors[0].1.contains("panicked"),
+                    "failure must name the panic: {}",
+                    errors[0].1
+                );
+            }
+            Ok(other) => panic!("expected AllAttemptsFailed, got: {other:?}"),
+            Err(_) => panic!("race hung after its only attempt panicked"),
+        }
+    }
+
     #[test]
     fn test_error_display() {
         let err = HappyEyeballsError::NoAddresses;
