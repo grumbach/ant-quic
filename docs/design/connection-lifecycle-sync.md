@@ -300,7 +300,9 @@ connection and retires superseded ones without that agreement.
 - A winner-map insert never orphans an untracked value: it is adopted as
   Superseded.
 - Entries of origin `Raw` keep the close behaviour they had while untracked
-  (no reader pre-cancel, no `NoReader` close, no reader-exit close while open).
+  (no reader pre-cancel, no `NoReader` close, no reader-exit close while open,
+  no ACK-v2 liveness-timeout close). Only an explicit `disconnect(peer)` now
+  also closes them.
 - A Live entry of origin `Raw` never rejects a newcomer (master had no Live
   entry to compare with): the newcomer takes the route and the Raw entry
   becomes Superseded, still open.

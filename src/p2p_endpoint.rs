@@ -7737,6 +7737,18 @@ impl P2pEndpoint {
         else {
             return;
         };
+        // #313 round 3 (C-313-4): master parity. A connection of origin Raw
+        // (a hole-punch or accepted-coordination winner) was not in the
+        // lifecycle on master, so this cleanup found no snapshot and closed
+        // nothing. A patch release must not close it here either.
+        if snapshot.origin == crate::nat_traversal_api::ConnectionOrigin::Raw {
+            debug!(
+                peer_id = ?peer_id,
+                stable_id,
+                "liveness cleanup leaves a Raw connection open (master parity)"
+            );
+            return;
+        }
         let close_reason = close_reason_for_disconnect(&reason);
         emit_peer_lifecycle_event(
             &self.peer_event_tx,

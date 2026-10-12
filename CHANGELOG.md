@@ -69,10 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of their data. They
   keep the close behaviour they had while untracked: the #368 janitor and
   repromotion never close them as `NoReader`, their reader is never
-  pre-cancelled, and a reader exit never closes them while they are open. Two
-  closes now also reach them, as for every tracked connection: `disconnect`
-  closes them, and the ACK-v2 liveness timeout closes them when their data
-  path is dead.
+  pre-cancelled, a reader exit never closes them while they are open, and the
+  ACK-v2 liveness timeout does not close them. One close now also reaches
+  them, as for every tracked connection: `disconnect` closes them.
 - **A hole-punch or accepted-coordination dial is bound to its authenticated
   identity (#313 R1, Q6).** A connection that does not authenticate as the
   expected peer is closed before anything is published. It is no longer stored
