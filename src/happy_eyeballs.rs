@@ -229,10 +229,11 @@ type AttemptOutcome<C> = (SocketAddr, Result<C, String>);
 
 /// Longest time the winner waits for the aborted losers to end.
 ///
-/// A loser that yields ends at once when it is aborted, so the wait is
-/// normally microseconds. A loser in a non-yielding section (blocking code)
-/// cannot be stopped from outside; this bound keeps it from holding a ready
-/// winner (#294).
+/// A loser that yields normally ends soon after it is aborted, so the wait is
+/// normally short; scheduling does not guarantee it. A loser in a non-yielding
+/// section (blocking code) cannot be stopped from outside. This bound keeps
+/// such a loser from holding a ready winner; what is left after the bound goes
+/// to a detached cleanup task (#294).
 const LOSER_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 
 /// Spawn a single connection attempt into the race's [`JoinSet`].
@@ -260,6 +261,31 @@ fn spawn_attempt<F, Fut, C, E>(
             Err(_) => Err("connection attempt panicked".to_string()),
         };
         (addr, outcome)
+    });
+}
+
+/// Hand what is left of a won race to a detached cleanup task, so that no
+/// loser is dropped on the winner's handoff path (#294).
+///
+/// The task drops the values that losers already returned (losers that also
+/// connected), then joins and drops the aborted losers that have not ended
+/// yet. It ends when the last loser ends. When nothing is left, no task is
+/// spawned.
+fn release_losers<C: Send + 'static>(
+    mut attempts: JoinSet<AttemptOutcome<C>>,
+    loser_values: Vec<C>,
+) {
+    if attempts.is_empty() && loser_values.is_empty() {
+        return;
+    }
+    debug!(
+        still_running = attempts.len(),
+        connected_losers = loser_values.len(),
+        "Happy Eyeballs: a cleanup task releases the losing attempts"
+    );
+    tokio::spawn(async move {
+        drop(loser_values);
+        while attempts.join_next().await.is_some() {}
     });
 }
 
@@ -302,21 +328,29 @@ fn spawn_attempt<F, Fut, C, E>(
 ///
 /// # Cancellation
 ///
-/// One [`JoinSet`] owns every spawned attempt (#294). Tokio cancellation is
-/// cooperative: an aborted attempt ends at its next poll (its next `.await`).
+/// One [`JoinSet`] owns every spawned attempt (#294).
 /// - When an attempt wins, every other attempt is aborted before the winner
-///   is returned. The race then waits for the aborted attempts to end, for at
-///   most 50 ms. An attempt that yields (every normal async dial) has ended,
-///   and a loser that also connected has been dropped, when the caller gets
-///   the winner. An attempt in a non-yielding section (blocking code) cannot
-///   be stopped from outside; it stays aborted and ends at its next poll,
-///   after the winner is returned. It cannot delay the winner by more than
-///   the bound.
+///   is returned. The race then waits at most 50 ms for the aborted attempts
+///   to end. The race never drops a loser on this path: the value of a loser
+///   that also connected, and any loser that has not ended yet, go to a
+///   detached cleanup task. That task drops them and ends when the last loser
+///   ends. So neither a blocking poll nor a blocking destructor of a loser
+///   can hold the winner for more than the bound.
 /// - When the caller drops the returned future (for example an outer
-///   timeout), the set is dropped and every attempt is aborted. Each attempt
-///   ends at its next poll.
+///   timeout), the set is dropped and every attempt is aborted.
 /// - An attempt that panics counts as a failed attempt; it does not stall the
 ///   race.
+///
+/// Assumptions. Tokio cancellation is cooperative: an aborted attempt ends at
+/// its next poll (its next `.await`), and the runtime then drops its future.
+/// A normal async dial ends within the bound, but scheduling does not
+/// guarantee it. An attempt in a non-yielding section, or a value with a
+/// blocking destructor, keeps what it holds until that code ends; the race
+/// cannot release it sooner. On a current-thread runtime the runtime drops
+/// aborted attempts on the same thread, so blocking code there blocks the
+/// whole runtime. `connect_fn` must therefore not hold resources that the
+/// winner needs across blocking code, and its values should drop without
+/// blocking.
 pub async fn race_connect<F, Fut, C, E>(
     addresses: &[SocketAddr],
     config: &HappyEyeballsConfig,
@@ -380,21 +414,20 @@ where
             Some(Ok((addr, Ok(conn)))) => {
                 info!(addr = %addr, "Happy Eyeballs: connection succeeded");
                 // Abort every losing attempt, then give the aborted attempts a
-                // bounded time to end. Results that arrive here (a loser that
-                // also connected) are dropped.
+                // bounded time to end. A loser that also connected returns a
+                // value; move it out, never drop it here: its destructor can
+                // block, and a timeout cannot interrupt a synchronous drop.
                 attempts.abort_all();
-                let drained = tokio::time::timeout(LOSER_SHUTDOWN_GRACE, async {
-                    while attempts.join_next().await.is_some() {}
+                let mut loser_values = Vec::new();
+                let _ = tokio::time::timeout(LOSER_SHUTDOWN_GRACE, async {
+                    while let Some(joined) = attempts.join_next().await {
+                        if let Ok((_, Ok(value))) = joined {
+                            loser_values.push(value);
+                        }
+                    }
                 })
                 .await;
-                if drained.is_err() {
-                    // These attempts are aborted and end at their next poll.
-                    // Dropping the set at return detaches them.
-                    debug!(
-                        remaining = attempts.len(),
-                        "Happy Eyeballs: aborted attempts did not end within the grace period"
-                    );
-                }
+                release_losers(attempts, loser_values);
                 return Ok((conn, addr));
             }
             Some(Ok((addr, Err(err)))) => {
