@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Tests
 
 - **Direct-stage budget regressions for PeerId dials (#304).** A loopback UDP
-  gate holds the dialer's datagrams for 3 s, so the handshake cannot finish
-  before the adaptive budget expires. The tests check that
+  gate holds the dialer's datagrams for 3 s, counted from the first datagram
+  of the tested attempt, so the handshake cannot finish before the adaptive
+  budget expires. The tests check that
   `connect_with_fallback` with a PeerId, and the fallback re-dial of
   `connect_peer_with_addrs` after a fast pre-pass failure, complete after the
   gate opens. Guards check that the pre-pass path still completes and that

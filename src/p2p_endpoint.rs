@@ -4264,10 +4264,13 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
-        // #304: the caller's budget for this whole dial. The fallback ladder
-        // below caps any direct-stage extension at this deadline, so its
-        // re-dial after a direct pre-pass that used the budget does not wait
-        // for a second full budget.
+        // #304: the end of one establishment budget, counted from the start
+        // of this dial. The fallback ladder below uses it only as a cap on
+        // the direct-stage extension of a dial that cannot hole-punch. A
+        // re-dial after a direct pre-pass that used this budget therefore
+        // gets the adaptive budget, not a second full budget. It is not an
+        // end-to-end timeout: the pre-pass (one full handshake budget per
+        // candidate) and the other ladder stages keep their own bounds.
         let dial_deadline = tokio::time::Instant::now()
             + self
                 .config
