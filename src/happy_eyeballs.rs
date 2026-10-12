@@ -1184,6 +1184,185 @@ mod tests {
             .unwrap();
     }
 
+    /// A panic payload whose destructor blocks until a gate opens.
+    struct BlockingPayload {
+        gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for BlockingPayload {
+        fn drop(&mut self) {
+            let _ = self.gate.lock().unwrap().recv();
+            self.dropped.notify_one();
+        }
+    }
+
+    /// A dial error whose `Display` panics with a [`BlockingPayload`].
+    struct PanickingDisplayError(std::sync::Mutex<Option<BlockingPayload>>);
+
+    impl std::fmt::Display for PanickingDisplayError {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let payload = self.0.lock().unwrap().take();
+            // `resume_unwind` skips the panic hook, so the test log stays clean.
+            std::panic::resume_unwind(Box::new(payload))
+        }
+    }
+
+    /// A future local that panics with a [`BlockingPayload`] when the
+    /// aborted future is dropped.
+    struct PanicOnCancel(Option<BlockingPayload>);
+
+    impl Drop for PanicOnCancel {
+        fn drop(&mut self) {
+            if let Some(payload) = self.0.take() {
+                std::panic::resume_unwind(Box::new(payload));
+            }
+        }
+    }
+
+    /// A gate that a separate thread opens only after the test reports that
+    /// the race returned, or after a 5 s guard.
+    struct ReleaseGate {
+        gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+        returned: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl ReleaseGate {
+        fn new() -> Self {
+            let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+            let (returned, returned_rx) = std::sync::mpsc::channel::<()>();
+            let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opened_by_thread = Arc::clone(&opened);
+            let thread = std::thread::spawn(move || {
+                let _ = returned_rx.recv_timeout(Duration::from_secs(5));
+                opened_by_thread.store(true, Ordering::SeqCst);
+                let _ = gate_tx.send(());
+            });
+            Self {
+                gate: Arc::new(std::sync::Mutex::new(gate_rx)),
+                opened,
+                returned,
+                thread,
+            }
+        }
+
+        /// Report that the race returned; return whether the gate was
+        /// already open at that time.
+        fn race_returned(self) -> bool {
+            let was_open = self.opened.load(Ordering::SeqCst);
+            let _ = self.returned.send(());
+            self.thread.join().unwrap();
+            was_open
+        }
+    }
+
+    /// #294 round 4 (Codex probe 1): a losing dial error whose `Display`
+    /// panics yields a panic payload. The race must not drop that payload on
+    /// the coordinator: its destructor can block, and a timeout cannot
+    /// interrupt a synchronous drop. The payload must still be dropped later.
+    ///
+    /// Deterministic: current-thread runtime and explicit gates. The winner
+    /// completes first and wakes the loser, which fails in the same scheduler
+    /// pass. A race that drops the payload inline can return only after the
+    /// gate thread opens the gate (5 s guard).
+    #[tokio::test]
+    async fn losing_error_display_panic_payload_does_not_hold_ready_winner() {
+        let gate = ReleaseGate::new();
+        let payload_gate = Arc::clone(&gate.gate);
+        let payload_dropped = Arc::new(tokio::sync::Notify::new());
+        let payload_dropped_for_attempt = Arc::clone(&payload_dropped);
+        let loser_may_finish = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let loser_may_finish = Arc::clone(&loser_may_finish);
+            let gate = Arc::clone(&payload_gate);
+            let dropped = Arc::clone(&payload_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: fails right after the winner; formatting the
+                    // error panics.
+                    loser_may_finish.notified().await;
+                    let payload = BlockingPayload { gate, dropped };
+                    Err(PanickingDisplayError(std::sync::Mutex::new(Some(payload))))
+                } else {
+                    // Winner: wake the loser, then win.
+                    loser_may_finish.notify_one();
+                    Ok(42u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!((winner, addr), (42, v4("10.0.0.1:80")));
+        assert!(
+            !gate.race_returned(),
+            "the ready winner was held until the loser's panic payload was released"
+        );
+        // No leak: the payload is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), payload_dropped.notified())
+            .await
+            .unwrap();
+    }
+
+    /// #294 round 4 (Codex probe 2): aborting a pending loser drops its
+    /// future, and a destructor in that future can panic. Tokio then returns
+    /// a panic-bearing join error. The race must not drop that error's
+    /// payload on the coordinator either. The payload must still be dropped
+    /// later.
+    ///
+    /// Deterministic: current-thread runtime and explicit gates, as above.
+    #[tokio::test]
+    async fn aborted_loser_panic_payload_does_not_hold_ready_winner() {
+        let gate = ReleaseGate::new();
+        let payload_gate = Arc::clone(&gate.gate);
+        let payload_dropped = Arc::new(tokio::sync::Notify::new());
+        let payload_dropped_for_attempt = Arc::clone(&payload_dropped);
+        let loser_entered = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let loser_entered = Arc::clone(&loser_entered);
+            let gate = Arc::clone(&payload_gate);
+            let dropped = Arc::clone(&payload_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: pending until aborted; the abort drops the bomb.
+                    let _bomb = PanicOnCancel(Some(BlockingPayload { gate, dropped }));
+                    loser_entered.notify_one();
+                    std::future::pending::<Result<u8, String>>().await
+                } else {
+                    // Winner: win after the loser is pending.
+                    loser_entered.notified().await;
+                    Ok(42u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!((winner, addr), (42, v4("10.0.0.1:80")));
+        assert!(
+            !gate.race_returned(),
+            "the ready winner was held until the aborted loser's panic payload was released"
+        );
+        // No leak: the payload is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), payload_dropped.notified())
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn test_error_display() {
         let err = HappyEyeballsError::NoAddresses;
