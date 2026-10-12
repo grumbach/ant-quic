@@ -437,6 +437,30 @@ pub(crate) struct TrackedConnection {
     reader_restart_pending_since: Option<Instant>,
 }
 
+/// #313 round 3 (finding 3): counts of our own relay uses per connection.
+type ClientRelayUseCounts = ParkingMutex<HashMap<usize, usize>>;
+
+/// #313 round 3 (finding 3): one relay use of ours on a connection, from
+/// its selection for a CONNECT-UDP handshake until the session is published
+/// (`relay_sessions` then covers it) or the handshake ends. While it lives,
+/// a retirement claim refuses the connection and a drain waits.
+struct ClientRelayUse {
+    counts: Arc<ClientRelayUseCounts>,
+    stable_id: usize,
+}
+
+impl Drop for ClientRelayUse {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.stable_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.stable_id);
+            }
+        }
+    }
+}
+
 /// #313 R2: source of lifecycle epochs (Live periods and retirement
 /// obligations). Monotonic and process-wide; a value is never reused.
 static LIFECYCLE_EPOCHS: AtomicU64 = AtomicU64::new(1);
@@ -1648,6 +1672,10 @@ pub struct NatTraversalEndpoint {
     /// Active relay sessions by relay server address
     /// Uses DashMap for fine-grained concurrent access without blocking workers
     relay_sessions: Arc<dashmap::DashMap<SocketAddr, RelaySession>>,
+    /// #313 round 3 (finding 3): our own relay use of a connection, per
+    /// stable id, from the moment `establish_relay_session` selects the
+    /// connection until the session is published or the handshake ends.
+    client_relay_uses: Arc<ClientRelayUseCounts>,
     /// Shared QUIC endpoint bound to the relay socket.
     ///
     /// The relay server allows one CONNECT-UDP bind session per client address,
@@ -3057,6 +3085,7 @@ impl NatTraversalEndpoint {
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
+            client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
@@ -3586,6 +3615,7 @@ impl NatTraversalEndpoint {
             emitted_established_events: emitted_established_events.clone(),
             relay_manager,
             relay_sessions: Arc::new(dashmap::DashMap::new()),
+            client_relay_uses: Arc::new(ParkingMutex::new(HashMap::new())),
             shared_relay_endpoint: Arc::new(std::sync::Mutex::new(None)),
             relay_accept_loop_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             accept_worker_handles: Arc::new(ParkingMutex::new(Vec::new())),
@@ -7570,12 +7600,21 @@ impl NatTraversalEndpoint {
                 None
             }
         });
-        let connection = if let Some(existing) = existing_conn {
+        // #313 round 3 (finding 3): count our relay use of the connection from
+        // its selection, coordinated with the retirement claim under the
+        // lifecycle lock. A connection that is being retired is not reused.
+        let reused = existing_conn.and_then(|existing| {
+            self.begin_client_relay_use(&existing)
+                .map(|relay_use| (existing, relay_use))
+        });
+        let (connection, _relay_use) = if let Some((existing, relay_use)) = reused {
             info!("Reusing existing peer connection to relay {}", relay_addr);
-            existing
+            (existing, Some(relay_use))
         } else {
             // No existing connection — create one
-            self.connect_new_to_relay(relay_addr).await?
+            let connection = self.connect_new_to_relay(relay_addr).await?;
+            let relay_use = self.begin_client_relay_use(&connection);
+            (connection, relay_use)
         };
 
         // Open a bidirectional stream for the CONNECT-UDP handshake
@@ -8940,9 +8979,12 @@ impl NatTraversalEndpoint {
         if !candidate.is_open() {
             return RetireClaim::Ineligible("the candidate is already closed");
         }
-        // #313 round 2 (P2-5): a live relay session of ours uses it.
-        if self.relay_session_uses(stable_id) {
-            return RetireClaim::Ineligible("a relay session uses the candidate");
+        // #313 round 2 (P2-5) and round 3 (finding 3): our own relay session,
+        // or a relay handshake of ours in flight, uses it.
+        if self.client_relay_active_on(stable_id) {
+            return RetireClaim::Ineligible(
+                "a relay session or handshake of ours uses the candidate",
+            );
         }
         let retiring = ConnectionLifecycleState::Retiring {
             replaced_by_generation,
@@ -9108,6 +9150,43 @@ impl NatTraversalEndpoint {
         }) {
             entry.reader_restart_pending_since = Some(Instant::now());
         }
+    }
+
+    /// #313 round 3 (finding 3): start one relay use of ours on
+    /// `connection`, unless the lifecycle is retiring or closing it. Under
+    /// the lifecycle write lock, so a retirement claim either sees the use
+    /// or the use sees the claim.
+    fn begin_client_relay_use(&self, connection: &InnerConnection) -> Option<ClientRelayUse> {
+        let stable_id = connection.stable_id();
+        let lifecycle = self.connection_lifecycle.write();
+        let taken = lifecycle.values().flatten().any(|entry| {
+            entry.stable_id() == stable_id
+                && matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Retiring { .. }
+                        | ConnectionLifecycleState::Closing { .. }
+                        | ConnectionLifecycleState::Closed { .. }
+                )
+        });
+        if taken {
+            return None;
+        }
+        *self.client_relay_uses.lock().entry(stable_id).or_default() += 1;
+        drop(lifecycle);
+        Some(ClientRelayUse {
+            counts: Arc::clone(&self.client_relay_uses),
+            stable_id,
+        })
+    }
+
+    /// #313 round 3 (finding 3): true while our own relay handshake or
+    /// published relay session uses the connection `stable_id`.
+    pub(crate) fn client_relay_active_on(&self, stable_id: usize) -> bool {
+        self.client_relay_uses
+            .lock()
+            .get(&stable_id)
+            .is_some_and(|count| *count > 0)
+            || self.relay_session_uses(stable_id)
     }
 
     /// #313 round 2 (P2-5): true while a client relay session of this

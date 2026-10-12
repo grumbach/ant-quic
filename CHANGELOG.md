@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only when: its winner is open and read locally; a probe on the winner was
   answered at most 3 s before; the peer sent a request on the winner, and
   nothing on the superseded connection for 30 s; no relay session (served,
-  or our own client session) runs on the superseded connection; and the
+  or our own client session, counted from the moment our CONNECT-UDP
+  handshake selects the connection) runs on the superseded connection; and the
   winner has been Live for 30 s. The reader, activity and relay evidence is
   checked again, under locks, at the claim. The arbiter then drains the
   connection (its reader stops at the next stream boundary; in-flight reads,
