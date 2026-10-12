@@ -19,7 +19,7 @@ ADRs document significant architectural decisions made in the project. Each reco
 | [ADR-007](ADR-007-local-only-hostkey.md) | Local-only HostKey | Accepted | 2025-12-22 |
 | [ADR-008](ADR-008-universal-connectivity-architecture.md) | Universal Connectivity Architecture | Accepted | 2025-12-26 |
 | [ADR-010](ADR-010-ble-transport-opt-in.md) | BLE Transport Stays Opt-In Until macOS Packaging Is Solved | Proposed | 2026-08-06 |
-| [ADR-017](ADR-017-single-arbiter-connection-retirement.md) | Single-Arbiter, Evidence-Gated Connection Retirement | Proposed | 2026-10-12 |
+| [ADR-017](ADR-017-single-arbiter-connection-retirement.md) | Single-Arbiter, Evidence-Gated Connection Retirement | Accepted | 2026-10-12 |
 
 ## ADR Template
 
