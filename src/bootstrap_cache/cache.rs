@@ -112,6 +112,18 @@ impl BootstrapCache {
         })
     }
 
+    /// Open or create a bootstrap cache for the node whose own PeerId is
+    /// `local_peer_id` (#269).
+    ///
+    /// RED scaffold: the exclusion is not implemented yet.
+    pub async fn open_for_local_peer(
+        config: BootstrapCacheConfig,
+        local_peer_id: PeerId,
+    ) -> std::io::Result<Self> {
+        let _ = local_peer_id;
+        Self::open(config).await
+    }
+
     /// Subscribe to cache events
     pub fn subscribe(&self) -> broadcast::Receiver<CacheEvent> {
         self.event_tx.subscribe()
@@ -928,6 +940,262 @@ mod tests {
         assert!(
             !peer.capabilities.supports_relay && !peer.capabilities.supports_coordination,
             "inbound evidence must not grant helper capabilities"
+        );
+    }
+
+    // ========================================================================
+    // #269: own-peer exclusion and IPv4-mapped address normalisation
+    // ========================================================================
+
+    const LOCAL: PeerId = PeerId([0x69; 32]);
+    const OTHER: PeerId = PeerId([0x70; 32]);
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("socket addr")
+    }
+
+    fn test_config(temp_dir: &TempDir) -> BootstrapCacheConfig {
+        BootstrapCacheConfig::builder()
+            .cache_dir(temp_dir.path())
+            .max_peers(100)
+            .epsilon(0.0)
+            .min_peers_to_save(1)
+            .build()
+    }
+
+    /// A peer with fresh global direct evidence: the best relay candidate.
+    fn relay_capable_peer(peer_id: PeerId, address: SocketAddr) -> CachedPeer {
+        let mut peer = CachedPeer::new(peer_id, vec![address], PeerSource::Connection);
+        peer.capabilities
+            .record_direct_observation(address, SystemTime::now());
+        peer.quality_score = 1.0;
+        peer
+    }
+
+    /// Write `peers` with the on-disk format and no cache-layer guards, as an
+    /// older build (or another process) would have written them.
+    fn write_cache_file(temp_dir: &TempDir, peers: Vec<CachedPeer>) {
+        let persistence = CachePersistence::new(temp_dir.path(), true).expect("persistence");
+        let mut data = CacheData::new(super::super::persistence::generate_instance_id());
+        for peer in peers {
+            data.peers.insert(peer.peer_id.0, peer);
+        }
+        persistence.save(&mut data).expect("write cache file");
+    }
+
+    async fn assert_no_selection_returns(cache: &BootstrapCache, peer_id: PeerId) {
+        let target = addr("203.0.113.200:9000");
+        let selections = [
+            ("select_peers", cache.select_peers(10).await),
+            ("select_relay_peers", cache.select_relay_peers(10).await),
+            ("select_coordinators", cache.select_coordinators(10).await),
+            (
+                "select_relays_for_target",
+                cache.select_relays_for_target(10, &target, false).await,
+            ),
+            (
+                "select_dual_stack_relays",
+                cache.select_dual_stack_relays(10).await,
+            ),
+            ("all_peers", cache.all_peers().await),
+        ];
+        for (name, peers) in selections {
+            assert!(
+                peers.iter().all(|peer| peer.peer_id != peer_id),
+                "{name} returned the local node's own entry"
+            );
+        }
+    }
+
+    /// #269: a restarted node must not load its own entry from a cache file
+    /// that an older build wrote, and no selection may return it.
+    #[tokio::test]
+    async fn local_peer_entry_is_dropped_when_an_existing_file_loads() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        write_cache_file(
+            &temp_dir,
+            vec![
+                relay_capable_peer(LOCAL, addr("203.0.113.69:9000")),
+                relay_capable_peer(OTHER, addr("203.0.113.70:9000")),
+            ],
+        );
+
+        let cache = BootstrapCache::open_for_local_peer(test_config(&temp_dir), LOCAL)
+            .await
+            .expect("open existing cache file");
+
+        assert!(
+            !cache.contains(&LOCAL).await,
+            "the local node's own entry must not load"
+        );
+        assert!(cache.contains(&OTHER).await, "other entries still load");
+        assert_eq!(cache.peer_count().await, 1);
+        assert_no_selection_returns(&cache, LOCAL).await;
+    }
+
+    /// #269: no insert path may store the local node's own entry, so no
+    /// selection can return it.
+    #[tokio::test]
+    async fn local_peer_is_never_stored_or_selected() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = BootstrapCache::open_for_local_peer(test_config(&temp_dir), LOCAL)
+            .await
+            .expect("open");
+        let own_addr = addr("203.0.113.69:9000");
+
+        cache.upsert(relay_capable_peer(LOCAL, own_addr)).await;
+        cache.add_seed(LOCAL, vec![own_addr]).await;
+        cache.add_from_connection(LOCAL, vec![own_addr], None).await;
+        cache.observe_direct_reachability(LOCAL, own_addr).await;
+        cache.observe_inbound_peer_address(LOCAL, own_addr).await;
+        cache
+            .upsert(relay_capable_peer(OTHER, addr("203.0.113.70:9000")))
+            .await;
+
+        assert!(
+            !cache.contains(&LOCAL).await,
+            "the local node's own entry must never be stored"
+        );
+        assert!(cache.get(&LOCAL).await.is_none());
+        assert_eq!(cache.peer_count().await, 1);
+        assert_no_selection_returns(&cache, LOCAL).await;
+    }
+
+    /// #269: IPv4-mapped IPv6 addresses are stored as plain IPv4, and the
+    /// duplicates that the rewrite exposes are removed.
+    #[tokio::test]
+    async fn ipv4_mapped_addresses_are_normalised_and_deduplicated() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = create_test_cache(&temp_dir).await;
+        let mut peer = CachedPeer::new(
+            OTHER,
+            vec![
+                addr("[::ffff:198.51.100.7]:9000"),
+                addr("198.51.100.7:9000"),
+                addr("[::ffff:198.51.100.8]:9001"),
+                addr("[2001:db8::7]:9000"),
+            ],
+            PeerSource::Connection,
+        );
+        peer.capabilities
+            .record_external_address(addr("[::ffff:198.51.100.9]:9002"));
+        cache.upsert(peer).await;
+        cache
+            .observe_inbound_peer_address(OTHER, addr("[::ffff:198.51.100.8]:9001"))
+            .await;
+
+        let stored = cache.get(&OTHER).await.expect("peer stored");
+        assert_eq!(
+            stored.addresses,
+            vec![
+                addr("198.51.100.7:9000"),
+                addr("198.51.100.8:9001"),
+                addr("[2001:db8::7]:9000"),
+            ],
+            "mapped addresses must be stored as IPv4 without duplicates"
+        );
+        assert_eq!(
+            stored.capabilities.external_addresses,
+            vec![addr("198.51.100.9:9002")]
+        );
+        assert!(
+            stored
+                .preferred_addresses()
+                .iter()
+                .all(|a| crate::shared::normalize_socket_addr(*a) == *a),
+            "the dial path must never get a mapped address: {:?}",
+            stored.preferred_addresses()
+        );
+    }
+
+    /// #269: a mapped private (LAN) address is LAN evidence, not global
+    /// evidence. Before the fix the mapped form was classified as a global
+    /// IPv6 address, which granted relay and coordinator capability.
+    #[tokio::test]
+    async fn mapped_private_address_does_not_grant_relay_capability() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = create_test_cache(&temp_dir).await;
+
+        cache
+            .observe_direct_reachability(OTHER, addr("[::ffff:192.168.1.50]:9000"))
+            .await;
+
+        let peer = cache.get(&OTHER).await.expect("peer stored");
+        assert_eq!(peer.addresses, vec![addr("192.168.1.50:9000")]);
+        assert_eq!(
+            peer.capabilities
+                .reachable_addresses
+                .iter()
+                .map(|record| (record.address, record.scope))
+                .collect::<Vec<_>>(),
+            vec![(
+                addr("192.168.1.50:9000"),
+                crate::reachability::ReachabilityScope::LocalNetwork
+            )]
+        );
+        assert!(
+            !peer.capabilities.supports_relay && !peer.capabilities.supports_coordination,
+            "LAN evidence must not grant helper capability"
+        );
+    }
+
+    /// #269: a cache file that an older build wrote with mapped addresses
+    /// (and the wrong global scope) still loads, and loads normalised. The
+    /// stored format does not change.
+    #[tokio::test]
+    async fn existing_cache_file_with_mapped_addresses_loads_normalised() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mapped_lan = addr("[::ffff:192.168.1.60]:9000");
+        let mut legacy = CachedPeer::new(
+            OTHER,
+            vec![mapped_lan, addr("192.168.1.60:9000")],
+            PeerSource::Connection,
+        );
+        // What an older build recorded for a mapped LAN address.
+        legacy
+            .capabilities
+            .reachable_addresses
+            .push(super::super::entry::ReachableAddressRecord {
+                address: mapped_lan,
+                scope: crate::reachability::ReachabilityScope::Global,
+                verified_at: SystemTime::now(),
+            });
+        legacy.capabilities.direct_reachability_scope =
+            Some(crate::reachability::ReachabilityScope::Global);
+        legacy.capabilities.supports_relay = true;
+        legacy.capabilities.supports_coordination = true;
+        write_cache_file(&temp_dir, vec![legacy]);
+
+        let cache = BootstrapCache::open(test_config(&temp_dir))
+            .await
+            .expect("an existing cache file must still load");
+        let peer = cache.get(&OTHER).await.expect("peer loaded");
+
+        assert_eq!(peer.addresses, vec![addr("192.168.1.60:9000")]);
+        assert_eq!(
+            peer.capabilities
+                .reachable_addresses
+                .iter()
+                .map(|record| (record.address, record.scope))
+                .collect::<Vec<_>>(),
+            vec![(
+                addr("192.168.1.60:9000"),
+                crate::reachability::ReachabilityScope::LocalNetwork
+            )]
+        );
+        assert!(
+            !peer.capabilities.supports_relay,
+            "reloaded LAN evidence must not keep a relay grant"
+        );
+        let relays = cache
+            .select_relays_for_target(1, &addr("192.168.1.99:9000"), false)
+            .await;
+        assert!(
+            relays
+                .iter()
+                .flat_map(CachedPeer::preferred_addresses)
+                .all(|a| a.is_ipv4()),
+            "relay selection must hand out IPv4, not mapped IPv6"
         );
     }
 
