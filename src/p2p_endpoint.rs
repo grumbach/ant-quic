@@ -8829,7 +8829,7 @@ impl P2pEndpoint {
         let reader_handles = Arc::clone(&self.reader_handles);
         let exited_reader_generations = Arc::clone(&self.exited_reader_generations);
         self.inner
-            .set_reader_liveness_probe(Arc::new(move |peer_id, generation| {
+            .set_reader_liveness_probe(Arc::new(move |peer_id, generation, stable_id| {
                 // F2 (#368 r1): an EXITED reader is dead regardless of the
                 // spawn-grace age gate — tombstones first. Contended
                 // tombstone reads conservatively skip this fast-path (the
@@ -8850,7 +8850,10 @@ impl P2pEndpoint {
                 // winners; false positives self-correct within one janitor
                 // interval). F3: readers spawned from session_connection()
                 // carry generation = conn_stable_id, which can differ from
-                // the lifecycle generation — match either. F4: a panicked
+                // the lifecycle generation — match either. #313 R1: the
+                // second match compares the reader's connection with the
+                // tracked connection's stable_id (it compared a stable_id
+                // with the generation, which never matched). F4: a panicked
                 // reader's handle is only removed at the end of the task
                 // body, so also require the task not finished.
                 reader_handles.try_read().map_or(true, |handles| {
@@ -8858,7 +8861,7 @@ impl P2pEndpoint {
                         entries.iter().any(|entry| {
                             entry.is_running()
                                 && (entry.generation == generation
-                                    || entry.conn_stable_id == generation as usize)
+                                    || entry.conn_stable_id == stable_id)
                                 && !entry.abort_handle.is_finished()
                         })
                     })
@@ -10164,15 +10167,23 @@ impl P2pEndpoint {
         let lifecycle_snapshot = self
             .inner
             .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
-        if mode == ReaderStartMode::Adoption
-            && (self.shutdown.is_cancelled()
-                || connection.close_reason().is_some()
-                || lifecycle_snapshot.is_some_and(|snapshot| {
-                    !matches!(
+        // #313 R1: connections of origin `Raw` (hole-punch and accepted-
+        // coordination winners) keep master's reader behaviour in every
+        // lifecycle state: an adoption may start on them, and their reader is
+        // never pre-cancelled. Before R1 they were untracked, so no reader
+        // start ever saw a non-Live snapshot for them.
+        let starts_like_master_raw =
+            |snapshot: &crate::nat_traversal_api::ConnectionLifecycleSnapshot| {
+                snapshot.origin == crate::nat_traversal_api::ConnectionOrigin::Raw
+                    || matches!(
                         snapshot.state,
                         crate::connection_lifecycle::ConnectionLifecycleState::Live
                     )
-                }))
+            };
+        if mode == ReaderStartMode::Adoption
+            && (self.shutdown.is_cancelled()
+                || connection.close_reason().is_some()
+                || lifecycle_snapshot.is_some_and(|snapshot| !starts_like_master_raw(&snapshot)))
         {
             return ReaderStart::NotStarted;
         }
@@ -10194,10 +10205,7 @@ impl P2pEndpoint {
                 state = ?snapshot.state,
                 "spawning reader task with lifecycle snapshot"
             );
-            if !matches!(
-                snapshot.state,
-                crate::connection_lifecycle::ConnectionLifecycleState::Live
-            ) {
+            if !starts_like_master_raw(&snapshot) {
                 cancel.cancel();
             }
         }
@@ -10263,12 +10271,7 @@ impl P2pEndpoint {
                 .connection_snapshot_by_stable_id(&peer_id, conn_stable_id);
             let unchanged = current.map(|snapshot| snapshot.generation)
                 == lifecycle_snapshot.map(|snapshot| snapshot.generation)
-                && current.is_none_or(|snapshot| {
-                    matches!(
-                        snapshot.state,
-                        crate::connection_lifecycle::ConnectionLifecycleState::Live
-                    )
-                });
+                && current.is_none_or(|snapshot| starts_like_master_raw(&snapshot));
             if !unchanged || connection.close_reason().is_some() || self.shutdown.is_cancelled() {
                 return ReaderStart::NotStarted;
             }
@@ -11519,6 +11522,7 @@ mod tests {
             connection_id: [0; 32],
             state: ConnectionLifecycleState::Live,
             established_at_unix_ms: 0,
+            origin: crate::nat_traversal_api::ConnectionOrigin::Registered,
         };
         assert!(send_generation_matches(Some(live), 42));
         assert!(!send_generation_matches(Some(live), 41));
@@ -11548,6 +11552,7 @@ mod tests {
             connection_id: [0; 32],
             state: ConnectionLifecycleState::Live,
             established_at_unix_ms: 0,
+            origin: crate::nat_traversal_api::ConnectionOrigin::Registered,
         };
         let calls = Cell::new(0);
         for snapshot in [
@@ -18888,6 +18893,18 @@ mod tests {
             }
         }
 
+        /// #313 R1: the connection is lifecycle-tracked and Live.
+        fn is_tracked_live(node: &P2pEndpoint, peer: &PeerId, stable_id: usize) -> bool {
+            node.inner
+                .connection_snapshot_by_stable_id(peer, stable_id)
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        crate::connection_lifecycle::ConnectionLifecycleState::Live
+                    )
+                })
+        }
+
         async fn wait_for_reader(node: &P2pEndpoint, peer: &PeerId, stable_id: usize, what: &str) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             while !node.live_reader_for_test(peer, stable_id).await {
@@ -18999,8 +19016,8 @@ mod tests {
                 .expect("A's waiter finalises H");
             let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
             assert!(
-                a.inner.current_connection_generation(&b_peer).is_none(),
-                "H must be an untracked raw winner at A"
+                is_tracked_live(&a, &b_peer, h.stable_id()),
+                "R1: H is A's lifecycle-tracked Live winner"
             );
             wait_for_reader(&a, &b_peer, h.stable_id(), "A's waiter-started reader on H").await;
 
@@ -19026,8 +19043,8 @@ mod tests {
             .await;
             assert!(h.close_reason().is_none(), "H stays open");
             assert!(
-                a.inner.current_connection_generation(&b_peer).is_none(),
-                "C must be an untracked raw winner at A"
+                is_tracked_live(&a, &b_peer, c.stable_id()),
+                "R1: C is A's lifecycle-tracked Live winner"
             );
 
             wait_for_generation(&b, &a_peer, "B registers C as the newer generation", |g| {
@@ -19071,7 +19088,10 @@ mod tests {
                 .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
                 .expect("start hole-punch H");
             let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
-            assert!(a.inner.current_connection_generation(&b_peer).is_none());
+            assert!(
+                is_tracked_live(&a, &b_peer, h.stable_id()),
+                "R1: H is A's lifecycle-tracked Live winner"
+            );
 
             wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
             let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |_| true).await;
@@ -19205,8 +19225,8 @@ mod tests {
             assert!(handled);
             let c_b = wait_for_winner(&b, &a_peer, "C_B is B's winner", |_| true).await;
             assert!(
-                b.inner.current_connection_generation(&a_peer).is_none(),
-                "C_B must be an untracked raw winner at B"
+                is_tracked_live(&b, &a_peer, c_b.stable_id()),
+                "R1: C_B is B's lifecycle-tracked Live winner"
             );
 
             wait_for_generation(&a, &b_peer, "A registers C_B", |_| true).await;
@@ -19660,8 +19680,8 @@ mod tests {
 
         /// Fix-only control (C4): adopting a raw winner starts its reader and
         /// nothing else. No outer peer record, no lifecycle event, no
-        /// lifecycle entry, and the winner map still routes to the same
-        /// connection.
+        /// lifecycle entry beyond the registrar's own (#313 R1 tracks the
+        /// winner), and the winner map still routes to the same connection.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn raw_winner_adoption_is_reader_only() {
             let a = shim_node().await;
@@ -19695,7 +19715,16 @@ mod tests {
                 !b.connected_peers.read().await.contains_key(&a_peer),
                 "a reader adoption must not record an outer peer"
             );
-            assert!(b.inner.lifecycle_empty_for_test(&a_peer));
+            assert_eq!(
+                b.inner
+                    .lifecycle_entries_for_test(&a_peer)
+                    .iter()
+                    .map(|(stable_id, _, _)| *stable_id)
+                    .collect::<Vec<_>>(),
+                vec![c_b.stable_id()],
+                "R1: the lifecycle holds only the registrar's entry for C_B; the adoption \
+                 adds none"
+            );
             let routed = winner(&b, &a_peer).await.expect("B still routes to A");
             assert_eq!(routed.stable_id(), c_b.stable_id(), "routing unchanged");
             loop {
