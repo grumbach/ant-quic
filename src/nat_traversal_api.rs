@@ -417,9 +417,46 @@ pub(crate) struct TrackedConnection {
     traversal_method: TraversalMethod,
     /// #313 R1: how the connection entered lifecycle custody.
     origin: ConnectionOrigin,
+    /// #313 R2 (ADR-017 E4): the retirement obligation of the current
+    /// Superseded period, as its epoch. Recorded at every transition to
+    /// Superseded, whether or not `accept` ever delivers the connection;
+    /// cleared when the entry becomes Live again.
+    obligation_epoch: Option<u64>,
+    /// #313 R2: the current Live period, as `(epoch, start)`; `None` while
+    /// the entry is not Live.
+    live_period: Option<(u64, Instant)>,
+    /// #313 R2 (ADR-017 E2): a probe pinned to this connection, issued in the
+    /// Live period with this epoch, was answered at this instant.
+    confirmed: Option<(u64, Instant)>,
+}
+
+/// #313 R2: source of lifecycle epochs (Live periods and retirement
+/// obligations). Monotonic and process-wide; a value is never reused.
+static LIFECYCLE_EPOCHS: AtomicU64 = AtomicU64::new(1);
+
+fn next_lifecycle_epoch() -> u64 {
+    LIFECYCLE_EPOCHS.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TrackedConnection {
+    /// #313 R2: enter a new Live period.
+    fn become_live(&mut self) {
+        self.state = ConnectionLifecycleState::Live;
+        self.obligation_epoch = None;
+        self.live_period = Some((next_lifecycle_epoch(), Instant::now()));
+        self.confirmed = None;
+    }
+
+    /// #313 R2: enter a new Superseded period, with a new obligation epoch.
+    fn become_superseded(&mut self, replaced_by_generation: u64) {
+        self.state = ConnectionLifecycleState::Superseded {
+            replaced_by_generation,
+        };
+        self.obligation_epoch = Some(next_lifecycle_epoch());
+        self.live_period = None;
+        self.confirmed = None;
+    }
+
     fn stable_id(&self) -> usize {
         self.connection.stable_id()
     }
@@ -510,6 +547,9 @@ pub(crate) fn tracked_connection_with_sort_keys_for_test(
         state: ConnectionLifecycleState::Live,
         traversal_method,
         origin: ConnectionOrigin::Registered,
+        obligation_epoch: None,
+        live_period: Some((next_lifecycle_epoch(), Instant::now())),
+        confirmed: None,
     }
 }
 
@@ -529,6 +569,48 @@ pub(crate) struct PromotedConnection {
 pub(crate) struct ReaderAdoption {
     pub(crate) peer_id: PeerId,
     pub(crate) connection: InnerConnection,
+}
+
+/// #313 R2 (ADR-017): the arbiter's current Live winner for a peer, with
+/// its Live period and its last probe answer in that period.
+pub(crate) struct RetirementWinner {
+    pub(crate) stable_id: usize,
+    pub(crate) connection: InnerConnection,
+    pub(crate) live_epoch: u64,
+    pub(crate) live_since: Instant,
+    pub(crate) confirmed_at: Option<Instant>,
+}
+
+/// #313 R2: an open Superseded connection with a retirement obligation.
+pub(crate) struct RetirementCandidate {
+    pub(crate) stable_id: usize,
+    pub(crate) epoch: u64,
+}
+
+/// #313 R2: one peer's retirement work at an arbiter.
+pub(crate) struct RetirementWork {
+    pub(crate) peer_id: PeerId,
+    pub(crate) winner: Option<RetirementWinner>,
+    pub(crate) candidates: Vec<RetirementCandidate>,
+}
+
+/// #313 R2: result of [`NatTraversalEndpoint::try_claim_retirement`].
+pub(crate) enum RetireClaim {
+    /// The connection is now Retiring; the caller owns its drain.
+    Claimed { connection: InnerConnection },
+    /// A check failed; the reason is for logs.
+    Ineligible(&'static str),
+}
+
+/// #313 R2: result of [`NatTraversalEndpoint::follow_connection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FollowOutcome {
+    /// The connection became this follower's Live winner.
+    Followed,
+    /// It already was the Live winner.
+    AlreadyLive,
+    /// Not followed; the reason is for logs.
+    NotEligible(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8041,6 +8123,9 @@ impl NatTraversalEndpoint {
             state: ConnectionLifecycleState::Live,
             traversal_method: TraversalMethod::Direct,
             origin,
+            obligation_epoch: None,
+            live_period: Some((next_lifecycle_epoch(), Instant::now())),
+            confirmed: None,
         };
 
         /// How the locked decision treats the candidate.
@@ -8225,9 +8310,7 @@ impl NatTraversalEndpoint {
                             .name(),
                             ConnectionCloseReason::Superseded,
                         );
-                        entries[live_idx].state = ConnectionLifecycleState::Superseded {
-                            replaced_by_generation: generation,
-                        };
+                        entries[live_idx].become_superseded(generation);
                     }
                     Self::log_lifecycle_live(&peer_id, &tracked);
                     entries.push(tracked.clone());
@@ -8342,6 +8425,9 @@ impl NatTraversalEndpoint {
             },
             traversal_method: TraversalMethod::Direct,
             origin: ConnectionOrigin::Raw,
+            obligation_epoch: Some(next_lifecycle_epoch()),
+            live_period: None,
+            confirmed: None,
         };
         Self::log_lifecycle_transition(
             peer_id,
@@ -8419,9 +8505,9 @@ impl NatTraversalEndpoint {
                 | ConnectionLifecycleState::Closed { reason, .. } => {
                     Some((entry.generation, reason))
                 }
-                ConnectionLifecycleState::Live | ConnectionLifecycleState::Superseded { .. } => {
-                    None
-                }
+                ConnectionLifecycleState::Live
+                | ConnectionLifecycleState::Superseded { .. }
+                | ConnectionLifecycleState::Retiring { .. } => None,
             })
             .max_by_key(|(generation, _)| *generation)
             .map(|(_, reason)| reason)
@@ -8522,6 +8608,11 @@ impl NatTraversalEndpoint {
     /// winner exits during its drain window. Claiming the `Closing` transition
     /// under the lifecycle lock prevents the delayed reader-cancellation task
     /// from cancelling a connection after such a promotion.
+    ///
+    /// #313 R2: this was master's timed supersede close. ADR-017 replaced it
+    /// with the arbiter's evidence-gated retirement; it remains only for the
+    /// test-only legacy mode, which emulates older peers.
+    #[cfg(all(test, feature = "network-discovery"))]
     pub(crate) fn close_superseded_connection_if_current(
         &self,
         peer_id: &PeerId,
@@ -8587,6 +8678,431 @@ impl NatTraversalEndpoint {
         self.connection_lifecycle
             .write()
             .insert(peer_id, vec![entry]);
+    }
+
+    /// #313 R2 (ADR-017 A1): true when this endpoint is the retirement
+    /// arbiter of its pair with `peer_id`, that is when its own PeerId is the
+    /// greater one. Both ends of a pair compute opposite answers from the two
+    /// authenticated identities; an endpoint is never the arbiter of a pair
+    /// with its own id.
+    pub(crate) fn is_retirement_arbiter_for(&self, peer_id: &PeerId) -> bool {
+        self.local_peer_id.0 > peer_id.0
+    }
+
+    /// #313 R2: true when this endpoint is the follower of its pair with
+    /// `peer_id` (its own PeerId is the smaller one).
+    pub(crate) fn is_retirement_follower_for(&self, peer_id: &PeerId) -> bool {
+        self.local_peer_id.0 < peer_id.0
+    }
+
+    /// #313 R2: the retirement work of every peer this endpoint arbitrates
+    /// and that has at least one open Superseded connection with an
+    /// obligation.
+    pub(crate) fn retirement_work(&self) -> Vec<RetirementWork> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let lifecycle = self.connection_lifecycle.read();
+        let mut work = Vec::new();
+        for (peer_id, entries) in lifecycle.iter() {
+            if !self.is_retirement_arbiter_for(peer_id) {
+                continue;
+            }
+            let candidates: Vec<RetirementCandidate> = entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.state, ConnectionLifecycleState::Superseded { .. })
+                        && entry.is_open()
+                })
+                .filter_map(|entry| {
+                    entry.obligation_epoch.map(|epoch| RetirementCandidate {
+                        stable_id: entry.stable_id(),
+                        epoch,
+                    })
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let winner = entries
+                .iter()
+                .find(|entry| {
+                    matches!(entry.state, ConnectionLifecycleState::Live) && entry.is_open()
+                })
+                .and_then(|entry| {
+                    entry
+                        .live_period
+                        .map(|(live_epoch, live_since)| RetirementWinner {
+                            stable_id: entry.stable_id(),
+                            connection: entry.connection.clone(),
+                            live_epoch,
+                            live_since,
+                            confirmed_at: entry
+                                .confirmed
+                                .filter(|(epoch, _)| *epoch == live_epoch)
+                                .map(|(_, at)| at),
+                        })
+                });
+            work.push(RetirementWork {
+                peer_id: *peer_id,
+                winner,
+                candidates,
+            });
+        }
+        work
+    }
+
+    /// #313 R2 (ADR-017 E2): record that a probe pinned to the connection,
+    /// issued in its Live period `live_epoch`, was answered now. Ignored when
+    /// the connection is no longer Live in that period.
+    pub(crate) fn record_connection_confirmed(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        live_epoch: u64,
+    ) -> bool {
+        let mut lifecycle = self.connection_lifecycle.write();
+        let Some(entry) = lifecycle.get_mut(peer_id).and_then(|entries| {
+            entries
+                .iter_mut()
+                .find(|entry| entry.stable_id() == stable_id)
+        }) else {
+            return false;
+        };
+        if !matches!(entry.state, ConnectionLifecycleState::Live)
+            || entry.live_period.map(|(epoch, _)| epoch) != Some(live_epoch)
+        {
+            return false;
+        }
+        entry.confirmed = Some((live_epoch, Instant::now()));
+        true
+    }
+
+    /// #313 R2 (ADR-017 A4): the single retirement claim. Under the
+    /// lifecycle write lock it checks E0 (this endpoint is the arbiter), the
+    /// lifecycle part of E1 (the winner is the current Live connection, open,
+    /// in Live period `winner_live_epoch`, and not the candidate), E2 (a probe
+    /// answer on the winner in that period, at most `freshness` old), E3(c)
+    /// (the winner has been Live for at least `quiet`) and E4 (the candidate
+    /// is open, Superseded, with obligation `epoch`). On success the
+    /// candidate becomes Retiring and the caller owns its drain. The caller
+    /// checks the P2P-layer parts (E1's reader, E3(a) and E3(b)) just before.
+    pub(crate) fn try_claim_retirement(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        epoch: u64,
+        winner_stable_id: usize,
+        winner_live_epoch: u64,
+        quiet: Duration,
+        freshness: Duration,
+    ) -> RetireClaim {
+        if !self.is_retirement_arbiter_for(peer_id) {
+            return RetireClaim::Ineligible("not the arbiter of the pair");
+        }
+        let mut lifecycle = self.connection_lifecycle.write();
+        if self.shutdown.load(Ordering::Relaxed) {
+            return RetireClaim::Ineligible("shutting down");
+        }
+        let Some(entries) = lifecycle.get_mut(peer_id) else {
+            return RetireClaim::Ineligible("no lifecycle entries");
+        };
+        let now = Instant::now();
+        let Some(winner) = entries
+            .iter()
+            .find(|entry| entry.stable_id() == winner_stable_id)
+        else {
+            return RetireClaim::Ineligible("the winner is gone");
+        };
+        if winner_stable_id == stable_id {
+            return RetireClaim::Ineligible("the candidate is the winner");
+        }
+        if !matches!(winner.state, ConnectionLifecycleState::Live) || !winner.is_open() {
+            return RetireClaim::Ineligible("the winner is not an open Live connection");
+        }
+        let Some((live_epoch, live_since)) = winner.live_period else {
+            return RetireClaim::Ineligible("the winner has no Live period");
+        };
+        if live_epoch != winner_live_epoch {
+            return RetireClaim::Ineligible("the winner's Live period changed");
+        }
+        match winner.confirmed {
+            Some((confirmed_epoch, at))
+                if confirmed_epoch == live_epoch && now.duration_since(at) <= freshness => {}
+            _ => return RetireClaim::Ineligible("no fresh probe answer on the winner"),
+        }
+        if now.duration_since(live_since) < quiet {
+            return RetireClaim::Ineligible("the winner has been Live for less than Q");
+        }
+        let replaced_by_generation = winner.generation;
+        let Some(candidate) = entries
+            .iter_mut()
+            .find(|entry| entry.stable_id() == stable_id)
+        else {
+            return RetireClaim::Ineligible("the candidate is gone");
+        };
+        if !matches!(candidate.state, ConnectionLifecycleState::Superseded { .. }) {
+            return RetireClaim::Ineligible("the candidate is not Superseded");
+        }
+        if candidate.obligation_epoch != Some(epoch) {
+            return RetireClaim::Ineligible("the obligation epoch changed");
+        }
+        if !candidate.is_open() {
+            return RetireClaim::Ineligible("the candidate is already closed");
+        }
+        let retiring = ConnectionLifecycleState::Retiring {
+            replaced_by_generation,
+            epoch,
+        };
+        Self::log_lifecycle_transition(
+            peer_id,
+            candidate.generation,
+            &candidate.connection_id,
+            candidate.stable_id(),
+            candidate.state.name(),
+            retiring.name(),
+            ConnectionCloseReason::Superseded,
+        );
+        candidate.state = retiring;
+        RetireClaim::Claimed {
+            connection: candidate.connection.clone(),
+        }
+    }
+
+    /// #313 R2 (ADR-017 A4.1): complete a claimed retirement: only if the
+    /// connection is still Retiring for `epoch`, close it with the reserved
+    /// Superseded code and record it Closed. A stale completion (the claim
+    /// was aborted, or the connection was closed meanwhile) does nothing.
+    pub(crate) fn complete_retirement(
+        &self,
+        peer_id: &PeerId,
+        stable_id: usize,
+        epoch: u64,
+    ) -> bool {
+        let connection = {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let Some(entry) = lifecycle.get_mut(peer_id).and_then(|entries| {
+                entries
+                    .iter_mut()
+                    .find(|entry| entry.stable_id() == stable_id)
+            }) else {
+                return false;
+            };
+            if !matches!(
+                entry.state,
+                ConnectionLifecycleState::Retiring { epoch: claimed, .. } if claimed == epoch
+            ) {
+                return false;
+            }
+            let closing = ConnectionLifecycleState::Closing {
+                reason: ConnectionCloseReason::Superseded,
+            };
+            Self::log_lifecycle_transition(
+                peer_id,
+                entry.generation,
+                &entry.connection_id,
+                entry.stable_id(),
+                entry.state.name(),
+                closing.name(),
+                ConnectionCloseReason::Superseded,
+            );
+            entry.state = closing;
+            entry.connection.clone()
+        };
+        if connection.close_reason().is_none()
+            && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
+        {
+            connection.close(code, ConnectionCloseReason::Superseded.reason_bytes());
+        }
+        let _ = self.mark_connection_closed(peer_id, stable_id, ConnectionCloseReason::Superseded);
+        true
+    }
+
+    /// #313 R2 (ADR-017 A4.1 step 3): abort a claimed retirement because its
+    /// replacement died during the drain. The connection becomes Superseded
+    /// again with a new obligation epoch, and when the peer has no open Live
+    /// connection it is repromoted. Returns false for a stale abort.
+    pub(crate) fn abort_retirement(&self, peer_id: &PeerId, stable_id: usize, epoch: u64) -> bool {
+        let needs_promotion = {
+            let mut lifecycle = self.connection_lifecycle.write();
+            let Some(entries) = lifecycle.get_mut(peer_id) else {
+                return false;
+            };
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.stable_id() == stable_id)
+            else {
+                return false;
+            };
+            let ConnectionLifecycleState::Retiring {
+                replaced_by_generation,
+                epoch: claimed,
+            } = entry.state
+            else {
+                return false;
+            };
+            if claimed != epoch {
+                return false;
+            }
+            entry.become_superseded(replaced_by_generation);
+            Self::log_lifecycle_transition(
+                peer_id,
+                entry.generation,
+                &entry.connection_id,
+                entry.stable_id(),
+                "Retiring",
+                entry.state.name(),
+                ConnectionCloseReason::Superseded,
+            );
+            !entries.iter().any(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live) && entry.is_open()
+            })
+        };
+        if needs_promotion {
+            let _ = self.repromote_surviving_connection(peer_id, None);
+        }
+        true
+    }
+
+    /// #313 R2: true while `stable_id` is an open connection the lifecycle
+    /// tracks for `peer_id` (in a state that is not Closing or Closed).
+    pub(crate) fn is_open_tracked_connection(&self, peer_id: &PeerId, stable_id: usize) -> bool {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.stable_id() == stable_id
+                        && !matches!(
+                            entry.state,
+                            ConnectionLifecycleState::Closing { .. }
+                                | ConnectionLifecycleState::Closed { .. }
+                        )
+                        && entry.is_open()
+                })
+            })
+    }
+
+    /// #313 R2: the stable ids of every open connection the lifecycle tracks
+    /// (in a state that is not Closing or Closed).
+    pub(crate) fn open_tracked_stable_ids(&self) -> HashSet<usize> {
+        self.connection_lifecycle
+            .read()
+            .values()
+            .flatten()
+            .filter(|entry| {
+                !matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Closing { .. }
+                        | ConnectionLifecycleState::Closed { .. }
+                ) && entry.is_open()
+            })
+            .map(TrackedConnection::stable_id)
+            .collect()
+    }
+
+    /// #313 R2: true while the connection a retirement relies on is open
+    /// (Live, Superseded or Retiring).
+    pub(crate) fn retirement_replacement_open(&self, peer_id: &PeerId, stable_id: usize) -> bool {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .and_then(|entries| entries.iter().find(|entry| entry.stable_id() == stable_id))
+            .is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    ConnectionLifecycleState::Live
+                        | ConnectionLifecycleState::Superseded { .. }
+                        | ConnectionLifecycleState::Retiring { .. }
+                ) && entry.is_open()
+            })
+    }
+
+    /// #313 R2 (ADR-017 A6): at a follower, make the open Superseded
+    /// connection `stable_id` the Live winner, because the arbiter probed it
+    /// and the follower's own probe on it was answered. The previous winner
+    /// becomes Superseded (its obligation is recorded; a follower never
+    /// executes it). The p2p layer is signalled as for a repromotion.
+    pub(crate) fn follow_connection(&self, peer_id: &PeerId, stable_id: usize) -> FollowOutcome {
+        if !self.is_retirement_follower_for(peer_id) {
+            return FollowOutcome::NotEligible("not the follower of the pair");
+        }
+        let promoted = {
+            let mut lifecycle = self.connection_lifecycle.write();
+            if self.shutdown.load(Ordering::Relaxed) {
+                return FollowOutcome::NotEligible("shutting down");
+            }
+            let Some(entries) = lifecycle.get_mut(peer_id) else {
+                return FollowOutcome::NotEligible("no lifecycle entries");
+            };
+            let Some(target_index) = entries
+                .iter()
+                .position(|entry| entry.stable_id() == stable_id)
+            else {
+                return FollowOutcome::NotEligible("not tracked");
+            };
+            if matches!(entries[target_index].state, ConnectionLifecycleState::Live) {
+                return FollowOutcome::AlreadyLive;
+            }
+            if !matches!(
+                entries[target_index].state,
+                ConnectionLifecycleState::Superseded { .. }
+            ) || !entries[target_index].is_open()
+            {
+                return FollowOutcome::NotEligible("not an open Superseded connection");
+            }
+            let target_generation = entries[target_index].generation;
+            if let Some(live_index) = entries.iter().position(|entry| {
+                matches!(entry.state, ConnectionLifecycleState::Live) && entry.is_open()
+            }) {
+                let live = &mut entries[live_index];
+                Self::log_lifecycle_transition(
+                    peer_id,
+                    live.generation,
+                    &live.connection_id,
+                    live.stable_id(),
+                    live.state.name(),
+                    "Superseded",
+                    ConnectionCloseReason::Superseded,
+                );
+                live.become_superseded(target_generation);
+            }
+            Self::adopt_displaced_untracked_locked(
+                self.local_peer_id,
+                peer_id,
+                entries,
+                &self.connections,
+                &self.next_connection_generation,
+                stable_id,
+                target_generation,
+            );
+            let target = &mut entries[target_index];
+            info!(
+                target: "ant_quic::p2p_endpoint::lifecycle",
+                peer_id = %Self::lifecycle_peer_prefix(peer_id),
+                generation = target.generation,
+                from_state = target.state.name(),
+                to_state = "Live",
+                reason = "FollowArbiter",
+                connection_id = %target.connection_id_hex(),
+                stable_id = target.stable_id(),
+                "connection lifecycle transition"
+            );
+            target.become_live();
+            let connection = target.connection.clone();
+            self.connections.insert(*peer_id, connection.clone());
+            self.emitted_established_events.insert(*peer_id);
+            PromotedConnection {
+                peer_id: *peer_id,
+                traversal_method: target.traversal_method,
+                connection,
+            }
+        };
+        let promoted_tx = self.connection_promoted_tx.read().clone();
+        if let Some(tx) = promoted_tx {
+            let _ = tx.send(promoted);
+        }
+        FollowOutcome::Followed
     }
 
     /// #368: install the p2p-layer reader-liveness probe (the p2p endpoint
@@ -8815,8 +9331,19 @@ impl NatTraversalEndpoint {
                             )
                         })
                         .map(|(index, _)| index)
+                })
+                // #313 R2 (ADR-017 A4.1): with no other survivor, a
+                // connection whose retirement the arbiter is draining is
+                // the last open path. Promoting it aborts the retirement
+                // (its epoch no longer matches, so the drain cannot complete
+                // it), and the drain then restarts its reader.
+                .or_else(|| {
+                    entries.iter().position(|entry| {
+                        matches!(entry.state, ConnectionLifecycleState::Retiring { .. })
+                            && entry.connection.is_alive()
+                            && entry.connection.close_reason().is_none()
+                    })
                 });
-
             let Some(index) = candidate else {
                 break None;
             };
@@ -8838,8 +9365,15 @@ impl NatTraversalEndpoint {
             let raw_origin = entries[index].origin == ConnectionOrigin::Raw;
             let raw_live_winner =
                 raw_origin && matches!(entries[index].state, ConnectionLifecycleState::Live);
+            // The drain stopped a Retiring connection's reader on purpose and
+            // restarts it after this promotion.
+            let retiring = matches!(
+                entries[index].state,
+                ConnectionLifecycleState::Retiring { .. }
+            );
             if !aged
                 || raw_live_winner
+                || retiring
                 || self.generation_has_live_reader(peer_id, generation, stable_id)
             {
                 break Some(index);
@@ -8855,8 +9389,11 @@ impl NatTraversalEndpoint {
                 target: "ant_quic::p2p_endpoint::lifecycle",
                 peer_id = %Self::lifecycle_peer_prefix(peer_id),
                 generation,
-                stable_id,
+                from_state = entries[index].state.name(),
+                to_state = "Closed",
                 reason = "NoReaderAtPromotion",
+                connection_id = %entries[index].connection_id_hex(),
+                stable_id,
                 "#368: refusing to promote a readerless connection; closing as NoReader"
             );
             orphan_closures.push((generation, stable_id, connection));
@@ -8905,7 +9442,7 @@ impl NatTraversalEndpoint {
                 stable_id = replacement.stable_id(),
                 "connection lifecycle transition"
             );
-            replacement.state = ConnectionLifecycleState::Live;
+            replacement.become_live();
         }
         let connection = replacement.connection.clone();
         let promoted = PromotedConnection {
@@ -9043,6 +9580,10 @@ impl NatTraversalEndpoint {
         }
 
         match snapshot.state {
+            // #313 R2 (ADR-017): the retirement executor owns a Retiring
+            // connection's drain and close. Its reader exit (the executor
+            // stopped it) closes nothing and removes nothing.
+            ConnectionLifecycleState::Retiring { .. } => ReaderExitOutcome::Noop,
             ConnectionLifecycleState::Superseded { .. } => {
                 if let Some(connection) =
                     self.connection_lifecycle
@@ -16783,6 +17324,9 @@ mod tests {
                 state,
                 traversal_method: TraversalMethod::Direct,
                 origin: ConnectionOrigin::Registered,
+                obligation_epoch: None,
+                live_period: None,
+                confirmed: None,
             }],
         );
     }
@@ -16926,6 +17470,9 @@ mod tests {
                 state: ConnectionLifecycleState::Live,
                 traversal_method: TraversalMethod::Direct,
                 origin: ConnectionOrigin::Registered,
+                obligation_epoch: None,
+                live_period: None,
+                confirmed: None,
             }],
         );
         dead_conn.close(VarInt::from_u32(0), b"#277-dead-live");
@@ -17050,6 +17597,9 @@ mod tests {
                         state: ConnectionLifecycleState::Live,
                         traversal_method: TraversalMethod::Direct,
                         origin: ConnectionOrigin::Registered,
+                        obligation_epoch: None,
+                        live_period: None,
+                        confirmed: None,
                     },
                     TrackedConnection {
                         connection: conn2.clone(),
@@ -17060,6 +17610,9 @@ mod tests {
                         state: ConnectionLifecycleState::Live,
                         traversal_method: TraversalMethod::Direct,
                         origin: ConnectionOrigin::Registered,
+                        obligation_epoch: None,
+                        live_period: None,
+                        confirmed: None,
                     },
                 ],
             );
@@ -17340,6 +17893,9 @@ mod tests {
                     },
                     traversal_method: TraversalMethod::Direct,
                     origin: ConnectionOrigin::Registered,
+                    obligation_epoch: None,
+                    live_period: None,
+                    confirmed: None,
                 },
                 TrackedConnection {
                     connection: w_conn.clone(),
@@ -17350,6 +17906,9 @@ mod tests {
                     state: ConnectionLifecycleState::Live,
                     traversal_method: TraversalMethod::Direct,
                     origin: ConnectionOrigin::Registered,
+                    obligation_epoch: None,
+                    live_period: None,
+                    confirmed: None,
                 },
             ],
         );
@@ -17453,6 +18012,9 @@ mod tests {
                     },
                     traversal_method: TraversalMethod::Direct,
                     origin: ConnectionOrigin::Registered,
+                    obligation_epoch: None,
+                    live_period: None,
+                    confirmed: None,
                 },
                 TrackedConnection {
                     connection: g2_a_conn.clone(),
@@ -17463,6 +18025,9 @@ mod tests {
                     state: ConnectionLifecycleState::Live,
                     traversal_method: TraversalMethod::Direct,
                     origin: ConnectionOrigin::Registered,
+                    obligation_epoch: None,
+                    live_period: None,
+                    confirmed: None,
                 },
             ],
         );
@@ -17480,6 +18045,9 @@ mod tests {
                 state: ConnectionLifecycleState::Live,
                 traversal_method: TraversalMethod::Direct,
                 origin: ConnectionOrigin::Registered,
+                obligation_epoch: None,
+                live_period: None,
+                confirmed: None,
             }],
         );
         endpoint.connections.insert(peer_b, g2_b_conn.clone());
@@ -18370,6 +18938,254 @@ mod tests {
 
             drop(control);
             shutdown_all(&[&endpoint, &wrong_target]).await;
+        }
+    }
+
+    /// #313 Part 2, slice R2: the lifecycle side of ADR-017.
+    #[cfg(feature = "network-discovery")]
+    mod r2_retirement_313 {
+        use super::*;
+
+        /// A peer id this endpoint arbitrates (it is smaller than any
+        /// generated local id).
+        const ARBITRATED_PEER: PeerId = PeerId([0u8; 32]);
+
+        async fn raw_dial(
+            endpoint: &NatTraversalEndpoint,
+            target: &NatTraversalEndpoint,
+        ) -> InnerConnection {
+            let addr = target
+                .shutdown_socket_address_for_test()
+                .expect("target address");
+            let connecting = endpoint
+                .get_endpoint()
+                .expect("quic endpoint")
+                .connect(addr, "peer")
+                .expect("start raw dial");
+            tokio::time::timeout(Duration::from_secs(10), connecting)
+                .await
+                .expect("raw dial timed out")
+                .expect("raw dial handshake")
+        }
+
+        fn work_for(endpoint: &NatTraversalEndpoint, peer: &PeerId) -> Option<RetirementWork> {
+            endpoint
+                .retirement_work()
+                .into_iter()
+                .find(|work| work.peer_id == *peer)
+        }
+
+        /// Fix-only (Codex P2-4): an obligation is per Superseded period. S
+        /// is superseded (epoch e1), repromoted, then superseded again
+        /// (epoch e2). A stale claim for e1 is refused even with fresh
+        /// evidence on the winner; a claim for e2 succeeds, and a stale
+        /// completion or abort does nothing.
+        #[tokio::test]
+        async fn n1_stale_claim_after_repromote_and_resupersede_is_refused() {
+            let (target_keypair, _) = test_identity();
+            let target = identified_test_endpoint(&target_keypair).await;
+            let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("endpoint binds");
+            let peer = ARBITRATED_PEER;
+            assert!(endpoint.is_retirement_arbiter_for(&peer));
+
+            let s = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, s.clone())
+                .expect("register S");
+            let n = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, n.clone())
+                .expect("register N");
+            let first = work_for(&endpoint, &peer).expect("S has an obligation");
+            let e1 = first.candidates[0].epoch;
+
+            n.close(VarInt::from_u32(0), b"313 test: N dies");
+            let promoted = endpoint
+                .get_connection(&peer)
+                .expect("lookup")
+                .expect("S is repromoted");
+            assert_eq!(promoted.stable_id(), s.stable_id());
+            assert!(
+                work_for(&endpoint, &peer).is_none(),
+                "repromotion cleared the obligation"
+            );
+
+            let n2 = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, n2.clone())
+                .expect("register N2");
+            let second = work_for(&endpoint, &peer).expect("S has a new obligation");
+            let e2 = second.candidates[0].epoch;
+            assert_ne!(e1, e2, "a new Superseded period has a new epoch");
+            let winner = second.winner.expect("N2 is the winner");
+            assert_eq!(winner.stable_id, n2.stable_id());
+            assert!(endpoint.record_connection_confirmed(&peer, n2.stable_id(), winner.live_epoch));
+
+            let claim = |epoch: u64| {
+                endpoint.try_claim_retirement(
+                    &peer,
+                    s.stable_id(),
+                    epoch,
+                    n2.stable_id(),
+                    winner.live_epoch,
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                )
+            };
+            assert!(
+                matches!(
+                    claim(e1),
+                    RetireClaim::Ineligible("the obligation epoch changed")
+                ),
+                "a stale claim for the first period is refused"
+            );
+            assert!(
+                matches!(
+                    endpoint.try_claim_retirement(
+                        &peer,
+                        s.stable_id(),
+                        e2,
+                        n2.stable_id(),
+                        winner.live_epoch + 1,
+                        Duration::ZERO,
+                        Duration::from_secs(10),
+                    ),
+                    RetireClaim::Ineligible("the winner's Live period changed")
+                ),
+                "a claim against another Live period of the winner is refused"
+            );
+            assert!(
+                matches!(claim(e2), RetireClaim::Claimed { .. }),
+                "the claim for the current period succeeds"
+            );
+            assert!(
+                !endpoint.complete_retirement(&peer, s.stable_id(), e1),
+                "stale completion"
+            );
+            assert!(
+                !endpoint.abort_retirement(&peer, s.stable_id(), e1),
+                "stale abort"
+            );
+            assert!(s.close_reason().is_none(), "nothing stale closed S");
+            assert!(endpoint.complete_retirement(&peer, s.stable_id(), e2));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while s.close_reason().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the completion closes S"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(n2.close_reason().is_none(), "the winner stays open");
+
+            drop((s, n, n2, promoted));
+            let _ = endpoint.shutdown().await;
+            let _ = target.shutdown().await;
+        }
+
+        /// Fix-only (Codex P2-4): the claim needs a fresh probe answer on the
+        /// winner in its current Live period, and the winner's minimum Live
+        /// age; the follower end never claims.
+        #[tokio::test]
+        async fn n1_claim_needs_fresh_evidence_age_and_the_arbiter_role() {
+            let (target_keypair, _) = test_identity();
+            let target = identified_test_endpoint(&target_keypair).await;
+            let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("endpoint binds");
+            let peer = ARBITRATED_PEER;
+
+            let l = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, l.clone())
+                .expect("register L");
+            let w = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, w.clone())
+                .expect("register W");
+            let work = work_for(&endpoint, &peer).expect("work");
+            let winner = work.winner.expect("winner");
+            let epoch = work.candidates[0].epoch;
+            let claim = |quiet: Duration, freshness: Duration| {
+                endpoint.try_claim_retirement(
+                    &peer,
+                    l.stable_id(),
+                    epoch,
+                    w.stable_id(),
+                    winner.live_epoch,
+                    quiet,
+                    freshness,
+                )
+            };
+            assert!(matches!(
+                claim(Duration::ZERO, Duration::from_secs(10)),
+                RetireClaim::Ineligible("no fresh probe answer on the winner")
+            ));
+            assert!(endpoint.record_connection_confirmed(&peer, w.stable_id(), winner.live_epoch));
+            assert!(matches!(
+                claim(Duration::from_secs(3600), Duration::from_secs(10)),
+                RetireClaim::Ineligible("the winner has been Live for less than Q")
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(matches!(
+                claim(Duration::ZERO, Duration::from_millis(1)),
+                RetireClaim::Ineligible("no fresh probe answer on the winner")
+            ));
+
+            // The same pair seen from the follower: a peer id greater than
+            // any local id, so this endpoint is not the arbiter.
+            let follower_side_peer = PeerId([0xFF; 32]);
+            assert!(!endpoint.is_retirement_arbiter_for(&follower_side_peer));
+            assert!(matches!(
+                endpoint.try_claim_retirement(
+                    &follower_side_peer,
+                    l.stable_id(),
+                    epoch,
+                    w.stable_id(),
+                    winner.live_epoch,
+                    Duration::ZERO,
+                    Duration::from_secs(10),
+                ),
+                RetireClaim::Ineligible("not the arbiter of the pair")
+            ));
+            assert!(l.close_reason().is_none() && w.close_reason().is_none());
+
+            drop((l, w));
+            let _ = endpoint.shutdown().await;
+            let _ = target.shutdown().await;
+        }
+
+        /// Control, GREEN on R1 and master: a standalone
+        /// `NatTraversalEndpoint` has no retirement executor, so it retires
+        /// nothing automatically (Codex Q8).
+        #[tokio::test]
+        async fn n1_standalone_inner_endpoint_never_retires() {
+            let (target_keypair, _) = test_identity();
+            let target = identified_test_endpoint(&target_keypair).await;
+            let endpoint = NatTraversalEndpoint::new(loopback_shutdown_test_config(), None, None)
+                .await
+                .expect("endpoint binds");
+            let peer = ARBITRATED_PEER;
+            let l = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, l.clone())
+                .expect("register L");
+            let w = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, w.clone())
+                .expect("register W");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(
+                l.close_reason().is_none(),
+                "a standalone inner endpoint retires nothing: {:?}",
+                l.close_reason()
+            );
+
+            drop((l, w));
+            let _ = endpoint.shutdown().await;
+            let _ = target.shutdown().await;
         }
     }
 }

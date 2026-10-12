@@ -2,13 +2,11 @@
 
 mod support;
 
-use ant_quic::{
-    ConnectionCloseReason, ConnectionError, PeerLifecycleEvent, derive_peer_id_from_public_key,
-};
+use ant_quic::{ConnectionCloseReason, ConnectionError, PeerLifecycleEvent};
 use std::time::{Duration, Instant};
 use support::{
-    CONNECT_TIMEOUT, ReusableKeypair, connect_pair, make_isolated_node_with_keypair, make_node,
-    normalize_local_addr, reset_lifecycle_events, reusable_keypair, spawn_accept_loop, test_guard,
+    CONNECT_TIMEOUT, RETIREMENT_WAIT, connect_pair, make_isolated_node_with_keypair, make_node,
+    normalize_local_addr, ordered_keypairs, reset_lifecycle_events, spawn_accept_loop, test_guard,
     wait_until,
 };
 use tokio::time::timeout;
@@ -58,27 +56,9 @@ async fn peer_shutdown_cleans_up_remote_view_without_waiting_for_reaper() {
 /// registrar rejects and closes it at registration.
 const REJECTED_CLOSE_WAIT: Duration = Duration::from_secs(20);
 
-/// Upper bound for the peer of an admitted loser to observe its retirement
-/// (ADR-017): the arbiter of the pair retires it no earlier than Q = 30 s
-/// after the winner became Live, once its probe and the follower's probe
-/// have been answered, and after a drain. 60 s leaves a wide margin.
-const RETIREMENT_WAIT: Duration = Duration::from_secs(60);
-
 /// How long a follower is watched for a retirement it must never make: more
 /// than Q plus the executor's passes.
 const FOLLOWER_KEEPS_FOR: Duration = Duration::from_secs(40);
-
-/// Two keypairs, the first with the greater `PeerId` (the arbiter of the
-/// pair under ADR-017).
-fn ordered_keypairs() -> (ReusableKeypair, ReusableKeypair) {
-    let first = reusable_keypair();
-    let second = reusable_keypair();
-    if derive_peer_id_from_public_key(&first.0).0 > derive_peer_id_from_public_key(&second.0).0 {
-        (first, second)
-    } else {
-        (second, first)
-    }
-}
 
 fn assert_superseded_application_close(close_reason: &ConnectionError, view: &str) {
     let code = match close_reason {
