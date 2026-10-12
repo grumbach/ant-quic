@@ -3449,7 +3449,13 @@ impl P2pEndpoint {
         // Create NAT traversal endpoint with the same identity key used for auth
         // This ensures P2pEndpoint and NatTraversalEndpoint use the same keypair
         let mut nat_config = config.to_nat_config_with_key(public_key.clone(), secret_key);
-        let bootstrap_cache = match BootstrapCache::open(config.bootstrap_cache.clone()).await {
+        // The cache never stores or selects this node's own PeerId (#269).
+        let bootstrap_cache = match BootstrapCache::open_for_local_peer(
+            config.bootstrap_cache.clone(),
+            peer_id,
+        )
+        .await
+        {
             Ok(cache) => Arc::new(cache),
             Err(e) => {
                 // Degrade to an in-memory cache rather than failing endpoint
@@ -3462,9 +3468,13 @@ impl P2pEndpoint {
                 );
                 let mut memory_config = config.bootstrap_cache.clone();
                 memory_config.persist = false;
-                Arc::new(BootstrapCache::open(memory_config).await.map_err(|e| {
-                    EndpointError::Config(format!("Failed to open bootstrap cache: {}", e))
-                })?)
+                Arc::new(
+                    BootstrapCache::open_for_local_peer(memory_config, peer_id)
+                        .await
+                        .map_err(|e| {
+                            EndpointError::Config(format!("Failed to open bootstrap cache: {}", e))
+                        })?,
+                )
             }
         };
         // The endpoint owns cache maintenance so every embedder gets periodic
