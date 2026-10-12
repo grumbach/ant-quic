@@ -20,8 +20,8 @@
 //! 3. After a configurable delay (default 250ms), if no connection has succeeded, the next
 //!    attempt starts in parallel
 //! 4. On any failure, the next attempt starts immediately without waiting for the delay
-//! 5. The first successful connection wins; all other pending attempts are cancelled
-//!    and have stopped before the winner is returned
+//! 5. The first successful connection wins; all other pending attempts are aborted
+//!    before the winner is returned (see `race_connect` for the exact guarantee)
 //!
 //! # Example
 //!
@@ -227,6 +227,14 @@ pub fn sort_addresses(addresses: &[SocketAddr], config: &HappyEyeballsConfig) ->
 /// What one spawned attempt returns: the address it dialled and its result.
 type AttemptOutcome<C> = (SocketAddr, Result<C, String>);
 
+/// Longest time the winner waits for the aborted losers to end.
+///
+/// A loser that yields ends at once when it is aborted, so the wait is
+/// normally microseconds. A loser in a non-yielding section (blocking code)
+/// cannot be stopped from outside; this bound keeps it from holding a ready
+/// winner (#294).
+const LOSER_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
+
 /// Spawn a single connection attempt into the race's [`JoinSet`].
 ///
 /// The set owns the task: dropping or shutting down the set stops the
@@ -294,12 +302,19 @@ fn spawn_attempt<F, Fut, C, E>(
 ///
 /// # Cancellation
 ///
-/// One [`JoinSet`] owns every spawned attempt (#294):
-/// - When an attempt wins, all other attempts are aborted and awaited before
-///   the winner is returned. No losing dial is still running when the caller
-///   gets the winner, and a loser that also connected is dropped.
+/// One [`JoinSet`] owns every spawned attempt (#294). Tokio cancellation is
+/// cooperative: an aborted attempt ends at its next poll (its next `.await`).
+/// - When an attempt wins, every other attempt is aborted before the winner
+///   is returned. The race then waits for the aborted attempts to end, for at
+///   most 50 ms. An attempt that yields (every normal async dial) has ended,
+///   and a loser that also connected has been dropped, when the caller gets
+///   the winner. An attempt in a non-yielding section (blocking code) cannot
+///   be stopped from outside; it stays aborted and ends at its next poll,
+///   after the winner is returned. It cannot delay the winner by more than
+///   the bound.
 /// - When the caller drops the returned future (for example an outer
-///   timeout), the set is dropped and every attempt is aborted.
+///   timeout), the set is dropped and every attempt is aborted. Each attempt
+///   ends at its next poll.
 /// - An attempt that panics counts as a failed attempt; it does not stall the
 ///   race.
 pub async fn race_connect<F, Fut, C, E>(
@@ -364,8 +379,22 @@ where
         match joined {
             Some(Ok((addr, Ok(conn)))) => {
                 info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                // Stop every losing attempt before the winner leaves the race.
-                attempts.shutdown().await;
+                // Abort every losing attempt, then give the aborted attempts a
+                // bounded time to end. Results that arrive here (a loser that
+                // also connected) are dropped.
+                attempts.abort_all();
+                let drained = tokio::time::timeout(LOSER_SHUTDOWN_GRACE, async {
+                    while attempts.join_next().await.is_some() {}
+                })
+                .await;
+                if drained.is_err() {
+                    // These attempts are aborted and end at their next poll.
+                    // Dropping the set at return detaches them.
+                    debug!(
+                        remaining = attempts.len(),
+                        "Happy Eyeballs: aborted attempts did not end within the grace period"
+                    );
+                }
                 return Ok((conn, addr));
             }
             Some(Ok((addr, Err(err)))) => {
@@ -860,10 +889,12 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
-    /// #294: when a winner is found, every losing attempt must already be
-    /// stopped when `race_connect` returns. An abort that is only scheduled
-    /// leaves the losing dial running (and holding its resources) after the
-    /// caller has the winner. The winner itself must not be dropped.
+    /// #294: when a winner is found, a losing attempt that yields must
+    /// already be stopped when `race_connect` returns. An abort that is only
+    /// scheduled leaves the losing dial running (and holding its resources)
+    /// after the caller has the winner. The winner itself must not be dropped.
+    /// (A loser that does not yield is covered by
+    /// `blocking_loser_does_not_hold_ready_winner`.)
     ///
     /// Deterministic: explicit gates on the current-thread runtime. The
     /// winning attempt waits until the losing dial has entered, and the check
