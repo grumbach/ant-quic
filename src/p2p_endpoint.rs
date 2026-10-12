@@ -915,7 +915,7 @@ pub(crate) mod reader_test_hooks {
 #[cfg(all(test, feature = "network-discovery"))]
 pub(crate) mod retirement_test_hooks {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
 
@@ -981,6 +981,77 @@ pub(crate) mod retirement_test_hooks {
     /// address, so a dropped endpoint of the same test can have had it.
     pub(crate) fn forget(endpoint_key: usize) {
         HOOKS.lock().remove(&endpoint_key);
+        POINTS.lock().retain(|(key, _), _| *key != endpoint_key);
+    }
+
+    /// #313 round 2: places in the retirement executor where a test can
+    /// park it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) enum Point {
+        /// A pass has collected its quiet candidates and is about to claim.
+        BeforeClaim,
+        /// A drain has started and has not touched the reader yet.
+        DrainBeforeStop,
+        /// A drain has stopped waiting and is about to complete or abort.
+        DrainBeforeDecide,
+    }
+
+    /// A one-shot gate at one [`Point`] of one endpoint.
+    #[derive(Default)]
+    pub(crate) struct PointGate {
+        parked: AtomicBool,
+        released: AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl PointGate {
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        pub(crate) async fn wait_until_parked(&self, within: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            while !self.parked.load(Ordering::SeqCst) {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            true
+        }
+    }
+
+    type PointMap = HashMap<(usize, Point), Arc<PointGate>>;
+    static POINTS: LazyLock<parking_lot::Mutex<PointMap>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Park the next arrival of `endpoint_key` at `point` until released
+    /// (at most 60 s).
+    pub(crate) fn arm_point(endpoint_key: usize, point: Point) -> Arc<PointGate> {
+        let gate = Arc::new(PointGate::default());
+        POINTS
+            .lock()
+            .insert((endpoint_key, point), Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) async fn point(endpoint_key: usize, point: Point) {
+        let gate = POINTS.lock().remove(&(endpoint_key, point));
+        let Some(gate) = gate else {
+            return;
+        };
+        gate.parked.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let notified = gate.notify.notified();
+            if gate.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -9530,6 +9601,12 @@ impl P2pEndpoint {
                 self.schedule_readiness_probe(peer_id, &winner, timing, true);
                 continue;
             }
+            #[cfg(all(test, feature = "network-discovery"))]
+            retirement_test_hooks::point(
+                self.reader_hooks_key(),
+                retirement_test_hooks::Point::BeforeClaim,
+            )
+            .await;
             for candidate in quiet_candidates {
                 match self.inner.try_claim_retirement(
                     &peer_id,
@@ -9660,6 +9737,12 @@ impl P2pEndpoint {
         cap: Duration,
     ) {
         let started = Instant::now();
+        #[cfg(all(test, feature = "network-discovery"))]
+        retirement_test_hooks::point(
+            self.reader_hooks_key(),
+            retirement_test_hooks::Point::DrainBeforeStop,
+        )
+        .await;
         let uni_in_flight = {
             let handles = self.reader_handles.read().await;
             handles
@@ -9703,6 +9786,12 @@ impl P2pEndpoint {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        #[cfg(all(test, feature = "network-discovery"))]
+        retirement_test_hooks::point(
+            self.reader_hooks_key(),
+            retirement_test_hooks::Point::DrainBeforeDecide,
+        )
+        .await;
 
         let replacement_open = self
             .inner
@@ -22446,6 +22535,445 @@ mod tests {
 
                 a.shutdown().await;
                 b.shutdown().await;
+            }
+
+            // #313 round 2 (Codex review of 377fa0c3). Each test below is RED
+            // on 377fa0c3 for the reason in its comment.
+
+            fn lifecycle_exporter_id(connection: &QuicConnection) -> [u8; 32] {
+                let mut exporter = [0u8; 32];
+                connection
+                    .export_keying_material(
+                        &mut exporter,
+                        b"ant-quic/lifecycle-connection-id/v1",
+                        b"canonical",
+                    )
+                    .expect("exporter");
+                exporter
+            }
+
+            async fn wait_for_no_reader(
+                node: &P2pEndpoint,
+                peer: &PeerId,
+                stable_id: usize,
+                what: &str,
+            ) {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while node.live_reader_for_test(peer, stable_id).await {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "timed out waiting until {what}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
+            fn slow_drain_timing() -> retirement_test_hooks::Timing {
+                retirement_test_hooks::Timing {
+                    drain_cap: Duration::from_secs(60),
+                    ..retirement_test_hooks::Timing::fast()
+                }
+            }
+
+            /// Round 2, P1-1. C1 is Retiring at the arbiter A and older than
+            /// the 10 s readerless grace; its reader has stopped and its exit
+            /// is processed; a slow stream holds the drain. The winner C2 then
+            /// dies, and C2's reader-exit handler is held, so the drain sees
+            /// the death first and aborts. The abort must keep C1, the last
+            /// connection to B, and give it a reader again. RED on 377fa0c3:
+            /// the abort makes C1 Superseded, and the repromotion it runs
+            /// closes the readerless C1 as NoReader.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_abort_after_the_grace_keeps_the_last_connection() {
+                let fixture_started = tokio::time::Instant::now();
+                let (a, b, b2, a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                set_timing(&a, slow_drain_timing());
+                let b_peer = b.peer_id();
+                let mut stream = b_c1.open_uni().await.expect("open a stream on C1");
+                stream
+                    .write_all(b"313 r2 abort: first half, ")
+                    .await
+                    .expect("write the first half");
+                wait_until(RETIRE_WITHIN, "A claims C1", || claims(&a) >= 1).await;
+                wait_for_no_reader(&a, &b_peer, a_c1.stable_id(), "C1's reader stops").await;
+                tokio::time::sleep_until(fixture_started + Duration::from_secs(13)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "fixture: C1 is still draining"
+                );
+                assert_eq!(completions(&a), 0, "fixture: C1 is still draining");
+
+                let c2_exit = reader_test_hooks::arm(a.reader_hooks_key(), a_c2.stable_id());
+                c2_exit
+                    .pause_exit_side_effects
+                    .store(true, AtomicOrdering::SeqCst);
+                b2.shutdown().await;
+                wait_until(Duration::from_secs(10), "C2 closes", || {
+                    a_c2.close_reason().is_some()
+                })
+                .await;
+                wait_until(Duration::from_secs(10), "the drain decides", || {
+                    hooks(&a).aborts.load(AtomicOrdering::SeqCst) >= 1
+                        || b_c1.close_reason().is_some()
+                })
+                .await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "the abort must keep C1, the last connection: {:?} ({:?})",
+                    remote_close_reason(&b_c1),
+                    b_c1.close_reason()
+                );
+                wait_for_winner(&a, &b_peer, "C1 is A's winner again", |connection| {
+                    connection.stable_id() == a_c1.stable_id()
+                })
+                .await;
+                wait_for_reader(&a, &b_peer, a_c1.stable_id(), "C1's reader restarts").await;
+                stream
+                    .write_all(b"second half")
+                    .await
+                    .expect("write the rest");
+                stream.finish().expect("finish");
+                assert!(
+                    recv_within(
+                        &a,
+                        b_peer,
+                        b"313 r2 abort: first half, second half",
+                        RECV_WINDOW
+                    )
+                    .await,
+                    "the in-flight stream completes"
+                );
+                // Past a janitor sweep (5 s ticks, 10 s grace).
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "the recovered C1 survives the janitor: {:?} ({:?})",
+                    remote_close_reason(&b_c1),
+                    b_c1.close_reason()
+                );
+                let later = b"313 r2 abort: after a janitor sweep";
+                b.send(&a.peer_id(), later).await.expect("B sends on C1");
+                assert!(
+                    recv_within(&a, b_peer, later, RECV_WINDOW).await,
+                    "A still reads C1"
+                );
+                assert_eq!(completions(&a), 0, "C1 was not retired");
+
+                c2_exit.release_exit();
+                reader_test_hooks::disarm(a.reader_hooks_key(), a_c2.stable_id());
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Round 2, P1-2. A claims C1 at epoch e, but the drain is held
+            /// before it touches C1's reader. The winner C2 dies, and
+            /// repromotion makes C1 Live again, which ends e; C1's reader
+            /// still runs. The resumed stale drain must not stop that reader.
+            /// RED on 377fa0c3: the drain finds C1's reader by its stable id
+            /// alone and cancels it, and the exit closes the winner C1 as
+            /// ReaderExit.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_stale_drain_does_not_stop_the_repromoted_winner_reader() {
+                let (a, b, b2, a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                let b_peer = b.peer_id();
+                let gate = retirement_test_hooks::arm_point(
+                    a.reader_hooks_key(),
+                    retirement_test_hooks::Point::DrainBeforeStop,
+                );
+                wait_until(RETIRE_WITHIN, "A claims C1", || claims(&a) >= 1).await;
+                assert!(
+                    gate.wait_until_parked(Duration::from_secs(10)).await,
+                    "the drain parks before it stops C1's reader"
+                );
+                b2.shutdown().await;
+                wait_until(Duration::from_secs(10), "C2 closes", || {
+                    a_c2.close_reason().is_some()
+                })
+                .await;
+                wait_for_winner(&a, &b_peer, "C1 is A's winner again", |connection| {
+                    connection.stable_id() == a_c1.stable_id()
+                })
+                .await;
+                assert!(
+                    a.live_reader_for_test(&b_peer, a_c1.stable_id()).await,
+                    "fixture: C1's reader still runs"
+                );
+
+                gate.release();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "the stale drain must not close the winner C1: {:?}",
+                    remote_close_reason(&b_c1)
+                );
+                assert!(
+                    a.live_reader_for_test(&b_peer, a_c1.stable_id()).await,
+                    "C1 has a reader"
+                );
+                let payload = b"313 r2: B to A on the repromoted C1";
+                b.send(&a.peer_id(), payload).await.expect("B sends on C1");
+                assert!(
+                    recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                    "A reads C1"
+                );
+                assert_eq!(completions(&a), 0, "C1 was not retired");
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Round 2, P1-3. As in the P1-1 test, but C2's exit handler runs
+            /// and repromotes C1 while it is still Retiring, and the drain is
+            /// held until then, so the recovery takes the repromotion path.
+            /// The drain then restarts C1's reader with the same lifecycle
+            /// generation. RED on 377fa0c3: the stopped reader's tombstone for
+            /// that generation stays, the liveness probe reports no reader,
+            /// and the next janitor sweep closes the aged C1 as NoReader.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_recovered_connection_survives_the_janitor() {
+                let fixture_started = tokio::time::Instant::now();
+                let (a, b, b2, a_c1, b_c1, a_c2) = finalize_supersede_fixture().await;
+                set_timing(&a, slow_drain_timing());
+                let b_peer = b.peer_id();
+                let mut stream = b_c1.open_uni().await.expect("open a stream on C1");
+                stream
+                    .write_all(b"313 r2 recovery: first half, ")
+                    .await
+                    .expect("write the first half");
+                wait_until(RETIRE_WITHIN, "A claims C1", || claims(&a) >= 1).await;
+                wait_for_no_reader(&a, &b_peer, a_c1.stable_id(), "C1's reader stops").await;
+                let gate = retirement_test_hooks::arm_point(
+                    a.reader_hooks_key(),
+                    retirement_test_hooks::Point::DrainBeforeDecide,
+                );
+                tokio::time::sleep_until(fixture_started + Duration::from_secs(13)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "fixture: C1 is still draining"
+                );
+
+                b2.shutdown().await;
+                wait_until(Duration::from_secs(10), "C2 closes", || {
+                    a_c2.close_reason().is_some()
+                })
+                .await;
+                wait_for_winner(&a, &b_peer, "C2's exit repromotes C1", |connection| {
+                    connection.stable_id() == a_c1.stable_id()
+                })
+                .await;
+                assert!(
+                    gate.wait_until_parked(Duration::from_secs(10)).await,
+                    "the drain stops waiting"
+                );
+                gate.release();
+                wait_for_reader(&a, &b_peer, a_c1.stable_id(), "C1's reader restarts").await;
+                stream
+                    .write_all(b"second half")
+                    .await
+                    .expect("write the rest");
+                stream.finish().expect("finish");
+                assert!(
+                    recv_within(
+                        &a,
+                        b_peer,
+                        b"313 r2 recovery: first half, second half",
+                        RECV_WINDOW
+                    )
+                    .await,
+                    "the in-flight stream completes"
+                );
+                // Past a janitor sweep (5 s ticks, 10 s grace).
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "the recovered C1 survives the janitor: {:?} ({:?})",
+                    remote_close_reason(&b_c1),
+                    b_c1.close_reason()
+                );
+                let later = b"313 r2 recovery: after a janitor sweep";
+                b.send(&a.peer_id(), later).await.expect("B sends on C1");
+                assert!(
+                    recv_within(&a, b_peer, later, RECV_WINDOW).await,
+                    "A still reads C1"
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Round 2, P2-4. A pass has collected the quiet C1 and is held
+            /// before its claim. B then sends a stream on C1, and A's reader
+            /// accepts it. The claim must see that stream and refuse; a later
+            /// pass retires C1 after a new quiet period. RED on 377fa0c3: the
+            /// claim uses the quietness the pass collected and retires C1.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_stream_between_collection_and_claim_blocks_the_claim() {
+                let (a, b, _b2, _a_c1, b_c1, _a_c2) = finalize_supersede_fixture().await;
+                let b_peer = b.peer_id();
+                let gate = retirement_test_hooks::arm_point(
+                    a.reader_hooks_key(),
+                    retirement_test_hooks::Point::BeforeClaim,
+                );
+                assert!(
+                    gate.wait_until_parked(RETIRE_WITHIN).await,
+                    "a pass collects the quiet C1"
+                );
+                let payload = b"313 r2: B on C1 between collection and claim";
+                b.send(&a.peer_id(), payload).await.expect("B sends on C1");
+                assert!(
+                    recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                    "A's reader accepts the stream on C1"
+                );
+                gate.release();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(claims(&a), 0, "the claim must see the new stream on C1");
+                assert!(b_c1.close_reason().is_none(), "C1 stays open");
+
+                wait_until(
+                    RETIRE_WITHIN,
+                    "A retires C1 after a new quiet period",
+                    || b_c1.close_reason().is_some(),
+                )
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_c1),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Round 2, P2-5. B opens a MASQUE CONNECT-UDP relay session on
+            /// C1 to the arbiter A (a relay server). The session stream stays
+            /// open, and no new stream arrives on C1, while B' reads the
+            /// winner C2. A must not retire C1 while the session lives; once
+            /// it ends, A retires C1. RED on 377fa0c3: the drain does not see
+            /// the relay handler, and A closes C1 under the live session.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_live_relay_session_blocks_retirement() {
+                let (a, b, _b2, _a_c1, b_c1, _a_c2) = finalize_supersede_fixture().await;
+                let (mut relay_send, mut relay_recv) =
+                    b_c1.open_bi().await.expect("open the relay stream on C1");
+                let request = crate::masque::ConnectUdpRequest::bind_any().encode();
+                relay_send
+                    .write_all(&(request.len() as u32).to_be_bytes())
+                    .await
+                    .expect("write the request length");
+                relay_send
+                    .write_all(&request)
+                    .await
+                    .expect("write the request");
+                let mut length = [0u8; 4];
+                tokio::time::timeout(Duration::from_secs(5), relay_recv.read_exact(&mut length))
+                    .await
+                    .expect("response length timeout")
+                    .expect("response length");
+                let mut body = vec![0u8; u32::from_be_bytes(length) as usize];
+                tokio::time::timeout(Duration::from_secs(5), relay_recv.read_exact(&mut body))
+                    .await
+                    .expect("response timeout")
+                    .expect("response");
+                let response =
+                    crate::masque::ConnectUdpResponse::decode(&mut bytes::Bytes::from(body))
+                        .expect("decode the response");
+                assert!(response.is_success(), "fixture: the relay session is live");
+
+                // Q is 1.5 s; the executor passes every 200 ms.
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert!(
+                    b_c1.close_reason().is_none(),
+                    "A must not retire C1 while its relay session lives: {:?}",
+                    remote_close_reason(&b_c1)
+                );
+                assert_eq!(claims(&a), 0, "no claim while the relay session lives");
+
+                relay_send.finish().expect("end the relay session");
+                drop(relay_recv);
+                wait_until(RETIRE_WITHIN, "A retires C1 once the session ends", || {
+                    b_c1.close_reason().is_some()
+                })
+                .await;
+                assert_eq!(
+                    remote_close_reason(&b_c1),
+                    Some(ConnectionCloseReason::Superseded)
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Round 2, P2-6 (R1 compatibility with master). A's only
+            /// connection to identity B is the hole-punch winner H (origin
+            /// Raw). B', a second live process with B's identity, then dials
+            /// D to A: the other initiator family, with a lower lifecycle id
+            /// than H. On master H is not in the lifecycle, so A admits D and
+            /// D takes the route; H stays open. RED on 377fa0c3: the Raw Live
+            /// H wins the cross-family comparison, and A rejects and closes D.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_raw_live_winner_does_not_reject_an_opposite_family_newcomer() {
+                // A is the follower, so A runs no retirement during the checks.
+                let ((b_key, b_peer), (a_key, _)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                let _accept_b2 = shim_accept(&b2);
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                    .await
+                    .expect("A's waiter finalises H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                assert_eq!(
+                    a.inner
+                        .connection_snapshot_by_stable_id(&b_peer, h.stable_id())
+                        .map(|snapshot| snapshot.origin),
+                    Some(crate::nat_traversal_api::ConnectionOrigin::Raw),
+                    "fixture: H is a Raw winner"
+                );
+
+                let hold = a.inner.arm_inbound_hold_for_test();
+                let d = raw_dial(&b2, a_addr).await;
+                let held = hold.wait_for_held(1).await;
+                crate::nat_traversal_api::lifecycle_points::override_connection_id(
+                    lifecycle_exporter_id(&d),
+                    [0x00; 32],
+                );
+                for (stable_id, _) in held {
+                    hold.release(stable_id);
+                }
+                wait_until(Duration::from_secs(10), "A decides on D", || {
+                    d.close_reason().is_some()
+                        || a.inner
+                            .open_lifecycle_entries_for_test(&b_peer)
+                            .iter()
+                            .any(|(_, id, _)| *id == [0x00; 32])
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    d.close_reason().is_none(),
+                    "A must admit D, as master does: {:?}",
+                    remote_close_reason(&d)
+                );
+                wait_for_winner(&a, &b_peer, "D takes the route", |connection| {
+                    a.inner
+                        .connection_snapshot_by_stable_id(&b_peer, connection.stable_id())
+                        .is_some_and(|snapshot| snapshot.connection_id == [0x00; 32])
+                })
+                .await;
+                assert!(h.close_reason().is_none(), "H stays open");
+
+                drop(hold);
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
             }
         }
     }
