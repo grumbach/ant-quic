@@ -7,8 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PeerId dials that cannot hole-punch no longer abort a slow direct handshake
+  at the adaptive 2.08 s budget (#304, residual of #292).** The direct stage of
+  `connect_with_fallback` used the adaptive budget (4 × RTT + 750 ms, about
+  2.08 s at the default RTT) for every dial that carried a target PeerId. When
+  no hole-punch coordinator was available, the cutoff could only lead to relay
+  or to a terminal `AllStrategiesFailed`, even though the caller still had
+  establishment budget. Under CPU contention, loopback handshakes have taken
+  about 5.9 s. A dial now keeps the adaptive budget only when it can
+  hole-punch (an authentic target PeerId and a coordinator). Every other
+  automatic dial gives its direct stage the remaining budget, less a reserve
+  for a usable relay, as #293 did for address-only dials. When
+  `connect_peer`/`connect_peer_with_addrs` reach the ladder after a failed
+  direct pre-pass, the extension stops at the end of the caller's dial budget,
+  so a re-dial after a pre-pass timeout still waits at most the adaptive
+  budget. The direct pre-pass itself already gave each handshake the full
+  establishment budget and is unchanged. Explicit strategies stay
+  authoritative, and every stage stays bounded.
+
 ### Tests
 
+- **Direct-stage budget regressions for PeerId dials (#304).** A loopback UDP
+  gate holds the dialer's datagrams for 3 s, so the handshake cannot finish
+  before the adaptive budget expires. The tests check that
+  `connect_with_fallback` with a PeerId, and the fallback re-dial of
+  `connect_peer_with_addrs` after a fast pre-pass failure, complete after the
+  gate opens. Guards check that the pre-pass path still completes and that
+  dials to a silent target stay bounded (no second full wait).
 - **Three replacement tests now make a genuinely new connection (#316).**
   `reconnect_reader_task::recv_after_reconnect`,
   `lifecycle_sender_stale::stale_sender_connection_fails_after_supersede` and

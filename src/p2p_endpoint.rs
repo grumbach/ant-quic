@@ -886,24 +886,49 @@ where
     None
 }
 
+/// Budget for the direct (Happy Eyeballs) stage of the fallback ladder.
+///
+/// The adaptive direct budget (`configured_timeout`, 4 x RTT + 750 ms) is a
+/// fast cutoff. Its only purpose is to leave time for hole punching when the
+/// direct path is blocked. A dial that cannot hole-punch (no target PeerId, a
+/// synthetic placeholder id, or no coordinator) gains nothing from the cutoff:
+/// under CPU contention it only turns a slow handshake into a terminal failure
+/// while the caller still has budget (#292 for address-only dials, #304 for
+/// PeerId dials). Such a dial gets the caller's remaining budget instead, less
+/// a reserve for a usable relay route.
+///
+/// - `ladder_remaining`: time left before the ladder's own deadline.
+/// - `caller_remaining`: time left in the caller's dial when the ladder runs
+///   inside a larger dial (the direct pre-pass of `connect_orchestrated` has
+///   already used part of it); `None` when the ladder is the whole dial.
+///
+/// The result is never below the adaptive budget capped by `ladder_remaining`
+/// (the budget before #304) and never above `ladder_remaining`, so the stage
+/// stays bounded. An explicit strategy stays authoritative.
 fn direct_stage_timeout(
     configured_timeout: Duration,
-    overall_timeout: Duration,
+    ladder_remaining: Duration,
     custom_strategy_supplied: bool,
-    address_only: bool,
+    holepunch_possible: bool,
     relay_reserve: Option<Duration>,
+    caller_remaining: Option<Duration>,
 ) -> Duration {
-    if custom_strategy_supplied || !address_only {
-        return configured_timeout.min(overall_timeout);
+    let minimum_direct = configured_timeout.min(ladder_remaining);
+    if custom_strategy_supplied || holepunch_possible {
+        return minimum_direct;
     }
 
-    let minimum_direct = configured_timeout.min(overall_timeout);
-    let maximum_relay_reserve = overall_timeout.saturating_sub(minimum_direct);
-    overall_timeout.saturating_sub(
-        relay_reserve
-            .unwrap_or(Duration::ZERO)
-            .min(maximum_relay_reserve),
-    )
+    let available = caller_remaining.map_or(ladder_remaining, |remaining| {
+        remaining.min(ladder_remaining)
+    });
+    let maximum_relay_reserve = available.saturating_sub(minimum_direct);
+    available
+        .saturating_sub(
+            relay_reserve
+                .unwrap_or(Duration::ZERO)
+                .min(maximum_relay_reserve),
+        )
+        .max(minimum_direct)
 }
 
 fn cached_peer_avg_rtt(peer: &CachedPeer) -> Option<Duration> {
@@ -4239,6 +4264,17 @@ impl P2pEndpoint {
             return Err(EndpointError::ShuttingDown);
         }
 
+        // #304: the caller's budget for this whole dial. The fallback ladder
+        // below caps any direct-stage extension at this deadline, so its
+        // re-dial after a direct pre-pass that used the budget does not wait
+        // for a second full budget.
+        let dial_deadline = tokio::time::Instant::now()
+            + self
+                .config
+                .timeouts
+                .nat_traversal
+                .connection_establishment_timeout;
+
         let is_simple_address_only = peer_id.is_none() && explicit_addrs.len() == 1;
 
         if let Some(peer_id) = peer_id {
@@ -4324,7 +4360,13 @@ impl P2pEndpoint {
 
         if target_ipv4.is_some() || target_ipv6.is_some() {
             match self
-                .connect_with_fallback(target_ipv4, target_ipv6, None, peer_id)
+                .connect_with_fallback_within(
+                    target_ipv4,
+                    target_ipv6,
+                    None,
+                    peer_id,
+                    Some(dial_deadline),
+                )
                 .await
             {
                 Ok((conn, _)) => return Ok(conn),
@@ -5202,12 +5244,38 @@ impl P2pEndpoint {
     }
 
     /// Connect with automatic fallback: Direct → HolePunch → Relay.
+    ///
+    /// Without a `strategy_config`, stage budgets are adaptive. The direct
+    /// stage of a dial that can hole-punch (an authentic target `peer_id`
+    /// and a coordinator) keeps the short adaptive budget, so a blocked
+    /// direct path quickly yields to hole punching. A dial that cannot
+    /// hole-punch gives its direct stage the remaining connection
+    /// establishment budget, less a reserve for a usable relay, so a slow
+    /// handshake under CPU contention is not aborted while the budget
+    /// remains (#292, #304). An explicit `strategy_config` stays
+    /// authoritative.
     pub async fn connect_with_fallback(
         &self,
         target_ipv4: Option<SocketAddr>,
         target_ipv6: Option<SocketAddr>,
         strategy_config: Option<StrategyConfig>,
         peer_id: Option<PeerId>,
+    ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
+        self.connect_with_fallback_within(target_ipv4, target_ipv6, strategy_config, peer_id, None)
+            .await
+    }
+
+    /// [`Self::connect_with_fallback`] as one part of a larger dial whose
+    /// budget ends at `caller_deadline` (#304). The ladder keeps its own
+    /// deadline; the deadline only caps how far the direct stage of a dial
+    /// that cannot hole-punch may extend past the adaptive budget.
+    async fn connect_with_fallback_within(
+        &self,
+        target_ipv4: Option<SocketAddr>,
+        target_ipv6: Option<SocketAddr>,
+        strategy_config: Option<StrategyConfig>,
+        peer_id: Option<PeerId>,
+        caller_deadline: Option<tokio::time::Instant>,
     ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
         if self.shutdown.is_cancelled() {
             return Err(EndpointError::ShuttingDown);
@@ -5334,7 +5402,10 @@ impl P2pEndpoint {
             );
         }
 
-        let address_only = peer_id.is_none();
+        // Hole punching needs an authentic target PeerId and a coordinator;
+        // without both, the HolePunching stage below skips straight to relay.
+        let holepunch_possible = config.coordinator.is_some()
+            && peer_id.is_some_and(|peer_id| !is_synthetic_peer_id(&peer_id));
         let relay_reserve = (config.relay_enabled && !config.relay_addrs.is_empty())
             .then_some(config.relay_timeout);
         let mut strategy = ConnectionStrategy::new(config);
@@ -5387,18 +5458,22 @@ impl P2pEndpoint {
                     }
 
                     let he_config = HappyEyeballsConfig::default();
-                    // Address-only dials cannot use hole punching because they do not
-                    // carry an authenticated target PeerId. Give their direct stage
-                    // the authoritative overall establishment budget, reserving time
-                    // only when a relay path is actually available. This keeps the
-                    // dial bounded while avoiding an early RTT-derived terminal abort
-                    // under scheduler contention (issue #292).
+                    // A dial that cannot hole-punch (address-only, synthetic
+                    // id, or no coordinator) gains nothing from the short
+                    // adaptive cutoff: it would only turn a slow handshake
+                    // under scheduler contention into a terminal failure.
+                    // Give its direct stage the caller's remaining budget,
+                    // reserving time only when a relay path is actually
+                    // available. The stage stays bounded by the ladder
+                    // deadline (issues #292, #304).
+                    let now = tokio::time::Instant::now();
                     let direct_timeout = direct_stage_timeout(
                         strategy.ipv4_timeout().max(strategy.ipv6_timeout()),
-                        overall_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        overall_deadline.saturating_duration_since(now),
                         custom_strategy_supplied,
-                        address_only,
+                        holepunch_possible,
                         relay_reserve,
+                        caller_deadline.map(|deadline| deadline.saturating_duration_since(now)),
                     );
                     let handshake_timeout = self
                         .config
@@ -12040,7 +12115,7 @@ mod tests {
         let overall = Duration::from_secs(30);
 
         assert_eq!(
-            direct_stage_timeout(configured, overall, false, true, None),
+            direct_stage_timeout(configured, overall, false, false, None, None),
             overall,
             "without a usable fallback, direct dialing owns the bounded overall budget"
         );
@@ -12049,8 +12124,9 @@ mod tests {
                 configured,
                 overall,
                 false,
-                true,
+                false,
                 Some(Duration::from_secs(10)),
+                None,
             ),
             Duration::from_secs(20),
             "a usable relay keeps its reserved slice"
@@ -12060,21 +12136,120 @@ mod tests {
                 configured,
                 overall,
                 false,
-                true,
+                false,
                 Some(Duration::from_secs(30)),
+                None,
             ),
             configured,
             "an oversized relay reserve must not starve a viable direct route"
         );
         assert_eq!(
-            direct_stage_timeout(configured, overall, true, true, None),
+            direct_stage_timeout(configured, overall, true, false, None, None),
             configured,
             "an explicit strategy remains authoritative"
         );
+    }
+
+    /// #304: the extension follows hole-punch capability, not whether the
+    /// dial carries a PeerId, and it never exceeds the caller's budget.
+    #[test]
+    fn peer_dial_direct_budget_follows_holepunch_and_caller_budget() {
+        let configured = Duration::from_millis(2_082);
+        let overall = Duration::from_secs(30);
+
         assert_eq!(
-            direct_stage_timeout(configured, overall, false, false, None),
+            direct_stage_timeout(configured, overall, false, true, None, None),
             configured,
-            "peer-oriented dialing retains its adaptive fallback allocation"
+            "a dial that can hole-punch keeps the adaptive cutoff for punching"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                true,
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(30)),
+            ),
+            configured,
+            "hole-punch capability wins over relay and caller budgets"
+        );
+        assert_eq!(
+            direct_stage_timeout(configured, overall, true, true, None, None),
+            configured,
+            "an explicit strategy remains authoritative for PeerId dials"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                false,
+                None,
+                Some(Duration::from_secs(12)),
+            ),
+            Duration::from_secs(12),
+            "the caller's remaining dial budget caps the extension"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                false,
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(25)),
+            ),
+            Duration::from_secs(15),
+            "the relay reserve comes out of the caller's remaining budget"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                false,
+                None,
+                Some(Duration::from_secs(40)),
+            ),
+            overall,
+            "the ladder deadline still bounds the stage"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                false,
+                None,
+                Some(Duration::ZERO)
+            ),
+            configured,
+            "a spent caller budget falls back to the adaptive budget, not to zero"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                overall,
+                false,
+                false,
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(1)),
+            ),
+            configured,
+            "a nearly spent caller budget never shrinks the adaptive budget"
+        );
+        assert_eq!(
+            direct_stage_timeout(
+                configured,
+                Duration::from_secs(1),
+                false,
+                false,
+                None,
+                Some(Duration::from_secs(5)),
+            ),
+            Duration::from_secs(1),
+            "the stage never exceeds the ladder's remaining time"
         );
     }
 
@@ -12083,7 +12258,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9000".parse().expect("loopback addr");
         let configured = Duration::from_millis(20);
         let overall = Duration::from_millis(300);
-        let effective = direct_stage_timeout(configured, overall, false, true, None);
+        let effective = direct_stage_timeout(configured, overall, false, false, None, None);
 
         let completed = timeout(
             effective,
