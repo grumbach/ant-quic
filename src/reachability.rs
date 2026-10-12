@@ -348,6 +348,33 @@ mod tests {
         assert_eq!(result, Some(ReachabilityScope::Global));
     }
 
+    /// #269 round 2: an IPv4-mapped IPv6 address (::ffff:a.b.c.d) is the IPv4
+    /// address on a dual-stack socket, so it must get the scope of that IPv4
+    /// address. Before the fix the IPv6 branch classified every mapped
+    /// address as Global, so LAN or loopback evidence could grant relay and
+    /// coordinator capability.
+    #[test]
+    fn scope_ipv4_mapped_matches_plain_ipv4() {
+        for (mapped, plain) in [
+            ("[::ffff:192.168.1.50]:9000", "192.168.1.50:9000"),
+            ("[::ffff:10.0.0.1]:9000", "10.0.0.1:9000"),
+            ("[::ffff:172.16.0.1]:9000", "172.16.0.1:9000"),
+            ("[::ffff:127.0.0.1]:9000", "127.0.0.1:9000"),
+            ("[::ffff:169.254.1.2]:9000", "169.254.1.2:9000"),
+            ("[::ffff:0.0.0.0]:9000", "0.0.0.0:9000"),
+            ("[::ffff:224.0.0.1]:9000", "224.0.0.1:9000"),
+            ("[::ffff:8.8.8.8]:9000", "8.8.8.8:9000"),
+        ] {
+            let mapped: SocketAddr = mapped.parse().unwrap();
+            let plain: SocketAddr = plain.parse().unwrap();
+            assert_eq!(
+                socket_addr_scope(mapped),
+                socket_addr_scope(plain),
+                "{mapped} must have the scope of {plain}"
+            );
+        }
+    }
+
     // TraversalMethod tests
 
     #[test]
