@@ -19184,10 +19184,10 @@ mod tests {
             .await;
             assert_never_published(&endpoint, expected.peer_id, "a coordinator dial").await;
             assert!(
-                !endpoint
+                endpoint
                     .active_sessions
                     .get(&expected.peer_id)
-                    .is_some_and(|session| session.session_state.connection.is_some()),
+                    .is_none_or(|session| session.session_state.connection.is_none()),
                 "R1: the session does not record the wrong-identity connection"
             );
             assert_eq!(
