@@ -20978,8 +20978,8 @@ mod tests {
             hooks.panic_attempt.store(1, AtomicOrdering::SeqCst);
             a.spawn_reader_task(b_peer, x.clone()).await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while !(hooks.panicked.load(AtomicOrdering::SeqCst)
-                && !a.live_reader_for_test(&b_peer, x.stable_id()).await)
+            while !hooks.panicked.load(AtomicOrdering::SeqCst)
+                || a.live_reader_for_test(&b_peer, x.stable_id()).await
             {
                 assert!(
                     tokio::time::Instant::now() < deadline,
