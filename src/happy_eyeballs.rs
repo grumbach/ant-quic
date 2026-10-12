@@ -21,6 +21,7 @@
 //!    attempt starts in parallel
 //! 4. On any failure, the next attempt starts immediately without waiting for the delay
 //! 5. The first successful connection wins; all other pending attempts are cancelled
+//!    and have stopped before the winner is returned
 //!
 //! # Example
 //!
@@ -42,10 +43,12 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 /// Which address family to prefer when interleaving connection attempts.
@@ -221,24 +224,20 @@ pub fn sort_addresses(addresses: &[SocketAddr], config: &HappyEyeballsConfig) ->
     result
 }
 
-/// Message sent from a spawned connection attempt back to the coordinator.
-enum AttemptResult<C> {
-    /// Connection succeeded with the connection value and the address used.
-    Success(C, SocketAddr),
-    /// Connection failed with the address and error description.
-    Failure(SocketAddr, String),
-}
+/// What one spawned attempt returns: the address it dialled and its result.
+type AttemptOutcome<C> = (SocketAddr, Result<C, String>);
 
-/// Spawn a single connection attempt as a tokio task.
+/// Spawn a single connection attempt into the race's [`JoinSet`].
 ///
-/// The task sends its result (success or failure) through the provided channel sender.
+/// The set owns the task: dropping or shutting down the set stops the
+/// attempt. A panic in the attempt future becomes a failed attempt, so the
+/// coordinator always gets one outcome per attempt.
 fn spawn_attempt<F, Fut, C, E>(
+    attempts: &mut JoinSet<AttemptOutcome<C>>,
     addr: SocketAddr,
     attempt_num: usize,
     connect_fn: &F,
-    tx: &tokio::sync::mpsc::UnboundedSender<AttemptResult<C>>,
-) -> JoinHandle<()>
-where
+) where
     F: Fn(SocketAddr) -> Fut,
     Fut: Future<Output = Result<C, E>> + Send + 'static,
     C: Send + 'static,
@@ -246,18 +245,14 @@ where
 {
     debug!(addr = %addr, attempt = attempt_num, "Starting connection attempt");
     let fut = connect_fn(addr);
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        match fut.await {
-            Ok(conn) => {
-                // Ignore send errors - receiver may have been dropped if another attempt won
-                let _ = tx_clone.send(AttemptResult::Success(conn, addr));
-            }
-            Err(e) => {
-                let _ = tx_clone.send(AttemptResult::Failure(addr, e.to_string()));
-            }
-        }
-    })
+    attempts.spawn(async move {
+        let outcome = match AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("connection attempt panicked".to_string()),
+        };
+        (addr, outcome)
+    });
 }
 
 /// Race multiple connection attempts using the RFC 8305 Happy Eyeballs algorithm.
@@ -296,6 +291,17 @@ where
 /// 5. If the attempt failed, start the next attempt immediately
 /// 6. If the delay elapsed, start the next attempt in parallel
 /// 7. Repeat until one succeeds or all fail
+///
+/// # Cancellation
+///
+/// One [`JoinSet`] owns every spawned attempt (#294):
+/// - When an attempt wins, all other attempts are aborted and awaited before
+///   the winner is returned. No losing dial is still running when the caller
+///   gets the winner, and a loser that also connected is dropped.
+/// - When the caller drops the returned future (for example an outer
+///   timeout), the set is dropped and every attempt is aborted.
+/// - An attempt that panics counts as a failed attempt; it does not stall the
+///   race.
 pub async fn race_connect<F, Fut, C, E>(
     addresses: &[SocketAddr],
     config: &HappyEyeballsConfig,
@@ -318,126 +324,75 @@ where
         "Starting Happy Eyeballs connection racing"
     );
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AttemptResult<C>>();
-    let mut attempts = AttemptTasks::with_capacity(sorted.len());
+    let mut attempts: JoinSet<AttemptOutcome<C>> = JoinSet::new();
     let mut errors: Vec<(SocketAddr, String)> = Vec::new();
-    let mut next_index: usize = 0;
-    let total = sorted.len();
-    let mut in_flight: usize = 0;
+    let mut pending = sorted.iter().copied().enumerate().peekable();
 
     // Spawn the first attempt immediately
-    attempts.push(spawn_attempt(
-        sorted[next_index],
-        next_index + 1,
-        &connect_fn,
-        &tx,
-    ));
-    next_index += 1;
-    in_flight += 1;
+    if let Some((index, addr)) = pending.next() {
+        spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
+    }
 
     // Main event loop
     loop {
-        if next_index < total {
-            // We have more addresses to try. Race between delay timer and results.
+        let joined = if pending.peek().is_some() {
+            // More addresses to try: race the next result against the delay timer.
             tokio::select! {
                 biased;
 
                 // Prefer checking results over starting new attempts
-                result = rx.recv() => {
-                    match result {
-                        Some(AttemptResult::Success(conn, addr)) => {
-                            info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                            return Ok((conn, addr));
-                        }
-                        Some(AttemptResult::Failure(addr, err)) => {
-                            warn!(addr = %addr, error = %err, "Connection attempt failed");
-                            errors.push((addr, err));
-                            in_flight -= 1;
-
-                            // On failure, start next attempt immediately (RFC 8305 Section 5)
-                            if next_index < total {
-                                attempts.push(spawn_attempt(
-                                    sorted[next_index],
-                                    next_index + 1,
-                                    &connect_fn,
-                                    &tx,
-                                ));
-                                next_index += 1;
-                                in_flight += 1;
-                            }
-                        }
-                        None => {
-                            // Channel closed unexpectedly
-                            break;
-                        }
-                    }
-                }
+                joined = attempts.join_next() => joined,
 
                 // Timer fires: start next attempt in parallel
-                _ = tokio::time::sleep(config.connection_attempt_delay) => {
-                    if next_index < total {
+                () = tokio::time::sleep(config.connection_attempt_delay) => {
+                    if let Some((index, addr)) = pending.next() {
                         debug!(
-                            addr = %sorted[next_index],
-                            attempt = next_index + 1,
+                            addr = %addr,
+                            attempt = index + 1,
                             "Starting parallel attempt after delay"
                         );
-                        attempts.push(spawn_attempt(
-                            sorted[next_index],
-                            next_index + 1,
-                            &connect_fn,
-                            &tx,
-                        ));
-                        next_index += 1;
-                        in_flight += 1;
+                        spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
                     }
+                    continue;
                 }
             }
         } else {
-            // No more addresses to try - wait for all pending results
-            if in_flight == 0 {
-                break;
-            }
+            // No more addresses to try - wait for the attempts in flight
+            attempts.join_next().await
+        };
 
-            match rx.recv().await {
-                Some(AttemptResult::Success(conn, addr)) => {
-                    info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                    return Ok((conn, addr));
-                }
-                Some(AttemptResult::Failure(addr, err)) => {
-                    warn!(addr = %addr, error = %err, "Connection attempt failed");
-                    errors.push((addr, err));
-                    in_flight -= 1;
-                }
-                None => {
-                    // Channel closed
+        match joined {
+            Some(Ok((addr, Ok(conn)))) => {
+                info!(addr = %addr, "Happy Eyeballs: connection succeeded");
+                // Stop every losing attempt before the winner leaves the race.
+                attempts.shutdown().await;
+                return Ok((conn, addr));
+            }
+            Some(Ok((addr, Err(err)))) => {
+                warn!(addr = %addr, error = %err, "Connection attempt failed");
+                errors.push((addr, err));
+            }
+            Some(Err(join_error)) => {
+                // Panics are caught inside the attempt, so only an external
+                // cancellation (runtime shutdown) reaches this arm.
+                warn!(error = %join_error, "Connection attempt ended without a result");
+            }
+            None => {
+                // No attempt in flight.
+                if pending.peek().is_none() {
                     break;
                 }
             }
         }
+
+        // An attempt ended without a winner: start the next attempt
+        // immediately (RFC 8305 Section 5).
+        if let Some((index, addr)) = pending.next() {
+            spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
+        }
     }
 
     Err(HappyEyeballsError::AllAttemptsFailed { errors })
-}
-
-/// Owns every attempt so cancellation of the race also cancels its child tasks.
-struct AttemptTasks(Vec<JoinHandle<()>>);
-
-impl AttemptTasks {
-    fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
-    }
-
-    fn push(&mut self, handle: JoinHandle<()>) {
-        self.0.push(handle);
-    }
-}
-
-impl Drop for AttemptTasks {
-    fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.abort();
-        }
-    }
 }
 
 #[cfg(test)]
