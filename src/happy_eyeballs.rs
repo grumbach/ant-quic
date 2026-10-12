@@ -41,6 +41,7 @@
 //! }).await?;
 //! ```
 
+use std::any::Any;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
@@ -225,7 +226,21 @@ pub fn sort_addresses(addresses: &[SocketAddr], config: &HappyEyeballsConfig) ->
 }
 
 /// What one spawned attempt returns: the address it dialled and its result.
-type AttemptOutcome<C> = (SocketAddr, Result<C, String>);
+type AttemptOutcome<C> = (SocketAddr, Result<C, AttemptFailure>);
+
+/// The payload of a caught panic. Its destructor is arbitrary code, so the
+/// coordinator never drops one; the race hands it to the cleanup task (#294).
+type PanicPayload = Box<dyn Any + Send>;
+
+/// Why one attempt failed.
+struct AttemptFailure {
+    /// The error text that `AllAttemptsFailed` reports.
+    message: String,
+    /// The payload when the attempt (or the formatting of its error)
+    /// panicked. It is kept as a value so that it is not dropped in the
+    /// attempt task or on the coordinator.
+    panic_payload: Option<PanicPayload>,
+}
 
 /// Longest time the winner waits for the aborted losers to end.
 ///
@@ -239,8 +254,9 @@ const LOSER_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 /// Spawn a single connection attempt into the race's [`JoinSet`].
 ///
 /// The set owns the task: dropping or shutting down the set stops the
-/// attempt. A panic in the attempt future becomes a failed attempt, so the
-/// coordinator always gets one outcome per attempt.
+/// attempt. A panic in the attempt future, or in the formatting of its error,
+/// becomes a failed attempt, so the coordinator always gets one outcome per
+/// attempt. The panic payload is returned, not dropped.
 fn spawn_attempt<F, Fut, C, E>(
     attempts: &mut JoinSet<AttemptOutcome<C>>,
     addr: SocketAddr,
@@ -255,36 +271,72 @@ fn spawn_attempt<F, Fut, C, E>(
     debug!(addr = %addr, attempt = attempt_num, "Starting connection attempt");
     let fut = connect_fn(addr);
     attempts.spawn(async move {
-        let outcome = match AssertUnwindSafe(fut).catch_unwind().await {
+        // Format the error inside the catch: a panicking `Display` is a failed
+        // attempt too.
+        let attempt = async move { fut.await.map_err(|e| e.to_string()) };
+        let outcome = match AssertUnwindSafe(attempt).catch_unwind().await {
             Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(_) => Err("connection attempt panicked".to_string()),
+            Ok(Err(message)) => Err(AttemptFailure {
+                message,
+                panic_payload: None,
+            }),
+            Err(payload) => Err(AttemptFailure {
+                message: "connection attempt panicked".to_string(),
+                panic_payload: Some(payload),
+            }),
         };
         (addr, outcome)
     });
 }
 
-/// Hand what is left of a won race to a detached cleanup task, so that no
-/// loser is dropped on the winner's handoff path (#294).
+/// Keep the parts of a join result that have an arbitrary destructor, and
+/// drop the rest here.
+///
+/// A connected loser's value goes to `loser_values` and a panic payload goes
+/// to `panic_payloads`. What is dropped here has a trivial destructor: an
+/// error `String`, or a join error for a cancelled task (it carries no
+/// payload).
+fn keep_leftovers<C>(
+    joined: Result<AttemptOutcome<C>, tokio::task::JoinError>,
+    loser_values: &mut Vec<C>,
+    panic_payloads: &mut Vec<PanicPayload>,
+) {
+    match joined {
+        Ok((_, Ok(value))) => loser_values.push(value),
+        Ok((_, Err(failure))) => panic_payloads.extend(failure.panic_payload),
+        Err(join_error) => {
+            if let Ok(payload) = join_error.try_into_panic() {
+                panic_payloads.push(payload);
+            }
+        }
+    }
+}
+
+/// Hand what is left of a race to a detached cleanup task, so that the
+/// coordinator never drops a loser's value or a panic payload (#294).
 ///
 /// The task drops the values that losers already returned (losers that also
-/// connected), then joins and drops the aborted losers that have not ended
-/// yet. It ends when the last loser ends. When nothing is left, no task is
-/// spawned.
+/// connected) and the panic payloads, then joins and drops the aborted losers
+/// that have not ended yet. It ends when the last loser ends. When nothing is
+/// left, no task is spawned.
 fn release_losers<C: Send + 'static>(
     mut attempts: JoinSet<AttemptOutcome<C>>,
     loser_values: Vec<C>,
+    panic_payloads: Vec<PanicPayload>,
 ) {
-    if attempts.is_empty() && loser_values.is_empty() {
+    if attempts.is_empty() && loser_values.is_empty() && panic_payloads.is_empty() {
         return;
     }
     debug!(
         still_running = attempts.len(),
         connected_losers = loser_values.len(),
+        panic_payloads = panic_payloads.len(),
         "Happy Eyeballs: a cleanup task releases the losing attempts"
     );
     tokio::spawn(async move {
         drop(loser_values);
+        drop(panic_payloads);
+        // This task is the place where leftovers are dropped.
         while attempts.join_next().await.is_some() {}
     });
 }
@@ -331,15 +383,20 @@ fn release_losers<C: Send + 'static>(
 /// One [`JoinSet`] owns every spawned attempt (#294).
 /// - When an attempt wins, every other attempt is aborted before the winner
 ///   is returned. The race then waits at most 50 ms for the aborted attempts
-///   to end. The race never drops a loser on this path: the value of a loser
-///   that also connected, and any loser that has not ended yet, go to a
-///   detached cleanup task. That task drops them and ends when the last loser
-///   ends. So neither a blocking poll nor a blocking destructor of a loser
-///   can hold the winner for more than the bound.
+///   to end. The race never drops a loser's value or a panic payload on the
+///   coordinator: the value of a loser that also connected, every panic
+///   payload (from an attempt, from the formatting of its error, or from a
+///   destructor that panicked when an aborted attempt was dropped) and any
+///   loser that has not ended yet go to a detached cleanup task. That task
+///   drops them and ends when the last loser ends. So neither a blocking poll
+///   nor a blocking destructor of a loser can hold the winner for more than
+///   the bound. The coordinator itself drops only error strings and
+///   cancellation results, which have trivial destructors.
 /// - When the caller drops the returned future (for example an outer
-///   timeout), the set is dropped and every attempt is aborted.
+///   timeout), the set is dropped and every attempt is aborted. Results that
+///   are already complete are dropped in that drop, on the caller's thread.
 /// - An attempt that panics counts as a failed attempt; it does not stall the
-///   race.
+///   race. Its payload goes to the cleanup task when the race ends.
 ///
 /// Assumptions. Tokio cancellation is cooperative: an aborted attempt ends at
 /// its next poll (its next `.await`), and the runtime then drops its future.
@@ -348,8 +405,9 @@ fn release_losers<C: Send + 'static>(
 /// blocking destructor, keeps what it holds until that code ends; the race
 /// cannot release it sooner. On a current-thread runtime the runtime drops
 /// aborted attempts on the same thread, so blocking code there blocks the
-/// whole runtime. `connect_fn` must therefore not hold resources that the
-/// winner needs across blocking code, and its values should drop without
+/// whole runtime. An error value of `connect_fn` is formatted and dropped in
+/// its own attempt task. `connect_fn` must therefore not hold resources that
+/// the winner needs across blocking code, and its values should drop without
 /// blocking.
 pub async fn race_connect<F, Fut, C, E>(
     addresses: &[SocketAddr],
@@ -375,6 +433,9 @@ where
 
     let mut attempts: JoinSet<AttemptOutcome<C>> = JoinSet::new();
     let mut errors: Vec<(SocketAddr, String)> = Vec::new();
+    // Payloads of attempts that panicked before the race ended. They go to
+    // the cleanup task at the end; the coordinator never drops them.
+    let mut panic_payloads: Vec<PanicPayload> = Vec::new();
     let mut pending = sorted.iter().copied().enumerate().peekable();
 
     // Spawn the first attempt immediately
@@ -417,27 +478,31 @@ where
                 // bounded time to end. A loser that also connected returns a
                 // value; move it out, never drop it here: its destructor can
                 // block, and a timeout cannot interrupt a synchronous drop.
+                // The same applies to a panic payload.
                 attempts.abort_all();
                 let mut loser_values = Vec::new();
                 let _ = tokio::time::timeout(LOSER_SHUTDOWN_GRACE, async {
                     while let Some(joined) = attempts.join_next().await {
-                        if let Ok((_, Ok(value))) = joined {
-                            loser_values.push(value);
-                        }
+                        keep_leftovers(joined, &mut loser_values, &mut panic_payloads);
                     }
                 })
                 .await;
-                release_losers(attempts, loser_values);
+                release_losers(attempts, loser_values, panic_payloads);
                 return Ok((conn, addr));
             }
-            Some(Ok((addr, Err(err)))) => {
-                warn!(addr = %addr, error = %err, "Connection attempt failed");
-                errors.push((addr, err));
+            Some(Ok((addr, Err(failure)))) => {
+                warn!(addr = %addr, error = %failure.message, "Connection attempt failed");
+                panic_payloads.extend(failure.panic_payload);
+                errors.push((addr, failure.message));
             }
             Some(Err(join_error)) => {
-                // Panics are caught inside the attempt, so only an external
-                // cancellation (runtime shutdown) reaches this arm.
+                // Panics in an attempt are caught inside it, so this arm sees
+                // an external cancellation (runtime shutdown), or a panic in a
+                // destructor while the runtime dropped the task.
                 warn!(error = %join_error, "Connection attempt ended without a result");
+                if let Ok(payload) = join_error.try_into_panic() {
+                    panic_payloads.push(payload);
+                }
             }
             None => {
                 // No attempt in flight.
@@ -454,6 +519,8 @@ where
         }
     }
 
+    // Every attempt has ended; only panic payloads can be left.
+    release_losers(attempts, Vec::new(), panic_payloads);
     Err(HappyEyeballsError::AllAttemptsFailed { errors })
 }
 
