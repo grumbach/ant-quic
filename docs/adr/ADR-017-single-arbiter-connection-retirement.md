@@ -128,17 +128,27 @@ that the peer reads the connection the arbiter keeps.
 | E0 | The local end is the arbiter for the pair (A1). |
 | E1 | The current Live winner W is not L, is open, and has a running local reader. |
 | E2 | A probe pinned to W, issued in W's current Live period, was answered no more than P = 3 s before the claim. The probe is the existing ACK-v2 probe request; it is answered by the peer's reader of the connection it arrived on, so an answer proves that the peer reads W. |
-| E3 | (a) A follower-originated request stream (anything except a reply to our own request) arrived on W in W's current Live period. (b) No stream arrived on L for Q = 30 s. (c) W has been the Live winner for at least Q. |
+| E3 | (a) A follower-originated request stream (anything except a reply to our own request) arrived on W in W's current Live period. (b) No stream arrived on L for Q = 30 s, no relay stream that this end serves runs on L, and no client relay session of this end uses L (an established MASQUE relay session is active use without new streams). (c) W has been the Live winner for at least Q. |
 | E4 | L is Superseded, with the obligation epoch given by the caller. The obligation is recorded at every Superseded transition (registration, adoption, follow), whether or not the connection is ever delivered by `accept`. A new Superseded period gets a new epoch; repromotion clears it, so a stale claim cannot close a later period. |
+
+The executor collects the P2P-layer evidence during its pass, but it checks
+E1's reader, E3(a), E3(b) and the relay streams again while it holds the
+reader and activity locks, and it claims before it releases them. A stream
+that the reader records after the claim is in flight for the drain (E5).
 
 - **A4.1 Claim, drain, complete (E5).** The claim moves L to a new lifecycle
   state, **Retiring**. Repromotion selects a Retiring entry only when no other
   survivor exists, and a reader exit of a Retiring entry closes nothing. The
   executor then owns the drain:
-  1. it stops L's reader at its next accept boundary;
+  1. it stops L's reader at its next accept boundary, but only if L is
+     still Retiring with the claimed epoch, checked under the reader lock.
+     It marks that reader owner. The exit of a marked owner does
+     bookkeeping only (no exited-reader tombstone, no lifecycle or peer
+     cleanup), whatever L's state is by then. If the claim already ended,
+     nothing is stopped and nothing is drained;
   2. it waits until the reader's accept loop has exited, L's uni read tasks
-     are done, local ACK waiters on L are resolved and L has no
-     unacknowledged send data, or until the cap (the configured
+     and served relay streams are done, local ACK waiters on L are resolved
+     and L has no unacknowledged send data, or until the cap (the configured
      `stream_read_deadline`, counted from the claim);
   3. it checks that W is still open, and it stops waiting at once when W
      closes. If W is not open, it aborts: L goes back to Superseded with a new
@@ -150,6 +160,17 @@ that the peer reads the connection the arbiter keeps.
 
   Drain completion is a completion condition, not a claim condition (Codex
   R2-P2-6), and no wait happens under the lifecycle lock.
+
+- **A4.2 Recovery owns the reader restart.** An abort (step 3), and a
+  repromotion that selects a Retiring L, mark L's reader restart as pending.
+  Until a new reader of L is admitted, or 30 s pass, repromotion does not
+  refuse L as readerless and the #368 cleanup skips it, so a recovery never
+  closes the last connection to the peer. The restart waits for the stopped
+  owner to exit (also when that owner still runs with its cancel fired), and
+  it then releases the pending mark. A reader admission drops the
+  exited-reader tombstone of its generation, and the reader-liveness probe
+  takes a running owner of the connection over a tombstone, so the restarted
+  reader keeps its lifecycle generation and is still seen as live.
 
 ### Routing
 
@@ -186,8 +207,11 @@ that the peer reads the connection the arbiter keeps.
    registration-time rejection can only hit a newcomer, before any reader
    runs on it (A3).
 4. So at the claim, W is open at both ends, unless the network or an
-   explicit teardown kills it. If W dies during the drain, the executor aborts
-   (A4.1 step 3) and L survives.
+   explicit teardown kills it. If W dies before the stop or during the
+   drain, the claim ends (by the abort, or by a repromotion that selects L),
+   and L survives: a stale drain does not stop a reader it no longer holds
+   (A4.1 step 1), and L is not closed as readerless while its reader
+   restarts (A4.2).
 5. Convergence: the arbiter retires every quiet non-winner, and A6 makes a new
    follower stop using L. The comparator's non-transitivity only changes which
    W the arbiter picks, never safety (Codex P2-2).
@@ -196,10 +220,10 @@ that the peer reads the connection the arbiter keeps.
 
 | Case | Behaviour |
 |---|---|
-| F1 Bounded loss classes | A follower stream opened on L after the claim is never accepted and is lost, although its `send` returned Ok. Streams in flight at the claim are drained up to the cap. The cap abandons unfinished work, and application bidi streams handed to `accept_bi` are not tracked. No finite timing or byte bound is claimed; callers that need delivery use ACK-v2. A loss-free handover needs a wire signal (W2). |
-| F2 Resources | A connection that the follower keeps using, a quiet pair whose follower runs old code, a pair without ACK-v2, and two live processes with one identity keep their superseded connections open while both processes live. This is equal to or better than master for inbound supersedes, and it replaces master's 5 s outbound close, which was the unsafe case. |
+| F1 Bounded loss classes | A follower stream opened on L after the claim is never accepted and is lost, although its `send` returned Ok. Streams in flight at the claim, including a relay stream accepted between the claim and the stop, are drained up to the cap. The cap abandons unfinished work (for example a relay session that started in that window and outlives the cap), and application bidi streams handed to `accept_bi` are not tracked. No finite timing or byte bound is claimed; callers that need delivery use ACK-v2. A loss-free handover needs a wire signal (W2). |
+| F2 Resources | A superseded connection stays open while the follower keeps using it, while there is no evidence on W (for example an old follower that stays quiet on W, or a pair without ACK-v2), and while a relay session uses it. Two live processes with one identity are one peer to the arbiter: if B is quiet on its connection L, and B' supplies W's evidence, the arbiter retires L, and B then has no connection to the arbiter and must dial again (the #315 S1 case; Codex round 2, P3). This is equal to or better than master for inbound supersedes, and it replaces master's 5 s outbound close, which was the unsafe case. |
 | F3 Old arbiter, new follower | The old arbiter applies master's timer closes. The new follower closes fewer connections than master, reads all of them, and follows the old arbiter's own `probe_peer` probes. |
-| F4 Old follower, new arbiter | Retirement needs E3(a) from the old follower's own traffic on W, so an old follower that routes to L is never cut off. The old follower's own 5 s timer can still close W. A total loss then needs the old follower to register its newer connection at least about Q − 5 s − P (about 22 s) after that connection's handshake completed, or a connection that completes its handshake at the old follower but never at the arbiter, and in both cases the old timer must fire within about one round trip of the arbiter's claim. |
+| F4 Old follower, new arbiter | Retirement needs E3(a) from the old follower's own traffic on W, so an old follower that routes to L is never cut off. The old follower's own 5 s timer can still close W. A total loss then needs the old follower to register its newer connection at least about Q − 5 s − P (about 22 s) after that connection's handshake completed, or a connection that completes its handshake at the old follower but never at the arbiter, and in both cases the old timer must fire within about one round trip of the arbiter's claim. Example (Codex round 2): the arbiter A registers inbound L, then W at t = 0; the old B registers W and sends on it, but finalizes L only at t = 25 s, then routes to L and starts its own 5 s timer on W. A keeps B's earlier request on W as E3(a), gets a fresh answer on W near t = 30 s and retires the quiet L; if B's timer closes W before B processes L's close, and A completes L before it processes W's close, no connection survives. On master A would have kept the inbound L. The 30 s age gate makes this rare; it is not excluded. |
 | F5 Three or more candidates | Only the arbiter decides; any arbiter-local choice of W is safe. |
 | F6 Restart | Arbiter restart: the follower's stale connection gets no keepalive answers and idles out. Follower restart: the arbiter's stale connection is quiet and is retired after Q once the new connection has evidence. |
 
@@ -273,6 +297,12 @@ allows (Codex round-2 answer 5). It is not a capability claim, so ADR-004's
     and repromote/re-supersede epochs (P2-4);
   - a reader that starts late on a superseded connection at the arbiter reads
     it, and only a claim closes it (no pre-cancel; Codex Q9);
+  - round 2 (Codex review of the round-1 code): an abort after the 10 s
+    readerless grace keeps the last connection and restarts its reader; a
+    stale drain does not stop the reader of a repromoted winner; a recovered
+    connection survives a janitor sweep with its old generation; a stream
+    that arrives between the pass and the claim blocks the claim; a live
+    relay session blocks retirement;
   - slow stream, inline ACK-v2 bidi, reader exit of a Retiring entry, and the
     drain cap (P2-5);
   - a legacy-mode follower (master timers, no follow): an unread winner
