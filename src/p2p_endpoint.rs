@@ -491,6 +491,49 @@ struct ReaderTaskHandle {
     /// #313 R2: the spawned uni read tasks of this reader that are still in
     /// flight. The retirement drain waits until it is 0.
     uni_in_flight: Arc<AtomicUsize>,
+    /// #313 round 2 (P1-2): a retirement drain stopped this owner, under a
+    /// claim it checked while it held the reader lock. Its exit then does
+    /// bookkeeping only: no tombstone and no lifecycle or peer cleanup,
+    /// because the drain owns what follows (completion, or recovery and a
+    /// reader restart).
+    retirement_stop: bool,
+}
+
+/// #313 round 2 (P2-5): relay streams this endpoint serves, per connection
+/// stable id. An established MASQUE relay session is active use of its
+/// connection: the retirement claim refuses a connection with one, and the
+/// drain waits until none is left.
+type RelayStreamCounts = ParkingMutex<HashMap<usize, usize>>;
+
+/// #313 round 2 (P2-5): marks one served relay stream as live on its
+/// connection until it is dropped (the relay handler ended).
+struct RelayStreamInFlight {
+    counts: Arc<RelayStreamCounts>,
+    stable_id: usize,
+}
+
+impl RelayStreamInFlight {
+    fn new(counts: Arc<RelayStreamCounts>, stable_id: usize) -> Self {
+        *counts.lock().entry(stable_id).or_default() += 1;
+        Self { counts, stable_id }
+    }
+}
+
+impl Drop for RelayStreamInFlight {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.stable_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.stable_id);
+            }
+        }
+    }
+}
+
+/// #313 round 2 (P2-5): the number of live relay streams on `stable_id`.
+fn relay_streams_on(counts: &RelayStreamCounts, stable_id: usize) -> usize {
+    counts.lock().get(&stable_id).copied().unwrap_or(0)
 }
 
 /// #313 R2: marks one spawned uni read task as in flight until it is
@@ -1629,6 +1672,9 @@ pub struct P2pEndpoint {
     /// last read a request stream from the peer (any stream except a reply to
     /// one of our own requests).
     stream_activity: Arc<ParkingMutex<HashMap<usize, StreamActivity>>>,
+    /// #313 round 2 (P2-5): live relay streams this endpoint serves, per
+    /// connection.
+    relay_streams: Arc<RelayStreamCounts>,
 
     /// #313 R2 (ADR-017 A6): arbiter probes this endpoint received as a
     /// follower; the follow consumer confirms and follows them.
@@ -4020,6 +4066,7 @@ impl P2pEndpoint {
             ack_response_drop_injection: Arc::new(AtomicUsize::new(0)),
             send_failure_log: Arc::new(SendFailureLog::default()),
             stream_activity: Arc::new(ParkingMutex::new(HashMap::new())),
+            relay_streams: Arc::new(ParkingMutex::new(HashMap::new())),
             follow_tx,
             retirement_kick: Arc::new(Notify::new()),
             retirement_probes: Arc::new(ParkingMutex::new(HashMap::new())),
@@ -6990,6 +7037,7 @@ impl P2pEndpoint {
         mut send: crate::high_level::SendStream,
         mut recv: crate::high_level::RecvStream,
         max_read_bytes: usize,
+        relay_streams: &Arc<RelayStreamCounts>,
     ) -> bool {
         let _ = (&mut send, &mut recv);
         let accepted_at = Instant::now();
@@ -7102,7 +7150,9 @@ impl P2pEndpoint {
         if inner.relay_server_present() {
             let inner = Arc::clone(inner);
             let relay_connection = connection.clone();
+            let in_flight = RelayStreamInFlight::new(Arc::clone(relay_streams), conn_stable_id);
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 inner
                     .handle_relay_bidi_stream_from_app_reader(relay_connection, send, recv, prefix)
                     .await;
@@ -9176,18 +9226,6 @@ impl P2pEndpoint {
         let exited_reader_generations = Arc::clone(&self.exited_reader_generations);
         self.inner
             .set_reader_liveness_probe(Arc::new(move |peer_id, generation, stable_id| {
-                // F2 (#368 r1): an EXITED reader is dead regardless of the
-                // spawn-grace age gate — tombstones first. Contended
-                // tombstone reads conservatively skip this fast-path (the
-                // handle check below still applies).
-                if let Ok(exited) = exited_reader_generations.try_read() {
-                    if exited
-                        .get(peer_id)
-                        .is_some_and(|gens| gens.contains(&generation))
-                    {
-                        return false;
-                    }
-                }
                 // F1 (#368 r1): tokio's RwLock is write-preferring, so
                 // try_read() fails whenever a writer holds OR is queued —
                 // every spawn/exit/cleanup, i.e. exactly during churn. A
@@ -9202,7 +9240,7 @@ impl P2pEndpoint {
                 // with the generation, which never matched). F4: a panicked
                 // reader's handle is only removed at the end of the task
                 // body, so also require the task not finished.
-                reader_handles.try_read().map_or(true, |handles| {
+                let running = reader_handles.try_read().ok().map(|handles| {
                     handles.get(peer_id).is_some_and(|entries| {
                         entries.iter().any(|entry| {
                             entry.is_running()
@@ -9211,7 +9249,25 @@ impl P2pEndpoint {
                                 && !entry.abort_handle.is_finished()
                         })
                     })
-                })
+                });
+                // #313 round 2 (P1-3): a running owner of the connection wins
+                // over a tombstone that an earlier owner of the same
+                // generation left (a reader restarted after a retirement
+                // recovery keeps the lifecycle generation).
+                if running == Some(true) {
+                    return true;
+                }
+                // F2 (#368 r1): an EXITED reader is dead regardless of the
+                // spawn-grace age gate. Contended tombstone reads
+                // conservatively skip this check.
+                if let Ok(exited) = exited_reader_generations.try_read()
+                    && exited
+                        .get(peer_id)
+                        .is_some_and(|gens| gens.contains(&generation))
+                {
+                    return false;
+                }
+                running.unwrap_or(true)
             }));
     }
 
@@ -9572,13 +9628,15 @@ impl P2pEndpoint {
                         .get(&winner.stable_id)
                         .and_then(|seen| seen.request_at)
                         .is_some_and(|at| at >= winner.live_since);
-                // E3(b): no stream from the follower on the candidate for Q.
+                // E3(b): no stream from the follower on the candidate for Q,
+                // and (#313 round 2, P2-5) no relay stream served on it.
                 let quiet_candidates: Vec<_> = candidates
                     .into_iter()
                     .filter(|candidate| {
                         activity
                             .get(&candidate.stable_id)
                             .is_none_or(|seen| now.duration_since(seen.any_at) >= timing.quiet)
+                            && relay_streams_on(&self.relay_streams, candidate.stable_id) == 0
                     })
                     .collect();
                 (follower_uses_winner, quiet_candidates)
@@ -9608,15 +9666,60 @@ impl P2pEndpoint {
             )
             .await;
             for candidate in quiet_candidates {
-                match self.inner.try_claim_retirement(
-                    &peer_id,
-                    candidate.stable_id,
-                    candidate.epoch,
-                    winner.stable_id,
-                    winner.live_epoch,
-                    min_winner_age,
-                    timing.freshness,
-                ) {
+                // #313 round 2 (P2-4): the evidence above was collected
+                // earlier and can be stale. Re-check E1's reader, E3(a),
+                // E3(b) and the relay streams while holding the reader and
+                // activity locks, and claim before releasing them. A stream
+                // noted after the claim is in flight for the drain (E5).
+                let handles = self.reader_handles.read().await;
+                let claim = {
+                    let winner_read = handles.get(&peer_id).is_some_and(|entries| {
+                        entries.iter().any(|handle| {
+                            handle.conn_stable_id == winner.stable_id
+                                && handle.is_running()
+                                && !handle.abort_handle.is_finished()
+                        })
+                    });
+                    let activity = self.stream_activity.lock();
+                    let now = Instant::now();
+                    let follower_uses_winner = skip_follow_evidence
+                        || activity
+                            .get(&winner.stable_id)
+                            .and_then(|seen| seen.request_at)
+                            .is_some_and(|at| at >= winner.live_since);
+                    let candidate_quiet = activity
+                        .get(&candidate.stable_id)
+                        .is_none_or(|seen| now.duration_since(seen.any_at) >= timing.quiet);
+                    if !winner_read {
+                        crate::nat_traversal_api::RetireClaim::Ineligible(
+                            "the winner has no running reader",
+                        )
+                    } else if !follower_uses_winner {
+                        crate::nat_traversal_api::RetireClaim::Ineligible(
+                            "no follower request on the winner",
+                        )
+                    } else if !candidate_quiet {
+                        crate::nat_traversal_api::RetireClaim::Ineligible(
+                            "a stream arrived on the candidate",
+                        )
+                    } else if relay_streams_on(&self.relay_streams, candidate.stable_id) != 0 {
+                        crate::nat_traversal_api::RetireClaim::Ineligible(
+                            "a relay stream runs on the candidate",
+                        )
+                    } else {
+                        self.inner.try_claim_retirement(
+                            &peer_id,
+                            candidate.stable_id,
+                            candidate.epoch,
+                            winner.stable_id,
+                            winner.live_epoch,
+                            min_winner_age,
+                            timing.freshness,
+                        )
+                    }
+                };
+                drop(handles);
+                match claim {
                     crate::nat_traversal_api::RetireClaim::Claimed { connection } => {
                         info!(
                             peer_id = %format!("{:02x}{:02x}", peer_id.0[0], peer_id.0[1]),
@@ -9743,19 +9846,31 @@ impl P2pEndpoint {
             retirement_test_hooks::Point::DrainBeforeStop,
         )
         .await;
-        let uni_in_flight = {
-            let handles = self.reader_handles.read().await;
-            handles
-                .values()
-                .flatten()
-                .find(|handle| handle.conn_stable_id == stable_id && handle.is_running())
-                .map(|handle| {
-                    handle.cancel.cancel();
-                    Arc::clone(&handle.uni_in_flight)
-                })
+        // #313 round 2 (P1-2): stop the reader only while the claim still
+        // holds, checked under the reader lock, and mark the stop, so its
+        // exit does bookkeeping only. A repromotion that ended the claim
+        // before this point keeps the reader running.
+        let (claim_held, uni_in_flight) = {
+            let mut handles = self.reader_handles.write().await;
+            if self.inner.is_retiring_for_epoch(&peer_id, stable_id, epoch) {
+                let uni_in_flight = handles
+                    .values_mut()
+                    .flatten()
+                    .find(|handle| handle.conn_stable_id == stable_id && handle.is_running())
+                    .map(|handle| {
+                        handle.retirement_stop = true;
+                        handle.cancel.cancel();
+                        Arc::clone(&handle.uni_in_flight)
+                    });
+                (true, uni_in_flight)
+            } else {
+                (false, None)
+            }
         };
+        // A claim that ended before the stop has nothing to drain.
         loop {
-            if connection.close_reason().is_some()
+            if !claim_held
+                || connection.close_reason().is_some()
                 || started.elapsed() >= cap
                 || !self
                     .inner
@@ -9781,7 +9896,9 @@ impl P2pEndpoint {
                 .get(&stable_id)
                 .is_none_or(|waiters| waiters.is_empty());
             let sends_done = connection.send_unacked_bytes() == 0;
-            if reader_done && streams_done && waiters_done && sends_done {
+            // #313 round 2 (P2-5): a relay stream accepted before the stop.
+            let relay_done = relay_streams_on(&self.relay_streams, stable_id) == 0;
+            if reader_done && streams_done && waiters_done && sends_done && relay_done {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -9847,38 +9964,63 @@ impl P2pEndpoint {
     }
 
     /// #313 R2: restart the reader of a connection whose retirement was
-    /// aborted. Its previous owner was stopped by the drain; admission waits
-    /// (bounded) until that owner's record is reaped.
+    /// aborted, or that a repromotion took back from a retirement claim. Its
+    /// previous owner was stopped by the drain; admission waits (bounded)
+    /// until that owner has exited and its record is reaped.
+    ///
+    /// #313 round 2 (P1-2): an owner that is still running but whose cancel
+    /// already fired is the stopped one, so the restart waits for it too. In
+    /// every outcome the recovery then releases its claim on the restart.
     async fn resume_reader_after_abort(
         &self,
         peer_id: PeerId,
         connection: crate::high_level::Connection,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let stable_id = connection.stable_id();
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if connection.close_reason().is_some() {
-                return;
+                break;
             }
             match self
                 .start_reader(peer_id, connection.clone(), ReaderStartMode::Resume)
                 .await
             {
-                ReaderStart::Started | ReaderStart::AlreadyOwned | ReaderStart::NotStarted => {
-                    return;
-                }
-                ReaderStart::Blocked => {
-                    if Instant::now() >= deadline {
-                        warn!(
-                            peer_id = ?peer_id,
-                            stable_id = connection.stable_id(),
-                            "could not restart the reader of an aborted retirement"
-                        );
-                        return;
+                ReaderStart::Started | ReaderStart::NotStarted => break,
+                ReaderStart::AlreadyOwned => {
+                    if !self.reader_owner_stopping(&peer_id, stable_id).await {
+                        break;
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                ReaderStart::Blocked => {}
             }
+            if Instant::now() >= deadline {
+                warn!(
+                    peer_id = ?peer_id,
+                    stable_id,
+                    "could not restart the reader of an aborted retirement"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        self.inner.clear_reader_restart_pending(&peer_id, stable_id);
+    }
+
+    /// #313 round 2 (P1-2): true while the running owner of `stable_id` has
+    /// been cancelled (it exits at its next accept boundary).
+    async fn reader_owner_stopping(&self, peer_id: &PeerId, stable_id: usize) -> bool {
+        self.reader_handles
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|handles| {
+                handles.iter().any(|handle| {
+                    handle.conn_stable_id == stable_id
+                        && handle.is_running()
+                        && handle.cancel.is_cancelled()
+                })
+            })
     }
 
     /// #368 backstop janitor: every 5 s, close open tracked connections
@@ -11068,6 +11210,7 @@ impl P2pEndpoint {
         // #313 R2 (ADR-017): stream activity for the retirement checks, and
         // the follower's queue of arbiter probes.
         let stream_activity = Arc::clone(&self.stream_activity);
+        let relay_streams = Arc::clone(&self.relay_streams);
         let follow_tx = self.follow_tx.clone();
         let stream_read_deadline = self.config.stream_read_deadline;
         let data_tx_capacity = self.data_tx_capacity;
@@ -11304,6 +11447,7 @@ impl P2pEndpoint {
                             send,
                             recv,
                             max_read_bytes,
+                            &relay_streams,
                         )
                         .await
                         {
@@ -11611,7 +11755,22 @@ impl P2pEndpoint {
             cancel,
             abort_handle,
             uni_in_flight: handle_uni_in_flight,
+            retirement_stop: false,
         });
+        // #313 round 2 (P1-3): this connection has a reader again. Drop the
+        // tombstone of an earlier owner of this generation, and end a
+        // retirement recovery's claim on the restart. (An earlier owner's
+        // exit side effects are done: admission needs its record reaped.)
+        if let Some(exited) = self
+            .exited_reader_generations
+            .write()
+            .await
+            .get_mut(&peer_id)
+        {
+            exited.retain(|exited_generation| *exited_generation != generation);
+        }
+        self.inner
+            .clear_reader_restart_pending(&peer_id, conn_stable_id);
         drop(handles);
         ReaderStart::Started
     }
@@ -11983,19 +12142,19 @@ impl P2pEndpoint {
                             .map(|record| {
                                 let was_stopping = record.state == ReaderOwnerState::Stopping;
                                 record.state = ReaderOwnerState::Exiting;
-                                was_stopping
+                                (was_stopping, record.retirement_stop)
                             })
                     });
-                    claimed.map(|was_stopping| {
+                    claimed.map(|(was_stopping, retirement_stop)| {
                         let other_running = handles.get(&peer_id).is_some_and(|entries| {
                             entries
                                 .iter()
                                 .any(|handle| handle.owner_id != owner_id && handle.is_running())
                         });
-                        !was_stopping && !other_running
+                        (!was_stopping && !other_running, retirement_stop)
                     })
                 };
-                let Some(last_reader) = claim else {
+                let Some((last_reader, retirement_stop)) = claim else {
                     debug!(
                         peer_id = ?peer_id,
                         conn_stable_id,
@@ -12012,6 +12171,20 @@ impl P2pEndpoint {
                 .await;
 
                 'side_effects: {
+                    // #313 round 2 (P1-2, P1-3): a retirement drain stopped
+                    // this owner. Whatever the connection's state is now (a
+                    // repromotion can have made it Live again), the drain owns
+                    // what follows, so this exit records no tombstone and
+                    // cleans up nothing.
+                    if retirement_stop {
+                        emit_peer_lifecycle_event(
+                            &peer_event_tx,
+                            peer_event_channels.as_ref(),
+                            peer_id,
+                            PeerLifecycleEvent::ReaderExited { generation },
+                        );
+                        break 'side_effects;
+                    }
                     // #368 F2: record the exited generation so the liveness
                     // probe can reject an exited-reader survivor immediately
                     // (bounded per peer).
@@ -12349,6 +12522,7 @@ impl Clone for P2pEndpoint {
             ack_response_drop_injection: Arc::clone(&self.ack_response_drop_injection),
             send_failure_log: Arc::clone(&self.send_failure_log),
             stream_activity: Arc::clone(&self.stream_activity),
+            relay_streams: Arc::clone(&self.relay_streams),
             follow_tx: self.follow_tx.clone(),
             retirement_kick: Arc::clone(&self.retirement_kick),
             retirement_probes: Arc::clone(&self.retirement_probes),
@@ -19453,6 +19627,7 @@ mod tests {
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                     uni_in_flight: Arc::new(AtomicUsize::new(0)),
+                    retirement_stop: false,
                 }],
             );
         }
@@ -19710,6 +19885,7 @@ mod tests {
                     cancel: CancellationToken::new(),
                     abort_handle: probe_join.abort_handle(),
                     uni_in_flight: Arc::new(AtomicUsize::new(0)),
+                    retirement_stop: false,
                 }],
             );
         }
