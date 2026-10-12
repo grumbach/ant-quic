@@ -964,6 +964,65 @@ mod tests {
         }
     }
 
+    /// #294 round 2: a losing attempt that blocks in a non-yielding section
+    /// (here `block_in_place`) cannot be stopped from outside, because tokio
+    /// cancellation is cooperative. The race must still hand over a ready
+    /// winner after a bounded wait. It must not wait until the blocked loser
+    /// ends.
+    ///
+    /// Deterministic in outcome: the gate keeps the loser blocked until the
+    /// test releases it, so a race that waits for the loser cannot return
+    /// before the release. A race with a bounded wait returns long before the
+    /// 5 s guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_loser_does_not_hold_ready_winner() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let mut race = tokio::spawn(async move {
+            race_connect(&addrs, &config, move |addr| {
+                let entered = Arc::clone(&entered);
+                let release_rx = Arc::clone(&release_rx);
+                async move {
+                    if addr.is_ipv6() {
+                        entered.notify_one();
+                        // Blocking section: an abort cannot interrupt it.
+                        tokio::task::block_in_place(|| {
+                            let _ = release_rx.lock().unwrap().recv();
+                        });
+                        std::future::pending::<Result<u8, String>>().await
+                    } else {
+                        // Gate: win only after the loser is blocked.
+                        entered.notified().await;
+                        Ok(42)
+                    }
+                }
+            })
+            .await
+        });
+
+        let before_release = tokio::time::timeout(Duration::from_secs(5), &mut race).await;
+        // Release the blocked worker before any assertion, so that a failure
+        // cannot leave a blocked thread behind.
+        let _ = release_tx.send(());
+        let joined = match before_release {
+            Ok(joined) => joined,
+            Err(_) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), race).await;
+                panic!("the ready winner was held until the blocked loser was released");
+            }
+        };
+        let (winner, addr) = joined.unwrap().unwrap();
+        assert_eq!(winner, 42);
+        assert_eq!(addr, v4("10.0.0.1:80"));
+    }
+
     #[test]
     fn test_error_display() {
         let err = HappyEyeballsError::NoAddresses;
