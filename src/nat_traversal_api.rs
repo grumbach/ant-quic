@@ -8279,8 +8279,16 @@ impl NatTraversalEndpoint {
             }
 
             let rejection = match policy {
+                // #313 round 2 (P2-6): a Live entry of origin `Raw` is one that
+                // master did not track, so master had no Live entry to compare
+                // with and admitted the candidate. Keep that decision: a Raw
+                // Live winner never rejects a candidate; the candidate takes
+                // the route and the Raw winner becomes Superseded (still open).
                 RegistrationPolicy::Lifecycle => live_idx
-                    .filter(|index| !Self::candidate_wins(&entries[*index], &tracked))
+                    .filter(|index| {
+                        entries[*index].origin == ConnectionOrigin::Registered
+                            && !Self::candidate_wins(&entries[*index], &tracked)
+                    })
                     .map(|_| Rejection::Superseded),
                 // #310: another connection already in the winner map keeps
                 // the slot, tracked or not.
