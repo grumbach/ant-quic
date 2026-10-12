@@ -58,7 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   winner choice does not change: a hole-punch winner keeps first-wins (a
   duplicate is closed as before), and an accepted-coordination winner always
   takes the slot (the connection it replaces becomes Superseded; nothing is
-  closed). Their generation is now the receive generation of their data. They
+  closed). A later registration decides as master did, too: a tracked winner
+  of this kind never rejects a newcomer (master had no Live entry to compare
+  with), so the newcomer takes the route and the earlier winner becomes
+  Superseded and stays open. Their generation is now the receive generation
+  of their data. They
   keep the close behaviour they had while untracked: the #368 janitor and
   repromotion never close them as `NoReader`, their reader is never
   pre-cancelled, and a reader exit never closes them while they are open. Two
