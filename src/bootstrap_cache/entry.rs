@@ -301,9 +301,11 @@ impl PeerCapabilities {
     }
 
     /// Check if this peer can bridge between source and target IP versions
+    ///
+    /// An IPv4-mapped IPv6 address counts as IPv4 (#269).
     pub fn can_bridge(&self, source: &SocketAddr, target: &SocketAddr) -> bool {
-        let source_v4 = source.is_ipv4();
-        let target_v4 = target.is_ipv4();
+        let source_v4 = normalize_socket_addr(*source).is_ipv4();
+        let target_v4 = normalize_socket_addr(*target).is_ipv4();
 
         // Same version - any peer can handle
         if source_v4 == target_v4 {
