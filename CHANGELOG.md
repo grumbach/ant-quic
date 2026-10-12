@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hole-punch and accepted-coordination winners are lifecycle-tracked
+  (#313 Part 2, slice R1).** These winners were raw winner-map inserts, so they
+  had no generation, and a coordinator winner left the tracked winner it
+  replaced Live beside it. They now go through the lifecycle registrar. The
+  winner choice does not change: a hole-punch winner keeps first-wins (a
+  duplicate is closed as before), and an accepted-coordination winner always
+  takes the slot (the connection it replaces becomes Superseded; nothing is
+  closed). Their generation is now the receive generation of their data. They
+  keep the close behaviour they had while untracked: the #368 janitor and
+  repromotion never close them as `NoReader`, their reader is never
+  pre-cancelled, and a reader exit never closes them while they are open. Two
+  closes now also reach them, as for every tracked connection: `disconnect`
+  closes them, and the ACK-v2 liveness timeout closes them when their data
+  path is dead.
+- **A hole-punch or accepted-coordination dial is bound to its authenticated
+  identity (#313 R1, Q6).** A connection that does not authenticate as the
+  expected peer is closed before anything is published. It is no longer stored
+  under the expected peer's key, and the session is not marked connected.
+- **`add_connection` of a connection that is already tracked registers nothing
+  (#313 R1, Q4).** A Live connection keeps its generation and gets no second
+  observed-address watch. A Superseded, Closing or Closed connection is refused
+  and not closed by the call (its lifecycle state governs it), so a
+  re-registration can no longer resurrect a connection whose drain close is in
+  progress. A connection that is already closed is refused too.
+- **No winner-map insert orphans an untracked connection (#313 R1).** The
+  registrar and repromotion adopt an open, untracked value that they displace
+  as Superseded.
+- **`poll` keeps a winner that registered after its closed-connection scan
+  (#313 R1).** The removal is bounded to the closed connection the scan saw,
+  and no `ConnectionLost` is reported for a peer that already has a new winner.
+- **The reader-liveness probe sees a reader that started before its
+  connection was registered (#313 R1).** It compared the connection's
+  `stable_id` with the lifecycle generation, so the #368 janitor could close a
+  connection as `NoReader` while its reader ran.
+
 ### Tests
 
 - **Three replacement tests now make a genuinely new connection (#316).**
