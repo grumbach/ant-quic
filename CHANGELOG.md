@@ -18,12 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the pair's **arbiter** (the end with the greater PeerId) retires, and
   only when: its winner is open and read locally; a probe on the winner was
   answered at most 3 s before; the peer sent a request on the winner, and
-  nothing on the superseded connection for 30 s; and the winner has been Live
-  for 30 s. The arbiter then drains the connection (its reader stops at the
-  next stream boundary; in-flight reads, ACK waiters and unacknowledged sends
-  finish, up to `stream_read_deadline`) and closes it with the reserved
-  `Superseded` code. If the winner dies during the drain, the retirement is
-  aborted. The other end (the **follower**) never retires; when the arbiter
+  nothing on the superseded connection for 30 s; no relay session (served,
+  or our own client session) runs on the superseded connection; and the
+  winner has been Live for 30 s. The reader, activity and relay evidence is
+  checked again, under locks, at the claim. The arbiter then drains the
+  connection (its reader stops at the next stream boundary; in-flight reads,
+  served relay streams, ACK waiters and unacknowledged sends finish, up to
+  `stream_read_deadline`) and closes it with the reserved `Superseded` code.
+  If the winner dies during the drain, or a repromotion takes the
+  connection back, the retirement is aborted: the connection is kept (it is
+  never closed as readerless while its reader restarts), a stale drain never
+  stops the reader of a connection it no longer holds, and the restarted
+  reader is seen as live by the #368 cleanup. The other end (the **follower**) never retires; when the arbiter
   probes a connection, the follower confirms it with its own probe and makes
   it its winner. Neither end pre-cancels a reader that starts late on a
   superseded connection any more: that reader reads it until the arbiter
