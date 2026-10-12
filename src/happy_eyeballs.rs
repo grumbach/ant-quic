@@ -1054,6 +1054,103 @@ mod tests {
         assert_eq!(addr, v4("10.0.0.1:80"));
     }
 
+    /// A connection stand-in whose destructor can block until a gate opens.
+    struct GatedDrop {
+        gate: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for GatedDrop {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.lock().unwrap().recv();
+            }
+            self.dropped.notify_one();
+        }
+    }
+
+    /// #294 round 3: a loser that also connected returns a value, and that
+    /// value can have a blocking destructor. The race must not drop it on the
+    /// winner's handoff path: a timeout cannot interrupt a synchronous drop,
+    /// so an inline drop holds a ready winner without a bound. The value must
+    /// still be dropped later (no leak).
+    ///
+    /// Deterministic: current-thread runtime and explicit gates. The winner
+    /// completes first and wakes the loser, which completes in the same
+    /// scheduler pass, so both results are ready when the race resumes. A
+    /// separate thread opens the destructor gate only after the race returns
+    /// (or after a 5 s guard). A race that drops the loser value inline can
+    /// therefore return only after the gate opens.
+    #[tokio::test]
+    async fn blocking_loser_result_drop_does_not_hold_ready_winner() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = Arc::new(std::sync::Mutex::new(gate_rx));
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+        let gate_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate_opened_by_thread = Arc::clone(&gate_opened);
+        let releaser = std::thread::spawn(move || {
+            let _ = returned_rx.recv_timeout(Duration::from_secs(5));
+            gate_opened_by_thread.store(true, Ordering::SeqCst);
+            let _ = gate_tx.send(());
+        });
+
+        let loser_may_finish = Arc::new(tokio::sync::Notify::new());
+        let loser_dropped = Arc::new(tokio::sync::Notify::new());
+        let winner_dropped = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let loser_dropped_for_attempt = Arc::clone(&loser_dropped);
+        let winner_dropped_for_attempt = Arc::clone(&winner_dropped);
+        let loser_may_finish_for_attempt = Arc::clone(&loser_may_finish);
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let gate_rx = Arc::clone(&gate_rx);
+            let loser_may_finish = Arc::clone(&loser_may_finish_for_attempt);
+            let loser_dropped = Arc::clone(&loser_dropped_for_attempt);
+            let winner_dropped = Arc::clone(&winner_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: also connects, right after the winner.
+                    loser_may_finish.notified().await;
+                    Ok::<GatedDrop, String>(GatedDrop {
+                        gate: Some(gate_rx),
+                        dropped: loser_dropped,
+                    })
+                } else {
+                    // Winner: wake the loser, then win.
+                    loser_may_finish.notify_one();
+                    Ok(GatedDrop {
+                        gate: None,
+                        dropped: winner_dropped,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let gate_was_open_at_return = gate_opened.load(Ordering::SeqCst);
+        let _ = returned_tx.send(());
+        releaser.join().unwrap();
+        assert_eq!(addr, v4("10.0.0.1:80"));
+        assert!(
+            !gate_was_open_at_return,
+            "the ready winner was held until the loser's destructor was released"
+        );
+
+        // No leak: the loser value is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), loser_dropped.notified())
+            .await
+            .unwrap();
+        drop(winner);
+        tokio::time::timeout(Duration::from_secs(1), winner_dropped.notified())
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn test_error_display() {
         let err = HappyEyeballsError::NoAddresses;
