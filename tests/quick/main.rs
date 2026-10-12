@@ -9,6 +9,7 @@
 // v0.2: auth_tests removed - TLS handles peer authentication via ML-DSA-65
 mod auto_binding_integration;
 mod binding_stream_tests;
+mod bootstrap_cache_self_exclusion;
 mod connect_topologies;
 mod connection_tests;
 mod crypto_tests;
