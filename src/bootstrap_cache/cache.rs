@@ -1244,6 +1244,60 @@ mod tests {
         );
     }
 
+    /// #269 round 2: relays are stored as IPv4 after normalisation, so a
+    /// target in IPv4-mapped form must select the same relays as the same
+    /// target in plain IPv4 form. Before the fix the mapped target was an
+    /// IPv6 target to the family filter, which removed every IPv4 relay.
+    #[tokio::test]
+    async fn mapped_target_selects_the_same_relays_as_plain_ipv4_target() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let cache = create_test_cache(&temp_dir).await;
+        let lan_relay = PeerId([0x71; 32]);
+        cache
+            .observe_direct_reachability(OTHER, addr("[::ffff:127.0.0.1]:9001"))
+            .await;
+        cache
+            .observe_direct_reachability(lan_relay, addr("[::ffff:192.168.1.20]:9003"))
+            .await;
+
+        for (mapped, plain) in [
+            ("[::ffff:127.0.0.2]:9002", "127.0.0.2:9002"),
+            ("[::ffff:192.168.1.30]:9002", "192.168.1.30:9002"),
+            ("[::ffff:203.0.113.5]:9002", "203.0.113.5:9002"),
+        ] {
+            let ids = |peers: Vec<CachedPeer>| -> Vec<PeerId> {
+                peers.into_iter().map(|peer| peer.peer_id).collect()
+            };
+            let for_mapped = ids(cache
+                .select_relays_for_target(4, &addr(mapped), false)
+                .await);
+            let for_plain = ids(cache.select_relays_for_target(4, &addr(plain), false).await);
+            assert!(!for_plain.is_empty(), "{plain} must select a relay");
+            assert_eq!(
+                for_mapped, for_plain,
+                "{mapped} must select the same relays as {plain}"
+            );
+        }
+    }
+
+    /// #269 round 2: the bridge check compares address families, so a mapped
+    /// source or target must count as IPv4.
+    #[test]
+    fn can_bridge_treats_mapped_addresses_as_ipv4() {
+        let mut caps = PeerCapabilities::default();
+        caps.record_external_address(addr("198.51.100.20:9000"));
+        let v4 = addr("198.51.100.1:9000");
+        let mapped = addr("[::ffff:198.51.100.2]:9000");
+        assert!(
+            caps.can_bridge(&v4, &mapped) && caps.can_bridge(&mapped, &v4),
+            "an IPv4-only relay can bridge IPv4 to IPv4-mapped traffic"
+        );
+        assert!(
+            !caps.can_bridge(&v4, &addr("[2001:db8::2]:9000")),
+            "an IPv4-only relay still cannot bridge to native IPv6"
+        );
+    }
+
     /// #262 fix 4 counterpart: OUTBOUND-verified reachability still grants.
     #[tokio::test]
     async fn outbound_observation_still_grants_capability() {
