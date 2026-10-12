@@ -1030,6 +1030,153 @@ async fn pause_hole_punch_winner_for_test(
     }
 }
 
+/// #313 Part 2 test-only point gates. A test arms a named point for one
+/// endpoint (keyed by the endpoint's shutdown flag); the first thread that
+/// reaches the point parks there until the test releases it. Later arrivals
+/// pass. A point blocks the calling thread (bounded), so no point may sit
+/// inside a lock that the releasing side needs. Production code never arms
+/// a point.
+#[cfg(all(test, feature = "network-discovery"))]
+pub(crate) mod lifecycle_points {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Weak};
+    use std::time::Duration;
+
+    use parking_lot::RwLock;
+
+    /// Before `close_superseded_connection_if_current` takes the lifecycle
+    /// lock to claim a generation.
+    pub(crate) const CLAIM_BEFORE: &str = "claim-before";
+    /// After that claim released the lifecycle lock, before the transport
+    /// close.
+    pub(crate) const CLAIM_AFTER: &str = "claim-after";
+    /// In `poll_closed_connections`, after the scan collected the closed
+    /// winners and before it removes them.
+    pub(crate) const POLL_CLOSED_AFTER_SCAN: &str = "poll-closed-after-scan";
+
+    pub(crate) struct PointGate {
+        key: (usize, &'static str),
+        park_available: AtomicBool,
+        parked: AtomicUsize,
+        parked_notify: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release_notify: std::sync::Condvar,
+    }
+
+    impl PointGate {
+        pub(crate) fn release(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *released = true;
+            self.release_notify.notify_all();
+        }
+
+        pub(crate) async fn wait_until_parked(&self) {
+            loop {
+                let parked = self.parked_notify.notified();
+                if self.parked.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                parked.await;
+            }
+        }
+
+        fn park(&self) {
+            if !self.park_available.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            self.parked.fetch_add(1, Ordering::SeqCst);
+            self.parked_notify.notify_waiters();
+            let released = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self
+                .release_notify
+                .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    pub(crate) struct PointGateGuard {
+        gate: Arc<PointGate>,
+    }
+
+    impl std::ops::Deref for PointGateGuard {
+        type Target = PointGate;
+
+        fn deref(&self) -> &Self::Target {
+            &self.gate
+        }
+    }
+
+    impl Drop for PointGateGuard {
+        fn drop(&mut self) {
+            self.gate.release();
+            let mut armed = POINTS.write();
+            if armed
+                .get(&self.gate.key)
+                .and_then(Weak::upgrade)
+                .is_some_and(|gate| Arc::ptr_eq(&gate, &self.gate))
+            {
+                armed.remove(&self.gate.key);
+            }
+        }
+    }
+
+    type PointMap = HashMap<(usize, &'static str), Weak<PointGate>>;
+
+    static POINTS: LazyLock<RwLock<PointMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+    pub(crate) fn arm(endpoint_key: usize, point: &'static str) -> PointGateGuard {
+        let gate = Arc::new(PointGate {
+            key: (endpoint_key, point),
+            park_available: AtomicBool::new(true),
+            parked: AtomicUsize::new(0),
+            parked_notify: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release_notify: std::sync::Condvar::new(),
+        });
+        POINTS.write().insert(gate.key, Arc::downgrade(&gate));
+        PointGateGuard { gate }
+    }
+
+    /// Park the calling thread at `point` if a test armed it for this
+    /// endpoint and nobody has parked there yet.
+    pub(crate) fn reach(endpoint_key: usize, point: &'static str) {
+        let gate = POINTS
+            .read()
+            .get(&(endpoint_key, point))
+            .and_then(Weak::upgrade);
+        if let Some(gate) = gate {
+            gate.park();
+        }
+    }
+
+    /// Observed-address watches started by `add_connection_with_outcome`,
+    /// per connection `stable_id`.
+    static OBSERVED_ADDRESS_WATCHES: LazyLock<parking_lot::Mutex<HashMap<usize, usize>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    pub(crate) fn note_observed_address_watch(stable_id: usize) {
+        *OBSERVED_ADDRESS_WATCHES
+            .lock()
+            .entry(stable_id)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn observed_address_watches(stable_id: usize) -> usize {
+        OBSERVED_ADDRESS_WATCHES
+            .lock()
+            .get(&stable_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ReaderExitOutcome {
     Noop,
@@ -6659,6 +6806,8 @@ impl NatTraversalEndpoint {
     }
 
     fn spawn_observed_address_watch_task(&self, peer_id: PeerId, connection: InnerConnection) {
+        #[cfg(all(test, feature = "network-discovery"))]
+        lifecycle_points::note_observed_address_watch(connection.stable_id());
         Self::spawn_observed_address_watch_task_parts(
             self.observed_address_tx.clone(),
             peer_id,
@@ -8020,6 +8169,8 @@ impl NatTraversalEndpoint {
         peer_id: &PeerId,
         generation: u64,
     ) -> bool {
+        #[cfg(all(test, feature = "network-discovery"))]
+        lifecycle_points::reach(self.lifecycle_points_key(), lifecycle_points::CLAIM_BEFORE);
         let connection = {
             let mut lifecycle = self.connection_lifecycle.write();
             let Some(entries) = lifecycle.get_mut(peer_id) else {
@@ -8052,6 +8203,8 @@ impl NatTraversalEndpoint {
             };
             entry.connection.clone()
         };
+        #[cfg(all(test, feature = "network-discovery"))]
+        lifecycle_points::reach(self.lifecycle_points_key(), lifecycle_points::CLAIM_AFTER);
 
         if connection.close_reason().is_none()
             && let Some(code) = ConnectionCloseReason::Superseded.app_error_code()
@@ -9514,6 +9667,67 @@ impl NatTraversalEndpoint {
         lifecycle.insert(peer_id, vec![entry]);
     }
 
+    /// #313 Part 2 test seam: the key that names this endpoint's
+    /// [`lifecycle_points`].
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn lifecycle_points_key(&self) -> usize {
+        Arc::as_ptr(&self.shutdown) as usize
+    }
+
+    /// #313 Part 2 test seam: arm one of this endpoint's lifecycle points.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_lifecycle_point_for_test(
+        &self,
+        point: &'static str,
+    ) -> lifecycle_points::PointGateGuard {
+        lifecycle_points::arm(self.lifecycle_points_key(), point)
+    }
+
+    /// #313 Part 2 test seam: every lifecycle entry for `peer_id`, as
+    /// `(stable_id, generation, state)`.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn lifecycle_entries_for_test(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(usize, u64, ConnectionLifecycleState)> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| (entry.stable_id(), entry.generation, entry.state))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #313 Part 2 test seam: put `connection` in the winner map with no
+    /// lifecycle registration (the shape a raw insert leaves behind).
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn insert_untracked_winner_for_test(
+        &self,
+        peer_id: PeerId,
+        connection: InnerConnection,
+    ) {
+        let _lifecycle = self.connection_lifecycle.write();
+        self.connections.insert(peer_id, connection);
+    }
+
+    /// #313 Part 2 test seam: run the repromotion of a survivor directly.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn repromote_for_test(&self, peer_id: &PeerId) -> Option<InnerConnection> {
+        self.repromote_surviving_connection(peer_id, None)
+    }
+
+    /// #313 Part 2 test seam: run the closed-winner scan that `poll` runs.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn poll_closed_connections_for_test(&self) -> Vec<NatTraversalEvent> {
+        let mut events = Vec::new();
+        self.poll_closed_connections(&mut events);
+        events
+    }
+
     /// #310 test hook: park this endpoint's first hole-punch winner just
     /// before its winner-map insert.
     #[cfg(test)]
@@ -10672,6 +10886,13 @@ impl NatTraversalEndpoint {
                     .map(|reason| (*entry.key(), reason.clone()))
             })
             .collect();
+        #[cfg(all(test, feature = "network-discovery"))]
+        if !closed_connections.is_empty() {
+            lifecycle_points::reach(
+                self.lifecycle_points_key(),
+                lifecycle_points::POLL_CLOSED_AFTER_SCAN,
+            );
+        }
 
         for (peer_id, reason) in closed_connections {
             self.connections.remove(&peer_id);
@@ -15224,6 +15445,37 @@ mod tests {
         target_addr: SocketAddr,
         target_peer: PeerId,
     ) -> (NatTraversalEndpoint, NatTraversalEndpoint) {
+        let unrelated = start_accepted_coordination_dial_for_test(
+            endpoint,
+            held_addr,
+            target_addr,
+            target_peer,
+        )
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !endpoint
+            .active_sessions
+            .get(&target_peer)
+            .is_some_and(|session| session.session_state.connection.is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accepted dial must store its session handle before shutdown"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        unrelated
+    }
+
+    /// #313 Part 2: the first half of [`dial_accepted_coordination_for_test`]:
+    /// start the accepted-coordination dial and return at once, without
+    /// waiting for its session handle.
+    async fn start_accepted_coordination_dial_for_test(
+        endpoint: &NatTraversalEndpoint,
+        held_addr: SocketAddr,
+        target_addr: SocketAddr,
+        target_peer: PeerId,
+    ) -> (NatTraversalEndpoint, NatTraversalEndpoint) {
         let local_peer = endpoint.local_peer_id();
         let coordinator_peer = PeerId([0x36; 32]);
 
@@ -15287,18 +15539,6 @@ mod tests {
             .await
             .expect("coordination accepted is handled");
         assert!(handled, "coordination accepted must be consumed");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !endpoint
-            .active_sessions
-            .get(&target_peer)
-            .is_some_and(|session| session.session_state.connection.is_some())
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the accepted dial must store its session handle before shutdown"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         (unrelated_server, unrelated_client)
     }
 
@@ -16794,5 +17034,852 @@ mod tests {
             endpoint.pending_accepts.lock().is_empty(),
             "stale G1 ticket must be consumed by the skip, not left queued"
         );
+    }
+
+    /// #313 Part 2, slice R1: lifecycle custody for hole-punch and
+    /// coordinator winners, without retirement. Each test names the master
+    /// mechanism that makes it fail before the R1 fix.
+    #[cfg(feature = "network-discovery")]
+    mod r1_custody_313 {
+        use super::*;
+        use crate::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey};
+
+        struct Identity {
+            keypair: (MlDsaPublicKey, MlDsaSecretKey),
+            peer_id: PeerId,
+        }
+
+        fn identity() -> Identity {
+            let (public_key, secret_key) =
+                crate::crypto::raw_public_keys::pqc::generate_ml_dsa_keypair().expect("keypair");
+            let peer_id =
+                crate::crypto::raw_public_keys::pqc::derive_peer_id_from_public_key(&public_key);
+            Identity {
+                keypair: (public_key, secret_key),
+                peer_id,
+            }
+        }
+
+        async fn endpoint_with(identity: Option<&Identity>) -> NatTraversalEndpoint {
+            let mut config = loopback_shutdown_test_config();
+            config.identity_key = identity.map(|identity| identity.keypair.clone());
+            NatTraversalEndpoint::new(config, None, None)
+                .await
+                .expect("endpoint binds")
+        }
+
+        fn state_of(
+            endpoint: &NatTraversalEndpoint,
+            peer: &PeerId,
+            stable_id: usize,
+        ) -> Option<ConnectionLifecycleState> {
+            endpoint
+                .connection_snapshot_by_stable_id(peer, stable_id)
+                .map(|snapshot| snapshot.state)
+        }
+
+        fn winner_id(endpoint: &NatTraversalEndpoint, peer: &PeerId) -> Option<usize> {
+            endpoint
+                .connections
+                .get(peer)
+                .map(|entry| entry.value().stable_id())
+        }
+
+        fn is_live(state: Option<ConnectionLifecycleState>) -> bool {
+            matches!(state, Some(ConnectionLifecycleState::Live))
+        }
+
+        fn is_superseded(state: Option<ConnectionLifecycleState>) -> bool {
+            matches!(state, Some(ConnectionLifecycleState::Superseded { .. }))
+        }
+
+        /// A raw QUIC dial from `endpoint` to `target`: no registration.
+        async fn raw_dial(
+            endpoint: &NatTraversalEndpoint,
+            target: &NatTraversalEndpoint,
+        ) -> InnerConnection {
+            let addr = target
+                .shutdown_socket_address_for_test()
+                .expect("target address");
+            let connecting = endpoint
+                .get_endpoint()
+                .expect("quic endpoint")
+                .connect(addr, "peer")
+                .expect("start raw dial");
+            tokio::time::timeout(Duration::from_secs(10), connecting)
+                .await
+                .expect("raw dial timed out")
+                .expect("raw dial handshake")
+        }
+
+        /// The connection `target` registered for the dialler.
+        async fn remote_view(target: &NatTraversalEndpoint) -> InnerConnection {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(connection) = target
+                    .connections
+                    .iter()
+                    .next()
+                    .map(|entry| entry.value().clone())
+                {
+                    return connection;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the target registers its side of the connection"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn shutdown_all(endpoints: &[&NatTraversalEndpoint]) {
+            for endpoint in endpoints {
+                let _ = endpoint.shutdown().await;
+            }
+        }
+
+        /// RED on master: the hole-punch winner is a raw winner-map insert
+        /// (nta `insert_hole_punch_winner_parts`) with no lifecycle entry, so
+        /// it has no generation, and the lifecycle's current generation does
+        /// not describe the winner.
+        #[tokio::test]
+        async fn r1_hole_punch_winner_is_lifecycle_tracked() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&target))
+                .expect("hole-punch dial starts");
+            let h = wait_for_winner(&endpoint, peer, "the hole-punch winner", |_| true).await;
+            let snapshot = endpoint.connection_snapshot_by_stable_id(&peer, h.stable_id());
+            assert!(
+                is_live(snapshot.map(|snapshot| snapshot.state)),
+                "R1: the hole-punch winner must be lifecycle-tracked and Live: {snapshot:?}"
+            );
+            assert_eq!(
+                endpoint.current_connection_generation(&peer),
+                snapshot.map(|snapshot| snapshot.generation),
+                "R1: the current generation must be the winner's"
+            );
+
+            drop(h);
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (Codex Q4 note): the accepted-coordination insert
+        /// replaces a tracked Live winner T in the winner map with an
+        /// untracked C. T stays Live in the lifecycle, so the map and the
+        /// lifecycle disagree about the current connection.
+        #[tokio::test]
+        async fn r1_coordinator_winner_supersedes_a_tracked_live_winner() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+            let held_addr = endpoint
+                .shutdown_socket_address_for_test()
+                .expect("endpoint address");
+            let target_addr = target
+                .shutdown_socket_address_for_test()
+                .expect("target address");
+
+            let tracked = raw_dial(&endpoint, &target).await;
+            let tracked_id = tracked.stable_id();
+            endpoint
+                .add_connection(peer, tracked.clone())
+                .expect("register T");
+            assert!(is_live(state_of(&endpoint, &peer, tracked_id)));
+
+            let _unrelated =
+                dial_accepted_coordination_for_test(&endpoint, held_addr, target_addr, peer).await;
+            let c = wait_for_winner(&endpoint, peer, "the coordinator winner", |winner| {
+                winner.stable_id() != tracked_id
+            })
+            .await;
+            let c_snapshot = endpoint.connection_snapshot_by_stable_id(&peer, c.stable_id());
+            assert!(
+                is_live(c_snapshot.map(|snapshot| snapshot.state)),
+                "R1: the coordinator winner C must be lifecycle-tracked and Live: {c_snapshot:?}"
+            );
+            assert_eq!(
+                endpoint.current_connection_generation(&peer),
+                c_snapshot.map(|snapshot| snapshot.generation),
+                "R1: the lifecycle's current generation must be the winner map's (C)"
+            );
+            assert!(
+                is_superseded(state_of(&endpoint, &peer, tracked_id)),
+                "R1: the displaced T must be Superseded, not Live beside C"
+            );
+            assert!(
+                tracked.close_reason().is_none(),
+                "the coordinator insert closes nothing"
+            );
+
+            drop((c, tracked));
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (rewrite of #310's concurrent-winner test against
+        /// the registrar). Two hole-punch winners for one peer (two targets
+        /// with one identity): the first parks before its insert, the second
+        /// takes the slot. Master's first-wins policy is kept: the first is
+        /// closed as a duplicate and the second stays the winner. R1 adds
+        /// custody: the second winner is lifecycle-tracked and Live.
+        #[tokio::test]
+        async fn r1_second_hole_punch_winner_keeps_first_wins_and_is_tracked() {
+            let shared = identity();
+            let first_target = endpoint_with(Some(&shared)).await;
+            let second_target = endpoint_with(Some(&shared)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = shared.peer_id;
+            let gate = endpoint.arm_winner_insert_gate_for_test();
+
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&first_target))
+                .expect("first candidate dial starts");
+            let (first_id, first) =
+                tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                    .await
+                    .expect("the first winner completes its handshake and parks");
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&second_target))
+                .expect("second candidate dial starts");
+            let second = wait_for_winner(&endpoint, peer, "the second winner", |winner| {
+                winner.stable_id() != first_id
+            })
+            .await;
+            let second_id = second.stable_id();
+            assert!(
+                is_live(state_of(&endpoint, &peer, second_id)),
+                "R1: the hole-punch winner that took the slot must be tracked and Live"
+            );
+            let second_weak = second.weak_handle();
+            drop(second);
+
+            gate.release();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if winner_id(&endpoint, &peer) == Some(second_id)
+                    && second_weak.is_alive()
+                    && !first.is_alive()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first-wins: the second winner keeps the slot and the first is closed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                is_live(state_of(&endpoint, &peer, second_id)),
+                "R1: the kept winner stays Live"
+            );
+            assert!(
+                !is_live(state_of(&endpoint, &peer, first_id)),
+                "the duplicate is not Live"
+            );
+
+            drop(gate);
+            shutdown_all(&[&endpoint, &first_target, &second_target]).await;
+        }
+
+        /// RED on master (rewrite of #310 round 2 against R1). The
+        /// coordinator insert displaces a hole-punch winner H that the
+        /// application still uses. R1 keeps master's policy (the
+        /// coordinator connection always takes the slot, nothing is closed)
+        /// and adds custody: H is tracked as Superseded, not orphaned, and it
+        /// stays open and usable.
+        #[tokio::test]
+        async fn r1_coordinator_displaced_hole_punch_winner_stays_open_and_tracked() {
+            let shared = identity();
+            let hole_punch_target = endpoint_with(Some(&shared)).await;
+            let coordination_target = endpoint_with(Some(&shared)).await;
+            let coordination_target_addr = coordination_target
+                .shutdown_socket_address_for_test()
+                .expect("coordination target address");
+            let endpoint = endpoint_with(None).await;
+            let held_addr = endpoint
+                .shutdown_socket_address_for_test()
+                .expect("endpoint address");
+            let peer = shared.peer_id;
+
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&hole_punch_target))
+                .expect("hole-punch dial starts");
+            let held = wait_for_winner(&endpoint, peer, "the hole-punch winner", |_| true).await;
+            let held_id = held.stable_id();
+            let remote_side = remote_view(&hole_punch_target).await;
+            let mut in_flight = held.open_uni().await.expect("open a stream on H");
+            in_flight
+                .write_all(b"started before the replacement, ")
+                .await
+                .expect("write the first half");
+
+            let _unrelated = dial_accepted_coordination_for_test(
+                &endpoint,
+                held_addr,
+                coordination_target_addr,
+                peer,
+            )
+            .await;
+            let coordinator_winner =
+                wait_for_winner(&endpoint, peer, "the coordinator winner", |winner| {
+                    winner.stable_id() != held_id
+                })
+                .await;
+            assert!(
+                is_live(state_of(&endpoint, &peer, coordinator_winner.stable_id())),
+                "R1: the coordinator winner is tracked and Live"
+            );
+            assert!(
+                is_superseded(state_of(&endpoint, &peer, held_id)),
+                "R1: the displaced hole-punch winner is tracked as Superseded"
+            );
+            drop(coordinator_winner);
+            assert!(held.close_reason().is_none(), "H stays open");
+
+            in_flight
+                .write_all(b"finished after it")
+                .await
+                .expect("the in-flight stream keeps writing after the replacement");
+            in_flight.finish().expect("finish the in-flight stream");
+            let mut later = held.open_uni().await.expect("open a new stream on H");
+            later
+                .write_all(b"opened after the replacement")
+                .await
+                .expect("write the new stream");
+            later.finish().expect("finish the new stream");
+            for expected in [
+                b"started before the replacement, finished after it".as_slice(),
+                b"opened after the replacement".as_slice(),
+            ] {
+                let mut received =
+                    tokio::time::timeout(Duration::from_secs(10), remote_side.accept_uni())
+                        .await
+                        .expect("the stream reaches the remote side in time")
+                        .expect("the remote side accepts the stream");
+                let bytes =
+                    tokio::time::timeout(Duration::from_secs(10), received.read_to_end(1024))
+                        .await
+                        .expect("the stream completes in time")
+                        .expect("the remote side reads the whole stream");
+                assert_eq!(
+                    bytes, expected,
+                    "H delivers its streams after the replacement"
+                );
+            }
+            assert!(held.close_reason().is_none(), "H is still open");
+
+            drop((in_flight, later, held, remote_side));
+            shutdown_all(&[&endpoint, &hole_punch_target, &coordination_target]).await;
+        }
+
+        /// RED on master (Q4): `add_connection` of a handle that is already
+        /// tracked as Superseded registers it again as a new Live generation,
+        /// which supersedes the real winner C and resurrects H.
+        #[tokio::test]
+        async fn r1_re_adding_a_superseded_handle_is_refused_without_closing() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+
+            let h = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, h.clone())
+                .expect("register H");
+            let c = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, c.clone())
+                .expect("register C");
+            let c_generation = endpoint
+                .current_connection_generation(&peer)
+                .expect("C Live");
+            assert!(is_superseded(state_of(&endpoint, &peer, h.stable_id())));
+
+            let outcome = endpoint
+                .add_connection_with_outcome(peer, h.clone())
+                .expect("re-add H");
+            assert!(
+                matches!(
+                    outcome,
+                    ConnectionRegistrationOutcome::Rejected { winner_generation }
+                        if winner_generation == c_generation
+                ),
+                "R1: re-adding the Superseded H must be refused in favour of C: {outcome:?}"
+            );
+            assert_eq!(
+                winner_id(&endpoint, &peer),
+                Some(c.stable_id()),
+                "C keeps the slot"
+            );
+            assert!(
+                is_live(state_of(&endpoint, &peer, c.stable_id())),
+                "C stays Live"
+            );
+            assert!(
+                is_superseded(state_of(&endpoint, &peer, h.stable_id())),
+                "H stays Superseded"
+            );
+            assert_eq!(
+                endpoint
+                    .lifecycle_entries_for_test(&peer)
+                    .iter()
+                    .filter(|(stable_id, _, _)| *stable_id == h.stable_id())
+                    .count(),
+                1,
+                "no second entry for H"
+            );
+            assert!(
+                h.close_reason().is_none() && c.close_reason().is_none(),
+                "the refused re-registration closes nothing"
+            );
+
+            drop((h, c));
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (Q4 and #313 item 3). A drain claim of the Superseded
+        /// H races `add_connection(H)`, at the two points of the claim: before
+        /// it takes the lifecycle lock, and after it released the lock but
+        /// before the transport close. On master the re-add makes H a new
+        /// Live winner, and the claim then closes that tracked winner while C
+        /// is left Superseded. With R1 the re-add is refused: C stays the
+        /// Live winner, open, and only H closes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn r1_re_adding_a_handle_during_its_drain_claim_cannot_resurrect_it() {
+            for point in [
+                lifecycle_points::CLAIM_BEFORE,
+                lifecycle_points::CLAIM_AFTER,
+            ] {
+                let target_identity = identity();
+                let target = endpoint_with(Some(&target_identity)).await;
+                let endpoint = Arc::new(endpoint_with(None).await);
+                let peer = target_identity.peer_id;
+
+                let h = raw_dial(&endpoint, &target).await;
+                endpoint
+                    .add_connection(peer, h.clone())
+                    .expect("register H");
+                let h_generation = endpoint.current_connection_generation(&peer).expect("H");
+                let c = raw_dial(&endpoint, &target).await;
+                endpoint
+                    .add_connection(peer, c.clone())
+                    .expect("register C");
+                assert!(is_superseded(state_of(&endpoint, &peer, h.stable_id())));
+
+                let gate = endpoint.arm_lifecycle_point_for_test(point);
+                let claimer = {
+                    let endpoint = Arc::clone(&endpoint);
+                    tokio::task::spawn_blocking(move || {
+                        endpoint.close_superseded_connection_if_current(&peer, h_generation)
+                    })
+                };
+                tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                    .await
+                    .expect("the claim parks at its point");
+                let _ = endpoint
+                    .add_connection_with_outcome(peer, h.clone())
+                    .expect("concurrent re-add of H");
+                gate.release();
+                let claimed = tokio::time::timeout(Duration::from_secs(10), claimer)
+                    .await
+                    .expect("the claim finishes")
+                    .expect("the claim joins");
+                assert!(claimed, "{point}: the claim of H's generation succeeds");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while h.close_reason().is_none() {
+                    assert!(std::time::Instant::now() < deadline, "{point}: H closes");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                assert_eq!(
+                    winner_id(&endpoint, &peer),
+                    Some(c.stable_id()),
+                    "{point}: C must keep the winner slot; a re-added H must not take it"
+                );
+                assert!(
+                    is_live(state_of(&endpoint, &peer, c.stable_id())),
+                    "{point}: C must stay Live"
+                );
+                assert!(c.close_reason().is_none(), "{point}: C must stay open");
+                assert!(
+                    !endpoint
+                        .lifecycle_entries_for_test(&peer)
+                        .iter()
+                        .any(|(stable_id, _, state)| *stable_id == h.stable_id()
+                            && matches!(state, ConnectionLifecycleState::Live)),
+                    "{point}: no Live entry for the claimed H"
+                );
+
+                drop(gate);
+                drop((h, c));
+                shutdown_all(&[&endpoint, &target]).await;
+            }
+        }
+
+        /// RED on master (Q4): `add_connection` of the current Live handle
+        /// allocates a new generation for the same connection and marks its
+        /// own previous entry Superseded, with a second observed-address
+        /// watch. R1 returns the existing generation and starts no watch.
+        #[tokio::test]
+        async fn r1_re_adding_the_live_handle_is_idempotent() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+
+            let c = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, c.clone())
+                .expect("register C");
+            let generation = endpoint
+                .current_connection_generation(&peer)
+                .expect("C Live");
+            let watches = lifecycle_points::observed_address_watches(c.stable_id());
+
+            let outcome = endpoint
+                .add_connection_with_outcome(peer, c.clone())
+                .expect("re-add C");
+            assert!(
+                matches!(
+                    outcome,
+                    ConnectionRegistrationOutcome::Live {
+                        generation: returned,
+                        superseded_generation: None,
+                    } if returned == generation
+                ),
+                "R1: re-adding the Live winner returns its existing generation: {outcome:?}"
+            );
+            assert_eq!(
+                endpoint.lifecycle_entries_for_test(&peer).len(),
+                1,
+                "R1: no second entry for the same connection"
+            );
+            assert_eq!(
+                lifecycle_points::observed_address_watches(c.stable_id()),
+                watches,
+                "R1: no second observed-address watch for the same connection"
+            );
+            assert!(c.close_reason().is_none());
+
+            drop(c);
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (#313 item 3, the raw paths): H is a raw hole-punch
+        /// winner, the coordinator's raw C replaces it, then `add_connection(H)`
+        /// re-registers H. C is then open, untracked and outside the winner
+        /// map: an orphan.
+        #[tokio::test]
+        async fn r1_coordinator_replacement_then_re_add_of_the_displaced_winner_orphans_nothing() {
+            let shared = identity();
+            let hole_punch_target = endpoint_with(Some(&shared)).await;
+            let coordination_target = endpoint_with(Some(&shared)).await;
+            let coordination_target_addr = coordination_target
+                .shutdown_socket_address_for_test()
+                .expect("coordination target address");
+            let endpoint = endpoint_with(None).await;
+            let held_addr = endpoint
+                .shutdown_socket_address_for_test()
+                .expect("endpoint address");
+            let peer = shared.peer_id;
+
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&hole_punch_target))
+                .expect("hole-punch dial starts");
+            let h = wait_for_winner(&endpoint, peer, "the hole-punch winner", |_| true).await;
+            let _unrelated = dial_accepted_coordination_for_test(
+                &endpoint,
+                held_addr,
+                coordination_target_addr,
+                peer,
+            )
+            .await;
+            let c = wait_for_winner(&endpoint, peer, "the coordinator winner", |winner| {
+                winner.stable_id() != h.stable_id()
+            })
+            .await;
+
+            let _ = endpoint
+                .add_connection_with_outcome(peer, h.clone())
+                .expect("re-add H");
+
+            for (name, connection) in [("H", &h), ("C", &c)] {
+                assert!(connection.close_reason().is_none(), "{name} stays open");
+                let in_map = winner_id(&endpoint, &peer) == Some(connection.stable_id());
+                let tracked = state_of(&endpoint, &peer, connection.stable_id()).is_some();
+                assert!(
+                    in_map || tracked,
+                    "{name} is open but neither the winner nor lifecycle-tracked: an orphan"
+                );
+            }
+            assert_eq!(
+                winner_id(&endpoint, &peer),
+                Some(c.stable_id()),
+                "R1: C keeps the slot; the re-add of the Superseded H is refused"
+            );
+
+            drop((h, c));
+            shutdown_all(&[&endpoint, &hole_punch_target, &coordination_target]).await;
+        }
+
+        /// RED on master (#313 item 5): a registration that displaces an
+        /// untracked winner-map value drops it from the map without closing
+        /// or tracking it, so it is orphaned.
+        #[tokio::test]
+        async fn r1_registration_adopts_a_displaced_untracked_winner() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+
+            let untracked = raw_dial(&endpoint, &target).await;
+            endpoint.insert_untracked_winner_for_test(peer, untracked.clone());
+            let newcomer = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, newcomer.clone())
+                .expect("register the newcomer");
+
+            assert_eq!(winner_id(&endpoint, &peer), Some(newcomer.stable_id()));
+            assert!(
+                is_superseded(state_of(&endpoint, &peer, untracked.stable_id())),
+                "R1: the displaced untracked value must be adopted as Superseded"
+            );
+            assert!(
+                untracked.close_reason().is_none(),
+                "adoption closes nothing"
+            );
+
+            drop((untracked, newcomer));
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (#313 item 5): the repromotion insert drops an
+        /// untracked value that landed in the winner map after the caller
+        /// read the slot.
+        #[tokio::test]
+        async fn r1_repromotion_adopts_a_displaced_untracked_winner() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = target_identity.peer_id;
+
+            let survivor = raw_dial(&endpoint, &target).await;
+            let mut entry = tracked_connection_for_test(survivor.clone(), 7, now_unix_ms());
+            entry.state = ConnectionLifecycleState::Superseded {
+                replaced_by_generation: 8,
+            };
+            endpoint.seed_lifecycle_entry_for_test(peer, entry);
+            let untracked = raw_dial(&endpoint, &target).await;
+            endpoint.insert_untracked_winner_for_test(peer, untracked.clone());
+
+            let promoted = endpoint
+                .repromote_for_test(&peer)
+                .expect("the survivor is promoted");
+            assert_eq!(promoted.stable_id(), survivor.stable_id());
+            assert!(
+                is_superseded(state_of(&endpoint, &peer, untracked.stable_id())),
+                "R1: the value the promotion displaced must be adopted as Superseded"
+            );
+            assert!(
+                untracked.close_reason().is_none(),
+                "adoption closes nothing"
+            );
+
+            drop((survivor, untracked, promoted));
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// RED on master (review §3): `poll_closed_connections` collects the
+        /// closed winners, then removes them by peer key. A winner
+        /// registered between the scan and the removal is evicted, and a
+        /// stale `ConnectionLost` is reported for a peer that is connected.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn r1_closed_winner_scan_keeps_a_winner_registered_after_the_scan() {
+            let target_identity = identity();
+            let target = endpoint_with(Some(&target_identity)).await;
+            let endpoint = Arc::new(endpoint_with(None).await);
+            let peer = target_identity.peer_id;
+
+            let old = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, old.clone())
+                .expect("register old");
+            old.close(VarInt::from_u32(0), b"313 test: old winner closes");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while old.close_reason().is_none() {
+                assert!(std::time::Instant::now() < deadline, "old closes");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let gate =
+                endpoint.arm_lifecycle_point_for_test(lifecycle_points::POLL_CLOSED_AFTER_SCAN);
+            let scanner = {
+                let endpoint = Arc::clone(&endpoint);
+                tokio::task::spawn_blocking(move || endpoint.poll_closed_connections_for_test())
+            };
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                .await
+                .expect("the scan parks after collecting the closed winner");
+            let newcomer = raw_dial(&endpoint, &target).await;
+            endpoint
+                .add_connection(peer, newcomer.clone())
+                .expect("register the newcomer");
+            gate.release();
+            let events = tokio::time::timeout(Duration::from_secs(10), scanner)
+                .await
+                .expect("the scan finishes")
+                .expect("the scan joins");
+
+            assert_eq!(
+                winner_id(&endpoint, &peer),
+                Some(newcomer.stable_id()),
+                "R1: the removal must be bounded to the closed winner the scan saw"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    NatTraversalEvent::ConnectionLost { peer_id, .. } if *peer_id == peer
+                )),
+                "R1: no ConnectionLost for a peer whose closed winner was already replaced: \
+                 {events:?}"
+            );
+
+            drop(gate);
+            drop((old, newcomer));
+            shutdown_all(&[&endpoint, &target]).await;
+        }
+
+        /// Wait out a loopback handshake and the dialler's decision on it,
+        /// asserting throughout that nothing is published under `peer`.
+        async fn assert_never_published(endpoint: &NatTraversalEndpoint, peer: PeerId, what: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert_eq!(
+                    winner_id(endpoint, &peer),
+                    None,
+                    "R1: {what} whose authenticated identity is not the expected peer must not \
+                     be published under the expected key"
+                );
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                endpoint.lifecycle_entries_for_test(&peer).is_empty(),
+                "R1: nothing is registered under the expected key"
+            );
+        }
+
+        /// RED on master (Q6): a hole-punch candidate that authenticates as
+        /// another identity Z is inserted under the expected peer's key, so
+        /// Z's connection serves the expected peer. A control dial to the same
+        /// address under Z's own key shows the path works.
+        #[tokio::test]
+        async fn r1_hole_punch_candidate_with_the_wrong_identity_is_closed_unpublished() {
+            let expected = identity();
+            let wrong = identity();
+            let wrong_target = endpoint_with(Some(&wrong)).await;
+            let endpoint = endpoint_with(None).await;
+
+            endpoint
+                .attempt_connection_to_candidate(
+                    wrong.peer_id,
+                    &winner_test_candidate(&wrong_target),
+                )
+                .expect("control dial starts");
+            let control =
+                wait_for_winner(&endpoint, wrong.peer_id, "the control winner", |_| true).await;
+            let open_before = endpoint
+                .get_endpoint()
+                .expect("quic endpoint")
+                .open_connections();
+
+            endpoint
+                .attempt_connection_to_candidate(
+                    expected.peer_id,
+                    &winner_test_candidate(&wrong_target),
+                )
+                .expect("hole-punch dial starts");
+            assert_never_published(&endpoint, expected.peer_id, "a hole-punch candidate").await;
+            assert_eq!(
+                endpoint
+                    .get_endpoint()
+                    .expect("quic endpoint")
+                    .open_connections(),
+                open_before,
+                "R1: the mismatched candidate is closed; only the control stays open"
+            );
+            assert!(control.close_reason().is_none(), "the control stays open");
+
+            drop(control);
+            shutdown_all(&[&endpoint, &wrong_target]).await;
+        }
+
+        /// RED on master (Q6): the accepted-coordination dial stores the
+        /// connection under the session's target key without checking its
+        /// authenticated identity, and reports the session connected. A
+        /// control dial to the same address under its own identity shows the
+        /// path works.
+        #[tokio::test]
+        async fn r1_coordinator_dial_to_the_wrong_identity_is_closed_unpublished() {
+            let expected = identity();
+            let wrong = identity();
+            let wrong_target = endpoint_with(Some(&wrong)).await;
+            let wrong_addr = wrong_target
+                .shutdown_socket_address_for_test()
+                .expect("wrong target address");
+            let endpoint = endpoint_with(None).await;
+            let held_addr = endpoint
+                .shutdown_socket_address_for_test()
+                .expect("endpoint address");
+
+            let _control_unrelated = dial_accepted_coordination_for_test(
+                &endpoint,
+                held_addr,
+                wrong_addr,
+                wrong.peer_id,
+            )
+            .await;
+            let control =
+                wait_for_winner(&endpoint, wrong.peer_id, "the control winner", |_| true).await;
+            let open_before = endpoint
+                .get_endpoint()
+                .expect("quic endpoint")
+                .open_connections();
+
+            let _unrelated = start_accepted_coordination_dial_for_test(
+                &endpoint,
+                held_addr,
+                wrong_addr,
+                expected.peer_id,
+            )
+            .await;
+            assert_never_published(&endpoint, expected.peer_id, "a coordinator dial").await;
+            assert!(
+                !endpoint
+                    .active_sessions
+                    .get(&expected.peer_id)
+                    .is_some_and(|session| session.session_state.connection.is_some()),
+                "R1: the session does not record the wrong-identity connection"
+            );
+            assert_eq!(
+                endpoint
+                    .get_endpoint()
+                    .expect("quic endpoint")
+                    .open_connections(),
+                open_before,
+                "R1: the mismatched dial is closed; only the control stays open"
+            );
+            assert!(control.close_reason().is_none(), "the control stays open");
+
+            drop(control);
+            shutdown_all(&[&endpoint, &wrong_target]).await;
+        }
     }
 }
