@@ -390,8 +390,16 @@ fn release_losers<C: Send + 'static>(
 ///   loser that has not ended yet go to a detached cleanup task. That task
 ///   drops them and ends when the last loser ends. So neither a blocking poll
 ///   nor a blocking destructor of a loser can hold the winner for more than
-///   the bound. The coordinator itself drops only error strings and
-///   cancellation results, which have trivial destructors.
+///   the bound. Of the attempt outcomes, the coordinator itself drops only
+///   error strings and cancellation results, which have trivial destructors.
+/// - The race owns `connect_fn` (it takes `F` by value). It drops the
+///   callback, with everything that the callback captures, when
+///   `race_connect` returns or when its future is dropped. That drop runs on
+///   the caller's task, on the return path. `F` has no `Send + 'static`
+///   bound, so the race cannot move this drop to another task. A caller must
+///   therefore not let `connect_fn` capture anything whose drop blocks, or
+///   must keep the last reference to such a value elsewhere (for example,
+///   capture an `Arc` clone and keep another clone outside the race).
 /// - When the caller drops the returned future (for example an outer
 ///   timeout), the set is dropped and every attempt is aborted. Results that
 ///   are already complete are dropped in that drop, on the caller's thread.
@@ -407,8 +415,8 @@ fn release_losers<C: Send + 'static>(
 /// aborted attempts on the same thread, so blocking code there blocks the
 /// whole runtime. An error value of `connect_fn` is formatted and dropped in
 /// its own attempt task. `connect_fn` must therefore not hold resources that
-/// the winner needs across blocking code, and its values should drop without
-/// blocking.
+/// the winner needs across blocking code, and its values and its captures
+/// should drop without blocking.
 pub async fn race_connect<F, Fut, C, E>(
     addresses: &[SocketAddr],
     config: &HappyEyeballsConfig,
