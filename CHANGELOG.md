@@ -109,6 +109,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget. The direct pre-pass itself already gave each handshake the full
   establishment budget and is unchanged. Explicit strategies stay
   authoritative, and every stage stays bounded.
+- **Happy Eyeballs `race_connect` stops the losing attempts before it returns
+  the winner (#294).** Before, the race only scheduled an abort for the losing
+  attempts, so a losing dial was still alive when the caller got the winner.
+  An attempt that panicked never sent a result, so the race waited until an
+  outer timeout cancelled it. Now one `JoinSet` owns every attempt. When an
+  attempt wins, the race aborts the losers and waits at most 50 ms for them to
+  end. A loser that has not ended by then, the value of a loser that also
+  connected, and every panic payload go to a detached cleanup task, so neither
+  a blocking poll nor a blocking destructor of a loser holds a ready winner
+  for longer than that bound. A panic in an attempt is a failed attempt for
+  its address. Caller drop and an outer timeout still abort every attempt.
+  The public API, winner selection, the attempt stagger and
+  `AllAttemptsFailed` do not change. The `race_connect` docs state what the
+  race drops, and where.
+- **The bootstrap cache never selects the local node, and it keeps
+  IPv4-mapped IPv6 addresses as IPv4 (#269).** `reachability::socket_addr_scope`
+  classified `[::ffff:192.168.1.50]` as a Global address. So a LAN node that
+  recorded its own mapped LAN address got relay and coordinator capability,
+  and could select itself as a relay. Now `socket_addr_scope` classifies an
+  IPv4-mapped address by its IPv4 address. The cache stores every address in
+  canonical form (`[::ffff:a.b.c.d]:p` becomes `a.b.c.d:p`) at load, insert
+  and capability update, and removes the duplicates that this exposes. Relay
+  selection and `can_bridge` normalise the target before the family and scope
+  checks. The new `BootstrapCache::open_for_local_peer(config, local_peer_id)`
+  drops the local PeerId at load, ignores it at insert and filters it from
+  every selection; `P2pEndpoint` opens its cache with it, and
+  `BootstrapCache::open` keeps its old behaviour. The stored file format does
+  not change: old files load, with their addresses normalised.
 
 ### Tests
 
@@ -128,6 +156,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tiebreaker chose the same winner on both ends in every diagnosed run. The
   test now waits (up to 10 s) until both ends keep the same QUIC connection,
   then checks that they hold opposite sides of it.
+- **Bootstrap-cache self-exclusion wiring test (#269).**
+  `tests/quick/bootstrap_cache_self_exclusion.rs` restarts a real `Node` on a
+  persistent cache that holds the node's own entry, and checks that the node
+  does not load, store or select that entry, and that a v4-mapped cached
+  address loads as IPv4.
 
 ## [0.27.57] - 2026-10-09
 
