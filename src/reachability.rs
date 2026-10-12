@@ -87,8 +87,11 @@ impl std::fmt::Display for TraversalMethod {
 ///
 /// Returns `None` for unspecified or multicast addresses, which are not useful
 /// as direct reachability evidence.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) has the scope of its IPv4
+/// address: a dual-stack socket reports IPv4 peers in that form (#269).
 pub fn socket_addr_scope(addr: SocketAddr) -> Option<ReachabilityScope> {
-    match addr.ip() {
+    match crate::shared::normalize_socket_addr(addr).ip() {
         IpAddr::V4(ipv4) => {
             if ipv4.is_unspecified() || ipv4.is_multicast() {
                 None
