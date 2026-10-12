@@ -1037,6 +1037,9 @@ pub(crate) mod retirement_test_hooks {
         DrainBeforeStop,
         /// A drain has stopped waiting and is about to complete or abort.
         DrainBeforeDecide,
+        /// #313 round 3: a reader restart was refused because the connection
+        /// still has an owner, and the restart is about to check that owner.
+        RecoveryAfterAlreadyOwned,
     }
 
     /// A one-shot gate at one [`Point`] of one endpoint.
@@ -9163,8 +9166,26 @@ impl P2pEndpoint {
         Arc::as_ptr(&self.reader_handles) as usize
     }
 
-    /// #313 test seam: true when a reader task for this connection is
-    /// registered and still running.
+    /// #313 round 3 test seam: a running reader owns `stable_id`, and its
+    /// cancel has not fired (it still accepts streams).
+    #[cfg(all(test, feature = "network-discovery"))]
+    async fn live_uncancelled_reader_for_test(&self, peer_id: &PeerId, stable_id: usize) -> bool {
+        self.reader_handles
+            .read()
+            .await
+            .get(peer_id)
+            .is_some_and(|handles| {
+                handles.iter().any(|handle| {
+                    handle.is_running()
+                        && handle.conn_stable_id == stable_id
+                        && !handle.abort_handle.is_finished()
+                        && !handle.cancel.is_cancelled()
+                })
+            })
+    }
+
+    /// #313 test seam: a running reader owns `stable_id` (it may have been
+    /// cancelled and not have reached its next accept boundary yet).
     #[cfg(all(test, feature = "network-discovery"))]
     async fn live_reader_for_test(&self, peer_id: &PeerId, stable_id: usize) -> bool {
         self.reader_handles
@@ -9988,6 +10009,12 @@ impl P2pEndpoint {
             {
                 ReaderStart::Started | ReaderStart::NotStarted => break,
                 ReaderStart::AlreadyOwned => {
+                    #[cfg(all(test, feature = "network-discovery"))]
+                    retirement_test_hooks::point(
+                        self.reader_hooks_key(),
+                        retirement_test_hooks::Point::RecoveryAfterAlreadyOwned,
+                    )
+                    .await;
                     if !self.reader_owner_stopping(&peer_id, stable_id).await {
                         break;
                     }
@@ -23150,6 +23177,349 @@ mod tests {
                 a.shutdown().await;
                 b.shutdown().await;
                 b2.shutdown().await;
+            }
+
+            // #313 round 3 (Codex re-review of 9e0dbfdf). Each test below is
+            // RED on 9e0dbfdf for the reason in its comment.
+
+            /// Like `finalize_supersede_fixture`, but C1 is the hole-punch
+            /// winner H, of origin Raw at the arbiter A. Returns
+            /// `(a, b, b2, a_h, b_h, a_c2)`.
+            async fn raw_supersede_fixture() -> (
+                Arc<P2pEndpoint>,
+                Arc<P2pEndpoint>,
+                Arc<P2pEndpoint>,
+                QuicConnection,
+                QuicConnection,
+                QuicConnection,
+            ) {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                for node in [&a, &b, &b2] {
+                    std::mem::forget(shim_accept(node));
+                }
+                let b_addr = shim_addr(&b);
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                    .await
+                    .expect("A's waiter finalises H");
+                let a_h = wait_for_winner(&a, &b_peer, "A's H", |_| true).await;
+                assert_eq!(
+                    a.inner
+                        .connection_snapshot_by_stable_id(&b_peer, a_h.stable_id())
+                        .map(|snapshot| snapshot.origin),
+                    Some(crate::nat_traversal_api::ConnectionOrigin::Raw),
+                    "fixture: H is a Raw winner"
+                );
+                wait_for_reader(&a, &b_peer, a_h.stable_id(), "A's reader on H").await;
+                let b_h = wait_for_winner(&b, &a_peer, "B's H", |_| true).await;
+                wait_for_reader(&b, &a_peer, b_h.stable_id(), "B's reader on H").await;
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b2)))
+                    .await
+                    .expect("C2 connect timeout")
+                    .expect("C2 connect");
+                let a_c2 = wait_for_winner(&a, &b_peer, "C2 supersedes H at A", |connection| {
+                    connection.stable_id() != a_h.stable_id()
+                })
+                .await;
+                (a, b, b2, a_h, b_h, a_c2)
+            }
+
+            /// B opens an ACK-v2 request stream on `connection` and sends part
+            /// of it, without its FIN: the reader that accepts it waits inline
+            /// for the rest.
+            async fn open_unfinished_ack_request(
+                connection: &QuicConnection,
+            ) -> (crate::high_level::SendStream, crate::high_level::RecvStream) {
+                let (mut send, recv) = connection
+                    .open_bi()
+                    .await
+                    .expect("open an ACK-v2 request stream");
+                send.write_all(crate::ack_frame::ACK_BIDI_REQUEST_MAGIC)
+                    .await
+                    .expect("write the request magic");
+                send.write_all(b"313 r3: an ACK-v2 request without its FIN")
+                    .await
+                    .expect("write part of the request");
+                (send, recv)
+            }
+
+            /// Claim L, hold the drain before the stop, put L's reader into an
+            /// inline ACK-v2 request without a FIN, then let the drain stop it
+            /// (the owner is cancelled but still runs).
+            async fn stop_l_inside_an_inline_request(
+                a: &P2pEndpoint,
+                b_l: &QuicConnection,
+            ) -> (crate::high_level::SendStream, crate::high_level::RecvStream) {
+                let stop_gate = retirement_test_hooks::arm_point(
+                    a.reader_hooks_key(),
+                    retirement_test_hooks::Point::DrainBeforeStop,
+                );
+                wait_until(RETIRE_WITHIN, "A claims L", || claims(a) >= 1).await;
+                assert!(
+                    stop_gate.wait_until_parked(Duration::from_secs(10)).await,
+                    "the drain parks before it stops L's reader"
+                );
+                let request = open_unfinished_ack_request(b_l).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                stop_gate.release();
+                request
+            }
+
+            async fn wait_for_uncancelled_reader(
+                node: &P2pEndpoint,
+                peer: &PeerId,
+                stable_id: usize,
+                within: Duration,
+                what: &str,
+            ) {
+                let deadline = tokio::time::Instant::now() + within;
+                while !node.live_uncancelled_reader_for_test(peer, stable_id).await {
+                    assert!(tokio::time::Instant::now() < deadline, "{what}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+
+            /// Round 3, P1 (finding 1), for both origins of L. The drain has
+            /// stopped L's reader inside an inline request; the winner C2 dies;
+            /// the reader restart finds the stopped owner (AlreadyOwned) and is
+            /// held there. The stopped owner then finishes its request and
+            /// exits. The restart must start a new reader. RED on 9e0dbfdf: the
+            /// restart sees no running cancelled owner any more, counts that as
+            /// success, and leaves L without a reader.
+            async fn recovery_waits_for_the_stopped_owner_to_exit(raw: bool) {
+                {
+                    let what = if raw { "Raw L" } else { "Registered L" };
+                    let (a, b, b2, a_l, b_l, a_c2) = if raw {
+                        raw_supersede_fixture().await
+                    } else {
+                        finalize_supersede_fixture().await
+                    };
+                    let b_peer = b.peer_id();
+                    let (mut request, _response) = stop_l_inside_an_inline_request(&a, &b_l).await;
+                    let owner_gate = retirement_test_hooks::arm_point(
+                        a.reader_hooks_key(),
+                        retirement_test_hooks::Point::RecoveryAfterAlreadyOwned,
+                    );
+                    b2.shutdown().await;
+                    wait_until(Duration::from_secs(10), "C2 closes", || {
+                        a_c2.close_reason().is_some()
+                    })
+                    .await;
+                    assert!(
+                        owner_gate.wait_until_parked(Duration::from_secs(10)).await,
+                        "{what}: the restart meets the stopped owner"
+                    );
+                    request.finish().expect("finish the request");
+                    wait_for_no_reader(&a, &b_peer, a_l.stable_id(), "the stopped owner exits")
+                        .await;
+                    owner_gate.release();
+                    wait_for_uncancelled_reader(
+                        &a,
+                        &b_peer,
+                        a_l.stable_id(),
+                        Duration::from_secs(5),
+                        &format!("{what}: the restart must start a new reader after the stopped owner exits"),
+                    )
+                    .await;
+                    assert!(b_l.close_reason().is_none(), "{what}: L stays open");
+                    let payload = b"313 r3: B to A after the recovery";
+                    b.send(&a.peer_id(), payload).await.expect("B sends on L");
+                    assert!(
+                        recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                        "{what}: A reads L"
+                    );
+                    a.shutdown().await;
+                    b.shutdown().await;
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_recovery_waits_for_the_stopped_owner_to_exit_registered() {
+                recovery_waits_for_the_stopped_owner_to_exit(false).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_recovery_waits_for_the_stopped_owner_to_exit_raw() {
+                recovery_waits_for_the_stopped_owner_to_exit(true).await;
+            }
+
+            /// Round 3, P1 (finding 2). As above, but the inline request never
+            /// gets its FIN, so the stopped owner never reaches its accept
+            /// boundary. Recovery must not give up on the last connection:
+            /// after 12 s and after 35 s, L is open and has a reader that
+            /// accepts streams. RED on 9e0dbfdf: the restart gives up after
+            /// 10 s, and the stopped owner reads nothing more.
+            async fn recovery_outlasts_a_stuck_stopped_owner(raw: bool) {
+                let what = if raw { "Raw L" } else { "Registered L" };
+                let (a, b, b2, a_l, b_l, a_c2) = if raw {
+                    raw_supersede_fixture().await
+                } else {
+                    finalize_supersede_fixture().await
+                };
+                let b_peer = b.peer_id();
+                let _request = stop_l_inside_an_inline_request(&a, &b_l).await;
+                b2.shutdown().await;
+                wait_until(Duration::from_secs(10), "C2 closes", || {
+                    a_c2.close_reason().is_some()
+                })
+                .await;
+                let recovery_started = tokio::time::Instant::now();
+                for check_at in [Duration::from_secs(12), Duration::from_secs(35)] {
+                    tokio::time::sleep_until(recovery_started + check_at).await;
+                    assert!(
+                        b_l.close_reason().is_none(),
+                        "{what}: L stays open after {check_at:?}: {:?}",
+                        b_l.close_reason()
+                    );
+                    assert!(
+                        a.live_uncancelled_reader_for_test(&b_peer, a_l.stable_id())
+                            .await,
+                        "{what}: after {check_at:?} L has a reader that accepts streams"
+                    );
+                    let payload = format!("313 r3: B to A, {check_at:?} after the recovery began");
+                    b.send(&a.peer_id(), payload.as_bytes())
+                        .await
+                        .expect("B sends on L");
+                    assert!(
+                        recv_within(&a, b_peer, payload.as_bytes(), RECV_WINDOW).await,
+                        "{what}: A reads L after {check_at:?}"
+                    );
+                }
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_recovery_outlasts_a_stuck_stopped_owner_registered() {
+                recovery_outlasts_a_stuck_stopped_owner(false).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_recovery_outlasts_a_stuck_stopped_owner_raw() {
+                recovery_outlasts_a_stuck_stopped_owner(true).await;
+            }
+
+            /// Round 3, P2 (finding 3). A starts its own CONNECT-UDP relay
+            /// handshake on L while L is its winner, and B (the relay server)
+            /// holds the response. C2 then supersedes L at A, and Q passes. A
+            /// must not retire L while the handshake is in flight, nor once the
+            /// session it opens is live. RED on 9e0dbfdf: the claim sees no
+            /// published session yet, and A retires L under the handshake.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+            async fn n1_client_relay_handshake_blocks_the_claim() {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let b2 = keyed_node(&b_key).await;
+                let a_peer = a.peer_id();
+                for node in [&a, &b, &b2] {
+                    std::mem::forget(shim_accept(node));
+                }
+                let b_addr = shim_addr(&b);
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+                    .await
+                    .expect("L connect timeout")
+                    .expect("L connect");
+                let a_l = wait_for_winner(&a, &b_peer, "A's L", |_| true).await;
+                let b_l = wait_for_winner(&b, &a_peer, "B's L", |_| true).await;
+                wait_for_reader(&b, &a_peer, b_l.stable_id(), "B's reader on L").await;
+
+                let hold = crate::nat_traversal_api::lifecycle_points::arm_relay_response_hold(
+                    b.inner
+                        .relay_server_key_for_test()
+                        .expect("B is a relay server"),
+                );
+                let relay = {
+                    let a = Arc::clone(&a);
+                    tokio::spawn(async move { a.inner.establish_relay_session(b_addr).await })
+                };
+                assert!(
+                    hold.wait_until_parked(Duration::from_secs(10)).await,
+                    "fixture: B holds the CONNECT-UDP response"
+                );
+                tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b2)))
+                    .await
+                    .expect("C2 connect timeout")
+                    .expect("C2 connect");
+                wait_for_winner(&a, &b_peer, "C2 supersedes L at A", |connection| {
+                    connection.stable_id() != a_l.stable_id()
+                })
+                .await;
+
+                // Q is 1.5 s; the executor passes every 200 ms.
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert!(
+                    b_l.close_reason().is_none(),
+                    "A must not retire L under its relay handshake: {:?}",
+                    remote_close_reason(&b_l)
+                );
+                assert_eq!(claims(&a), 0, "no claim during the relay handshake");
+
+                hold.release();
+                let established = tokio::time::timeout(Duration::from_secs(10), relay)
+                    .await
+                    .expect("relay handshake timeout")
+                    .expect("relay task");
+                assert!(established.is_ok(), "the relay session is established");
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                assert!(
+                    b_l.close_reason().is_none(),
+                    "A must not retire L while its relay session lives: {:?}",
+                    remote_close_reason(&b_l)
+                );
+                assert_eq!(claims(&a), 0, "no claim while the relay session lives");
+
+                a.shutdown().await;
+                b.shutdown().await;
+                b2.shutdown().await;
+            }
+
+            /// Round 3, scope C-313-4 (ACK-v2 parity with master). The ACK-v2
+            /// liveness timeout fires for A's Raw hole-punch winner H. On
+            /// master H is not in the lifecycle, so the timeout closes
+            /// nothing; R1 must keep it open too. RED on 9e0dbfdf: the
+            /// lifecycle-tracked H is closed as LivenessTimeout.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_liveness_timeout_keeps_a_raw_connection() {
+                let ((a_key, _), (b_key, b_peer)) = ordered_identities();
+                let a = keyed_node(&a_key).await;
+                let b = keyed_node(&b_key).await;
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                let b_addr = shim_addr(&b);
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let waiter_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                a.await_hole_punch_outcome(b_addr, b_peer, waiter_deadline)
+                    .await
+                    .expect("A's waiter finalises H");
+                let h = wait_for_winner(&a, &b_peer, "A's H", |_| true).await;
+                assert_eq!(
+                    a.inner
+                        .connection_snapshot_by_stable_id(&b_peer, h.stable_id())
+                        .map(|snapshot| snapshot.origin),
+                    Some(crate::nat_traversal_api::ConnectionOrigin::Raw),
+                    "fixture: H is a Raw winner"
+                );
+
+                a.trigger_liveness_close(b_peer, h.stable_id(), &h).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(
+                    h.close_reason().is_none(),
+                    "the liveness timeout must keep the Raw H open, as master does: {:?}",
+                    h.close_reason()
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
             }
         }
     }

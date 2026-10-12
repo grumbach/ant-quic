@@ -1443,6 +1443,63 @@ pub(crate) mod lifecycle_points {
             hold.hold(stable_id, remote).await;
         }
     }
+
+    /// #313 round 3 test seam: hold one relay server's next CONNECT-UDP
+    /// response, keyed by the server (`Arc` pointer).
+    #[derive(Default)]
+    pub(crate) struct RelayResponseHold {
+        parked: AtomicBool,
+        released: AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl RelayResponseHold {
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        }
+
+        pub(crate) async fn wait_until_parked(&self, within: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            while !self.parked.load(Ordering::SeqCst) {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            true
+        }
+    }
+
+    static RELAY_RESPONSE_HOLDS: LazyLock<
+        parking_lot::Mutex<HashMap<usize, Arc<RelayResponseHold>>>,
+    > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    pub(crate) fn arm_relay_response_hold(server_key: usize) -> Arc<RelayResponseHold> {
+        let hold = Arc::new(RelayResponseHold::default());
+        RELAY_RESPONSE_HOLDS
+            .lock()
+            .insert(server_key, Arc::clone(&hold));
+        hold
+    }
+
+    pub(crate) async fn relay_response_point(server_key: usize) {
+        let hold = RELAY_RESPONSE_HOLDS.lock().remove(&server_key);
+        let Some(hold) = hold else {
+            return;
+        };
+        hold.parked.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let notified = hold.notify.notified();
+            if hold.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6750,6 +6807,8 @@ impl NatTraversalEndpoint {
                     client_addr, request
                 );
 
+                #[cfg(all(test, feature = "network-discovery"))]
+                lifecycle_points::relay_response_point(Arc::as_ptr(&relay_server) as usize).await;
                 match relay_server
                     .handle_connect_request(&request, client_addr)
                     .await
@@ -10765,6 +10824,15 @@ impl NatTraversalEndpoint {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// #313 round 3 test seam: the key of this endpoint's relay server for
+    /// `lifecycle_points::arm_relay_response_hold`.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn relay_server_key_for_test(&self) -> Option<usize> {
+        self.relay_server
+            .as_ref()
+            .map(|server| Arc::as_ptr(server) as usize)
     }
 
     /// #313 Part 2 (R2) test seam: the open connections the lifecycle
