@@ -719,6 +719,24 @@ pub(crate) mod reader_test_hooks {
         }
     }
 
+    /// #313 Part 2: endpoints whose reader-adoption consumer drops every
+    /// signal, so a test can hold a published winner readerless.
+    static ADOPTION_SUPPRESSED: LazyLock<parking_lot::Mutex<std::collections::HashSet<usize>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+    pub(crate) fn suppress_adoption(endpoint_key: usize, suppressed: bool) {
+        let mut set = ADOPTION_SUPPRESSED.lock();
+        if suppressed {
+            set.insert(endpoint_key);
+        } else {
+            set.remove(&endpoint_key);
+        }
+    }
+
+    pub(crate) fn adoption_suppressed(endpoint_key: usize) -> bool {
+        ADOPTION_SUPPRESSED.lock().contains(&endpoint_key)
+    }
+
     pub(crate) async fn park_after_duplicate(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
         if let Some(hooks) = hooks
             && attempt != 0
@@ -8942,6 +8960,10 @@ impl P2pEndpoint {
                             peer_id,
                             connection,
                         } = adoption;
+                        #[cfg(all(test, feature = "network-discovery"))]
+                        if reader_test_hooks::adoption_suppressed(endpoint.reader_hooks_key()) {
+                            continue;
+                        }
                         if endpoint
                             .inner
                             .extract_peer_id_from_connection(&connection)
@@ -19905,6 +19927,200 @@ mod tests {
 
             a.shutdown().await;
             b.shutdown().await;
+        }
+
+        /// #313 Part 2, slice R1, P2P-layer tests: the reader-liveness probe
+        /// and the controls that keep newly tracked connections out of the
+        /// close paths master never applied to them (Codex R2-P2-5).
+        mod r1_custody {
+            use super::*;
+
+            /// RED on master (review §3): a reader started before its
+            /// connection is registered carries `generation = stable_id`. The
+            /// liveness probe then compares that stable_id with the lifecycle
+            /// generation (`conn_stable_id == generation as usize`), never
+            /// matches, and reports no reader, so the #368 janitor closes the
+            /// connection as NoReader although its reader runs.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_reader_started_before_registration_is_seen_by_the_liveness_probe() {
+                let a = shim_node().await;
+                let b = shim_node().await;
+                let b_addr = shim_addr(&b);
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+
+                let h = raw_dial(&a, b_addr).await;
+                wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+                a.spawn_reader_task(b_peer, h.clone()).await;
+                wait_for_reader(&a, &b_peer, h.stable_id(), "A's reader on untracked H").await;
+                a.inner
+                    .add_connection(b_peer, h.clone())
+                    .expect("register H after its reader started");
+                let generation = a
+                    .inner
+                    .connection_snapshot_by_stable_id(&b_peer, h.stable_id())
+                    .expect("H is tracked")
+                    .generation;
+                assert_ne!(
+                    generation,
+                    h.stable_id() as u64,
+                    "fixture: the lifecycle generation differs from the reader's stable_id"
+                );
+
+                let orphans = a.inner.orphaned_open_generations(0);
+                assert!(
+                    !orphans.contains(&(b_peer, h.stable_id())),
+                    "the liveness probe must see H's running reader: {orphans:?}"
+                );
+                // Through the 10 s age gate and at least one janitor tick.
+                tokio::time::sleep(Duration::from_secs(16)).await;
+                assert!(
+                    h.close_reason().is_none(),
+                    "the #368 janitor closed H although its reader runs: {:?}",
+                    h.close_reason()
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Control, GREEN on master and must stay GREEN (Codex R2-P2-5):
+            /// a hole-punch winner whose reader start is held back stays
+            /// readerless. Master never enumerated such untracked winners, so
+            /// the #368 janitor never closed them; R1 tracks them and must not
+            /// add that close.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_readerless_hole_punch_winner_is_not_janitor_closed() {
+                let a = shim_node().await;
+                let b = shim_node().await;
+                let b_addr = shim_addr(&b);
+                let b_peer = b.peer_id();
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), true);
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                assert!(
+                    !a.live_reader_for_test(&b_peer, h.stable_id()).await,
+                    "fixture: H has no reader at A"
+                );
+                let orphans = a.inner.orphaned_open_generations(0);
+                assert!(
+                    !orphans.contains(&(b_peer, h.stable_id())),
+                    "R1 must not make the janitor close a readerless hole-punch winner master \
+                     never closed: {orphans:?}"
+                );
+                tokio::time::sleep(Duration::from_secs(16)).await;
+                assert!(
+                    h.close_reason().is_none(),
+                    "the janitor closed the hole-punch winner: {:?}",
+                    h.close_reason()
+                );
+
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), false);
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Control, GREEN on master and must stay GREEN (Codex R2-P2-5):
+            /// a reader that a late waiter starts on a hole-punch winner that
+            /// the coordinator connection already displaced is a normal
+            /// reader. On master the winner is untracked, so the start has no
+            /// lifecycle snapshot and is never pre-cancelled. R1 tracks it as
+            /// Superseded and must not turn that start into the pre-cancel and
+            /// its immediate close.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_late_waiter_reader_on_a_displaced_hole_punch_winner_is_not_pre_cancelled() {
+                let a = shim_node().await;
+                let b = shim_node().await;
+                let (a_addr, b_addr) = (shim_addr(&a), shim_addr(&b));
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), true);
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+                let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |_| true).await;
+                assert_eq!(b_h.remote_address(), a_addr, "fixture: B's H is A's dial");
+
+                let handled = a
+                    .inner
+                    .inject_accepted_coordination_for_test(
+                        h.clone(),
+                        a_peer,
+                        b_peer,
+                        vec![a_addr],
+                        vec![b_addr],
+                    )
+                    .await
+                    .expect("CoordinationAccepted handled");
+                assert!(handled);
+                wait_for_winner(&a, &b_peer, "C replaces H at A", |connection| {
+                    connection.stable_id() != h.stable_id()
+                })
+                .await;
+
+                a.spawn_reader_task(b_peer, h.clone()).await;
+                let payload = b"313 r1: B to A on the displaced H";
+                let mut stream = b_h.open_uni().await.expect("open a stream on H");
+                stream.write_all(payload).await.expect("write on H");
+                stream.finish().expect("finish on H");
+                assert!(
+                    recv_within(&a, b_peer, payload, RECV_WINDOW).await,
+                    "the late reader on H must read B's stream (no pre-cancel): H close {:?}",
+                    h.close_reason()
+                );
+                assert!(h.close_reason().is_none(), "H stays open");
+
+                reader_test_hooks::suppress_adoption(a.reader_hooks_key(), false);
+                a.shutdown().await;
+                b.shutdown().await;
+            }
+
+            /// Control, GREEN on master and must stay GREEN (Codex R2-P2-5):
+            /// when the reader of an open hole-punch winner exits, master's
+            /// untracked winner takes `ReaderExitOutcome::Noop` and stays
+            /// open. R1 tracks it and must not close it from a reader-exit arm.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn r1_reader_exit_of_an_open_hole_punch_winner_closes_nothing() {
+                let a = shim_node().await;
+                let b = shim_node().await;
+                let b_addr = shim_addr(&b);
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let _accept_a = shim_accept(&a);
+                let _accept_b = shim_accept(&b);
+
+                a.inner
+                    .attempt_hole_punch_candidate_for_test(b_peer, b_addr)
+                    .expect("start hole-punch H");
+                let h = wait_for_winner(&a, &b_peer, "H is A's winner", |_| true).await;
+                wait_for_generation(&b, &a_peer, "B registers H", |_| true).await;
+                wait_for_reader(&a, &b_peer, h.stable_id(), "A's adopted reader on H").await;
+                let mut events = a.subscribe_all_peer_events();
+
+                a.cancel_reader_for_test(&b_peer, h.stable_id()).await;
+                assert!(
+                    saw_reader_exit(&mut events, b_peer, Duration::from_secs(5)).await,
+                    "the cancelled reader exits"
+                );
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                assert!(
+                    h.close_reason().is_none(),
+                    "a hole-punch winner's reader exit must close nothing: {:?}",
+                    h.close_reason()
+                );
+
+                a.shutdown().await;
+                b.shutdown().await;
+            }
         }
     }
 }
