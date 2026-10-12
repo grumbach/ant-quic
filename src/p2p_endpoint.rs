@@ -49,6 +49,8 @@
 //! }
 //! ```
 
+#[cfg(test)]
+mod direct_stage_budget_tests;
 mod socket_binding;
 
 use std::collections::hash_map::DefaultHasher;
