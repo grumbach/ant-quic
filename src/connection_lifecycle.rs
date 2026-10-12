@@ -150,6 +150,15 @@ pub(crate) enum ConnectionLifecycleState {
     Superseded {
         replaced_by_generation: u64,
     },
+    /// #313 R2 (ADR-017): the pair's arbiter claimed this superseded
+    /// connection for retirement and owns its drain. Repromotion never
+    /// selects it, and a reader exit closes nothing; only the retirement
+    /// executor completes it (Closing, then Closed) or aborts it (back to
+    /// Superseded) for the same obligation `epoch`.
+    Retiring {
+        replaced_by_generation: u64,
+        epoch: u64,
+    },
     Closing {
         reason: ConnectionCloseReason,
     },
@@ -164,6 +173,7 @@ impl ConnectionLifecycleState {
         match self {
             Self::Live => "Live",
             Self::Superseded { .. } => "Superseded",
+            Self::Retiring { .. } => "Retiring",
             Self::Closing { .. } => "Closing",
             Self::Closed { .. } => "Closed",
         }

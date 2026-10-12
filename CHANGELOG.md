@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Superseded connections are retired by one end of each pair, on evidence
+  (#313 Part 2, slice R2; ADR-017).** Before, the end that registered a
+  replacement on its outbound, relay or re-keyed accept path closed the
+  superseded connection after a fixed 5 s, and an inbound supersede never
+  closed it (#315). When the two ends kept opposite winners, both could close
+  the connection the other kept, so a pair could lose every connection. Now
+  only the pair's **arbiter** (the end with the greater PeerId) retires, and
+  only when: its winner is open and read locally; a probe on the winner was
+  answered at most 3 s before; the peer sent a request on the winner, and
+  nothing on the superseded connection for 30 s; and the winner has been Live
+  for 30 s. The arbiter then drains the connection (its reader stops at the
+  next stream boundary; in-flight reads, ACK waiters and unacknowledged sends
+  finish, up to `stream_read_deadline`) and closes it with the reserved
+  `Superseded` code. If the winner dies during the drain, the retirement is
+  aborted. The other end (the **follower**) never retires; when the arbiter
+  probes a connection, the follower confirms it with its own probe and makes
+  it its winner. Neither end pre-cancels a reader that starts late on a
+  superseded connection any more: that reader reads it until the arbiter
+  retires it, and a reader exit never retires. Obligations live in the
+  lifecycle, independent of the accept queue (#315): an inbound superseded
+  connection that was accepted and read is retired by the arbiter; one that
+  `accept` skipped has no reader and is still closed by the #368 readerless
+  cleanup after 10 s, as before. No wire change: the roles come from the
+  authenticated identities, and the evidence uses the existing probe
+  exchange. Effects: a superseded connection that is read now stays open for
+  at least 30 s (and while the peer keeps using it); a follower never retires
+  one; a pair whose peer does not negotiate ACK-v2, or whose old-version
+  peer stays quiet, keeps its superseded connections until they idle out or
+  the peer closes them; and applications see more `Replaced` events at the
+  follower when it follows. Logs: the retirement summaries use the
+  `ant_quic::p2p_endpoint` target; the two #368 readerless-close records on
+  the `ant_quic::p2p_endpoint::lifecycle` target now carry `generation`,
+  `from_state`, `to_state` and `connection_id`.
+
 ### Fixed
 
 - **Hole-punch and accepted-coordination winners are lifecycle-tracked
