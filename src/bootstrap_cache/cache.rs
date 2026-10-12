@@ -250,7 +250,8 @@ impl BootstrapCache {
     ///
     /// # Arguments
     /// * `count` - Maximum number of relays to return
-    /// * `target` - The target address to reach
+    /// * `target` - The target address to reach. An IPv4-mapped IPv6 target
+    ///   selects the same relays as its plain IPv4 form (#269).
     /// * `prefer_dual_stack` - If true, prioritize dual-stack relays
     pub async fn select_relays_for_target(
         &self,

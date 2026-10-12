@@ -271,6 +271,10 @@ pub fn select_relays_for_target(
         return Vec::new();
     }
 
+    // Cached addresses are stored in canonical form (IPv4-mapped IPv6 becomes
+    // plain IPv4), so the target must be compared in the same form for both
+    // the family filter and the scope score (#269).
+    let target = crate::shared::normalize_socket_addr(target);
     let target_is_ipv4 = target.is_ipv4();
 
     let mut candidates: Vec<&CachedPeer> = peers
