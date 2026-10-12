@@ -301,6 +301,9 @@ connection and retires superseded ones without that agreement.
   Superseded.
 - Entries of origin `Raw` keep the close behaviour they had while untracked
   (no reader pre-cancel, no `NoReader` close, no reader-exit close while open).
+- A Live entry of origin `Raw` never rejects a newcomer (master had no Live
+  entry to compare with): the newcomer takes the route and the Raw entry
+  becomes Superseded, still open.
 
 ### Retirement (slice R2, ADR-017)
 
@@ -328,14 +331,18 @@ evidence-gated):
   its winner W is open, Live and read locally (E1); a probe pinned to W in W's
   current Live period was answered at most 3 s before (E2); the follower sent
   a request stream on W in that period, no stream arrived on L for Q = 30 s,
-  and W has been Live for at least Q (E3); and L's obligation epoch matches
-  (E4).
+  no relay stream or relay session runs on L, and W has been Live for at
+  least Q (E3); and L's obligation epoch matches (E4). The reader, activity
+  and relay evidence is checked again under locks at the claim.
 - **Drain and completion.** The claim moves L to `Retiring`. The executor
-  stops L's reader at its next accept boundary, waits for its in-flight uni
-  reads, our ACK waiters on L and unacknowledged send data (bounded by
-  `stream_read_deadline`), then closes L with the `Superseded` code. If W dies
-  first, it aborts: L becomes Superseded again (or is repromoted at once) and
-  its reader restarts.
+  stops L's reader at its next accept boundary (only while the claim still
+  holds; the exit of that reader cleans up nothing), waits for its in-flight
+  uni reads and served relay streams, our ACK waiters on L and unacknowledged
+  send data (bounded by `stream_read_deadline`), then closes L with the
+  `Superseded` code. If W dies first, it aborts: L becomes Superseded again
+  (or is repromoted at once) and its reader restarts. Until the restart, L is
+  marked as restart-pending, so neither repromotion nor the #368 janitor
+  closes it as readerless.
 - **Follow.** A follower that receives the arbiter's probe on a Superseded
   connection X probes X itself; when that probe is answered it makes X its
   Live winner. Its probe is also the arbiter's E3 evidence.
