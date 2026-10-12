@@ -12,6 +12,7 @@ use super::entry::{CachedPeer, ConnectionOutcome, PeerCapabilities, PeerSource};
 use super::persistence::{CacheData, CachePersistence};
 use super::selection::select_epsilon_greedy;
 use crate::nat_traversal_api::PeerId;
+use crate::shared::normalize_socket_addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -65,6 +66,9 @@ pub struct CacheStats {
 #[derive(Debug)]
 pub struct BootstrapCache {
     config: BootstrapCacheConfig,
+    /// The local node's own PeerId. The cache never stores or selects it
+    /// (#269). `None` for a cache opened without a local identity.
+    local_peer_id: Option<PeerId>,
     data: Arc<RwLock<CacheData>>,
     /// `None` when the cache is in-memory only (`config.persist == false`).
     persistence: Option<CachePersistence>,
@@ -80,7 +84,37 @@ impl BootstrapCache {
     /// Loads existing cache data from disk if available, otherwise starts fresh.
     /// With `config.persist == false` the cache is in-memory only: nothing is
     /// loaded, nothing is ever written, and no cache directory is created.
+    ///
+    /// Every address is stored in canonical form: an IPv4-mapped IPv6 address
+    /// (`::ffff:a.b.c.d`) becomes plain IPv4 at load and at insert (#269).
+    /// A node that knows its own PeerId should use
+    /// [`Self::open_for_local_peer`] instead.
     pub async fn open(config: BootstrapCacheConfig) -> std::io::Result<Self> {
+        Self::open_inner(config, None).await
+    }
+
+    /// Open or create a bootstrap cache for the node whose own PeerId is
+    /// `local_peer_id`.
+    ///
+    /// Same as [`Self::open`], and the cache never holds the local node's own
+    /// entry (#269): an entry for `local_peer_id` is dropped when an existing
+    /// cache file loads, every insert path ignores it, and no selection
+    /// returns it. A node can learn its own announcement from the network
+    /// (for example after a restart); without this exclusion it could select
+    /// itself as a relay or coordinator and dial itself.
+    ///
+    /// [`crate::p2p_endpoint::P2pEndpoint`] opens its cache this way.
+    pub async fn open_for_local_peer(
+        config: BootstrapCacheConfig,
+        local_peer_id: PeerId,
+    ) -> std::io::Result<Self> {
+        Self::open_inner(config, Some(local_peer_id)).await
+    }
+
+    async fn open_inner(
+        config: BootstrapCacheConfig,
+        local_peer_id: Option<PeerId>,
+    ) -> std::io::Result<Self> {
         let persistence = if config.persist {
             Some(CachePersistence::new(
                 &config.cache_dir,
@@ -89,10 +123,21 @@ impl BootstrapCache {
         } else {
             None
         };
-        let data = match &persistence {
+        let mut data = match &persistence {
             Some(p) => p.load()?,
             None => CacheData::new(super::persistence::generate_instance_id()),
         };
+        // Entries from disk were written without these guards (older builds,
+        // or another process): clean them here. The stored format is
+        // unchanged; the next save writes the clean entries.
+        if let Some(local) = local_peer_id
+            && data.peers.remove(&local.0).is_some()
+        {
+            info!("Dropped the local node's own entry from the bootstrap cache");
+        }
+        for peer in data.peers.values_mut() {
+            peer.normalize_addresses();
+        }
         let (event_tx, _) = broadcast::channel(256);
         let now = Instant::now();
 
@@ -104,24 +149,13 @@ impl BootstrapCache {
 
         Ok(Self {
             config,
+            local_peer_id,
             data: Arc::new(RwLock::new(data)),
             persistence,
             event_tx,
             last_save: Arc::new(RwLock::new(now)),
             last_cleanup: Arc::new(RwLock::new(now)),
         })
-    }
-
-    /// Open or create a bootstrap cache for the node whose own PeerId is
-    /// `local_peer_id` (#269).
-    ///
-    /// RED scaffold: the exclusion is not implemented yet.
-    pub async fn open_for_local_peer(
-        config: BootstrapCacheConfig,
-        local_peer_id: PeerId,
-    ) -> std::io::Result<Self> {
-        let _ = local_peer_id;
-        Self::open(config).await
     }
 
     /// Subscribe to cache events
@@ -150,18 +184,34 @@ impl BootstrapCache {
         peer.calculate_quality(&self.config.weights);
     }
 
-    /// Select peers for bootstrap using epsilon-greedy strategy.
-    ///
-    /// Returns up to `count` peers, balancing exploitation of known-good peers
-    /// with exploration of untested peers based on the configured epsilon.
-    pub async fn select_peers(&self, count: usize) -> Vec<CachedPeer> {
+    /// Whether `peer_id` is the local node's own PeerId (#269).
+    fn is_local_peer(&self, peer_id: &PeerId) -> bool {
+        self.local_peer_id.as_ref() == Some(peer_id)
+    }
+
+    /// Refresh every entry's derived state and return the entries that a
+    /// selection may use. The local node's own entry is never a candidate
+    /// (#269); load and insert already keep it out, and this is the last
+    /// guard.
+    async fn selection_candidates(&self) -> Vec<CachedPeer> {
         let mut data = self.data.write().await;
         let now = SystemTime::now();
         for peer in data.peers.values_mut() {
             self.refresh_cached_peer(peer, now);
         }
-        let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
-        drop(data);
+        data.peers
+            .values()
+            .filter(|peer| !self.is_local_peer(&peer.peer_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Select peers for bootstrap using epsilon-greedy strategy.
+    ///
+    /// Returns up to `count` peers, balancing exploitation of known-good peers
+    /// with exploration of untested peers based on the configured epsilon.
+    pub async fn select_peers(&self, count: usize) -> Vec<CachedPeer> {
+        let peers = self.selection_candidates().await;
 
         select_epsilon_greedy(&peers, count, self.config.epsilon)
             .into_iter()
@@ -173,13 +223,7 @@ impl BootstrapCache {
     ///
     /// Returns peers sorted by quality score, preferring observed relay capability.
     pub async fn select_relay_peers(&self, count: usize) -> Vec<CachedPeer> {
-        let mut data = self.data.write().await;
-        let now = SystemTime::now();
-        for peer in data.peers.values_mut() {
-            self.refresh_cached_peer(peer, now);
-        }
-        let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
-        drop(data);
+        let peers = self.selection_candidates().await;
 
         super::selection::select_with_capabilities(&peers, count, true, false)
             .into_iter()
@@ -191,13 +235,7 @@ impl BootstrapCache {
     ///
     /// Returns peers sorted by quality score, preferring observed coordination capability.
     pub async fn select_coordinators(&self, count: usize) -> Vec<CachedPeer> {
-        let mut data = self.data.write().await;
-        let now = SystemTime::now();
-        for peer in data.peers.values_mut() {
-            self.refresh_cached_peer(peer, now);
-        }
-        let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
-        drop(data);
+        let peers = self.selection_candidates().await;
 
         super::selection::select_with_capabilities(&peers, count, false, true)
             .into_iter()
@@ -222,13 +260,7 @@ impl BootstrapCache {
     ) -> Vec<CachedPeer> {
         use super::selection::select_relays_for_target;
 
-        let mut data = self.data.write().await;
-        let now = SystemTime::now();
-        for peer in data.peers.values_mut() {
-            self.refresh_cached_peer(peer, now);
-        }
-        let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
-        drop(data);
+        let peers = self.selection_candidates().await;
 
         select_relays_for_target(&peers, count, *target, prefer_dual_stack)
             .into_iter()
@@ -242,13 +274,7 @@ impl BootstrapCache {
     pub async fn select_dual_stack_relays(&self, count: usize) -> Vec<CachedPeer> {
         use super::selection::select_dual_stack_relays;
 
-        let mut data = self.data.write().await;
-        let now = SystemTime::now();
-        for peer in data.peers.values_mut() {
-            self.refresh_cached_peer(peer, now);
-        }
-        let peers: Vec<CachedPeer> = data.peers.values().cloned().collect();
-        drop(data);
+        let peers = self.selection_candidates().await;
 
         select_dual_stack_relays(&peers, count)
             .into_iter()
@@ -259,7 +285,15 @@ impl BootstrapCache {
     /// Add or update a peer in the cache.
     ///
     /// If the cache is at capacity, evicts the lowest quality peers.
-    pub async fn upsert(&self, peer: CachedPeer) {
+    /// Addresses are stored in canonical form (IPv4-mapped IPv6 becomes plain
+    /// IPv4). An entry for the local node's own PeerId is ignored (#269).
+    pub async fn upsert(&self, mut peer: CachedPeer) {
+        if self.is_local_peer(&peer.peer_id) {
+            debug!("Ignoring bootstrap cache entry for the local node's own PeerId");
+            return;
+        }
+        peer.normalize_addresses();
+
         let mut data = self.data.write().await;
 
         // Evict lowest quality if at capacity
@@ -303,10 +337,14 @@ impl BootstrapCache {
 
         if let Some(peer) = data.peers.get_mut(&peer_id.0) {
             if outcome.success {
+                let replaces_capabilities = outcome.capabilities_discovered.is_some();
                 peer.record_success(
                     outcome.rtt_ms.unwrap_or(100),
                     outcome.capabilities_discovered,
                 );
+                if replaces_capabilities {
+                    peer.normalize_addresses();
+                }
             } else {
                 peer.record_failure();
             }
@@ -348,6 +386,7 @@ impl BootstrapCache {
 
         if let Some(peer) = data.peers.get_mut(&peer_id.0) {
             peer.capabilities = caps;
+            peer.capabilities.normalize_addresses();
             peer.calculate_quality(&self.config.weights);
         }
     }
@@ -370,6 +409,11 @@ impl BootstrapCache {
     /// as a relay/coordinator, poisoning helper selection for third-party
     /// hole punches.
     pub async fn observe_inbound_peer_address(&self, peer_id: PeerId, address: SocketAddr) {
+        if self.is_local_peer(&peer_id) {
+            debug!("Ignoring inbound observation of the local node's own PeerId");
+            return;
+        }
+        let address = normalize_socket_addr(address);
         let mut data = self.data.write().await;
         let now = SystemTime::now();
         let peer = data
@@ -394,6 +438,11 @@ impl BootstrapCache {
     /// This is the only path that feeds capability derivation
     /// (`supports_relay` / `supports_coordination`).
     pub async fn observe_direct_reachability(&self, peer_id: PeerId, address: SocketAddr) {
+        if self.is_local_peer(&peer_id) {
+            debug!("Ignoring direct reachability of the local node's own PeerId");
+            return;
+        }
+        let address = normalize_socket_addr(address);
         let mut data = self.data.write().await;
         let now = SystemTime::now();
 
@@ -602,14 +651,10 @@ impl BootstrapCache {
         })
     }
 
-    /// Get all cached peers (for export/debug).
+    /// Get all cached peers (for export/debug, and the endpoint's dial
+    /// directory). Never includes the local node's own entry (#269).
     pub async fn all_peers(&self) -> Vec<CachedPeer> {
-        let mut data = self.data.write().await;
-        let now = SystemTime::now();
-        for peer in data.peers.values_mut() {
-            self.refresh_cached_peer(peer, now);
-        }
-        data.peers.values().cloned().collect()
+        self.selection_candidates().await
     }
 
     /// Get the configuration.
