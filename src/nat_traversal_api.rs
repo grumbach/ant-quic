@@ -1227,6 +1227,122 @@ pub(crate) mod lifecycle_points {
             .copied()
             .unwrap_or(0)
     }
+
+    /// #313 Part 2 (R2): forced lifecycle connection ids, keyed by the real
+    /// TLS-exporter id. Both ends of one QUIC connection compute the same
+    /// exporter id, so one entry forces the id at both ends.
+    static CONNECTION_ID_OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<[u8; 32], [u8; 32]>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    pub(crate) fn override_connection_id(real: [u8; 32], forced: [u8; 32]) {
+        CONNECTION_ID_OVERRIDES.lock().insert(real, forced);
+    }
+
+    pub(crate) fn connection_id_override(real: &[u8; 32]) -> Option<[u8; 32]> {
+        CONNECTION_ID_OVERRIDES.lock().get(real).copied()
+    }
+
+    /// #313 Part 2 (R2): hold inbound connections of one endpoint before the
+    /// accept loop registers them, so a test chooses their registration
+    /// order. Each held connection waits until the test releases it.
+    pub(crate) struct InboundHold {
+        held: parking_lot::Mutex<Vec<(usize, std::net::SocketAddr)>>,
+        released: parking_lot::Mutex<std::collections::HashSet<usize>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl InboundHold {
+        /// Wait until at least `count` connections are held; returns them as
+        /// `(stable_id, remote address)` in arrival order.
+        pub(crate) async fn wait_for_held(
+            &self,
+            count: usize,
+        ) -> Vec<(usize, std::net::SocketAddr)> {
+            loop {
+                let changed = self.changed.notified();
+                {
+                    let held = self.held.lock();
+                    if held.len() >= count {
+                        return held.clone();
+                    }
+                }
+                changed.await;
+            }
+        }
+
+        pub(crate) fn release(&self, stable_id: usize) {
+            self.released.lock().insert(stable_id);
+            self.changed.notify_waiters();
+        }
+
+        async fn hold(&self, stable_id: usize, remote: std::net::SocketAddr) {
+            self.held.lock().push((stable_id, remote));
+            self.changed.notify_waiters();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let changed = self.changed.notified();
+                if self.released.lock().contains(&stable_id) {
+                    return;
+                }
+                if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(crate) struct InboundHoldGuard {
+        key: usize,
+        hold: Arc<InboundHold>,
+    }
+
+    impl std::ops::Deref for InboundHoldGuard {
+        type Target = InboundHold;
+
+        fn deref(&self) -> &Self::Target {
+            &self.hold
+        }
+    }
+
+    impl Drop for InboundHoldGuard {
+        fn drop(&mut self) {
+            INBOUND_HOLDS.write().remove(&self.key);
+            let held: Vec<usize> = self.hold.held.lock().iter().map(|(id, _)| *id).collect();
+            for stable_id in held {
+                self.hold.release(stable_id);
+            }
+        }
+    }
+
+    static INBOUND_HOLDS: LazyLock<RwLock<HashMap<usize, Arc<InboundHold>>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+
+    pub(crate) fn arm_inbound_hold(endpoint_key: usize) -> InboundHoldGuard {
+        let hold = Arc::new(InboundHold {
+            held: parking_lot::Mutex::new(Vec::new()),
+            released: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            changed: tokio::sync::Notify::new(),
+        });
+        INBOUND_HOLDS
+            .write()
+            .insert(endpoint_key, Arc::clone(&hold));
+        InboundHoldGuard {
+            key: endpoint_key,
+            hold,
+        }
+    }
+
+    /// The accept loop's point before it registers an inbound connection.
+    pub(crate) async fn hold_inbound(
+        endpoint_key: usize,
+        stable_id: usize,
+        remote: std::net::SocketAddr,
+    ) {
+        let hold = INBOUND_HOLDS.read().get(&endpoint_key).cloned();
+        if let Some(hold) = hold {
+            hold.hold(stable_id, remote).await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6370,6 +6486,13 @@ impl NatTraversalEndpoint {
                         match connecting.await {
                             Ok(connection) => {
                                 info!("Accepted connection from {}", connection.remote_address());
+                                #[cfg(all(test, feature = "network-discovery"))]
+                                lifecycle_points::hold_inbound(
+                                    Arc::as_ptr(&shutdown) as usize,
+                                    connection.stable_id(),
+                                    connection.remote_address(),
+                                )
+                                .await;
 
                                 // Prefer peer ID from the authenticated public key when available.
                                 let peer_id = Self::derive_peer_id_from_connection(&connection)
@@ -7743,6 +7866,10 @@ impl NatTraversalEndpoint {
             )
             .is_ok()
         {
+            #[cfg(all(test, feature = "network-discovery"))]
+            if let Some(forced) = lifecycle_points::connection_id_override(&exporter) {
+                return forced;
+            }
             return exporter;
         }
 
@@ -9973,6 +10100,13 @@ impl NatTraversalEndpoint {
         Arc::as_ptr(&self.shutdown) as usize
     }
 
+    /// #313 Part 2 (R2) test seam: hold this endpoint's inbound connections
+    /// before the accept loop registers them.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn arm_inbound_hold_for_test(&self) -> lifecycle_points::InboundHoldGuard {
+        lifecycle_points::arm_inbound_hold(self.lifecycle_points_key())
+    }
+
     /// #313 Part 2 test seam: arm one of this endpoint's lifecycle points.
     #[cfg(all(test, feature = "network-discovery"))]
     pub(crate) fn arm_lifecycle_point_for_test(
@@ -9996,6 +10130,28 @@ impl NatTraversalEndpoint {
                 entries
                     .iter()
                     .map(|entry| (entry.stable_id(), entry.generation, entry.state))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #313 Part 2 (R2) test seam: the open connections the lifecycle
+    /// tracks for `peer_id`, as `(stable_id, lifecycle connection id,
+    /// state)`. The lifecycle connection id is the TLS-exporter id, which both
+    /// ends of one QUIC connection share.
+    #[cfg(all(test, feature = "network-discovery"))]
+    pub(crate) fn open_lifecycle_entries_for_test(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(usize, [u8; 32], ConnectionLifecycleState)> {
+        self.connection_lifecycle
+            .read()
+            .get(peer_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.is_open())
+                    .map(|entry| (entry.stable_id(), entry.connection_id, entry.state))
                     .collect()
             })
             .unwrap_or_default()
