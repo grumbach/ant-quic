@@ -9936,8 +9936,10 @@ impl P2pEndpoint {
                 .get(&stable_id)
                 .is_none_or(|waiters| waiters.is_empty());
             let sends_done = connection.send_unacked_bytes() == 0;
-            // #313 round 2 (P2-5): a relay stream accepted before the stop.
-            let relay_done = relay_streams_on(&self.relay_streams, stable_id) == 0;
+            // #313 round 2 (P2-5): a relay stream accepted before the stop;
+            // round 3 (finding 3): a relay handshake or session of ours.
+            let relay_done = relay_streams_on(&self.relay_streams, stable_id) == 0
+                && !self.inner.client_relay_active_on(stable_id);
             if reader_done && streams_done && waiters_done && sends_done && relay_done {
                 break;
             }
