@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Superseded connections are retired by one end of each pair, on evidence
+  (#313 Part 2, slice R2; ADR-017).** Before, the end that registered a
+  replacement on its outbound, relay or re-keyed accept path closed the
+  superseded connection after a fixed 5 s, and an inbound supersede never
+  closed it (#315). When the two ends kept opposite winners, both could close
+  the connection the other kept, so a pair could lose every connection. Now
+  only the pair's **arbiter** (the end with the greater PeerId) retires, and
+  only when: its winner is open and read locally; a probe on the winner was
+  answered at most 3 s before; the peer sent a request on the winner, and
+  nothing on the superseded connection for 30 s; no relay session (served,
+  or our own client session, counted from the moment our CONNECT-UDP
+  handshake selects the connection) runs on the superseded connection; and the
+  winner has been Live for 30 s. The reader, activity and relay evidence is
+  checked again, under locks, at the claim. The arbiter then drains the
+  connection (its reader stops at the next stream boundary; in-flight reads,
+  served relay streams, ACK waiters and unacknowledged sends finish, up to
+  `stream_read_deadline`) and closes it with the reserved `Superseded` code.
+  If the winner dies during the drain, or a repromotion takes the
+  connection back, the retirement is aborted: the connection is kept (it is
+  never closed as readerless while its reader restarts), a stale drain never
+  stops the reader of a connection it no longer holds, and the restarted
+  reader is seen as live by the #368 cleanup. The reader restart does not
+  give up while the connection is open: it waits for the stopped reader to
+  exit (it aborts that reader after 5 s if it still waits inside a stream)
+  and succeeds only when a reader that accepts streams runs. The other end (the **follower**) never retires; when the arbiter
+  probes a connection, the follower confirms it with its own probe and makes
+  it its winner. Neither end pre-cancels a reader that starts late on a
+  superseded connection any more: that reader reads it until the arbiter
+  retires it, and a reader exit never retires. Obligations live in the
+  lifecycle, independent of the accept queue (#315): an inbound superseded
+  connection that was accepted and read is retired by the arbiter; one that
+  `accept` skipped has no reader and is still closed by the #368 readerless
+  cleanup after 10 s, as before. No wire change: the roles come from the
+  authenticated identities, and the evidence uses the existing probe
+  exchange. Effects: a superseded connection that is read now stays open for
+  at least 30 s (and while the peer keeps using it); a follower never retires
+  one; a pair whose peer does not negotiate ACK-v2, or whose old-version
+  peer stays quiet, keeps its superseded connections until they idle out or
+  the peer closes them; and applications see more `Replaced` events at the
+  follower when it follows. Logs: the retirement summaries use the
+  `ant_quic::p2p_endpoint` target; the two #368 readerless-close records on
+  the `ant_quic::p2p_endpoint::lifecycle` target now carry `generation`,
+  `from_state`, `to_state` and `connection_id`.
+
+### Fixed
+
+- **Hole-punch and accepted-coordination winners are lifecycle-tracked
+  (#313 Part 2, slice R1).** These winners were raw winner-map inserts, so they
+  had no generation, and a coordinator winner left the tracked winner it
+  replaced Live beside it. They now go through the lifecycle registrar. The
+  winner choice does not change: a hole-punch winner keeps first-wins (a
+  duplicate is closed as before), and an accepted-coordination winner always
+  takes the slot (the connection it replaces becomes Superseded; nothing is
+  closed). A later registration decides as master did, too: a tracked winner
+  of this kind never rejects a newcomer (master had no Live entry to compare
+  with), so the newcomer takes the route and the earlier winner becomes
+  Superseded and stays open. Their generation is now the receive generation
+  of their data. They
+  keep the close behaviour they had while untracked: the #368 janitor and
+  repromotion never close them as `NoReader`, their reader is never
+  pre-cancelled, a reader exit never closes them while they are open, and the
+  ACK-v2 liveness timeout does not close them. One close now also reaches
+  them, as for every tracked connection: `disconnect` closes them.
+- **A hole-punch or accepted-coordination dial is bound to its authenticated
+  identity (#313 R1, Q6).** A connection that does not authenticate as the
+  expected peer is closed before anything is published. It is no longer stored
+  under the expected peer's key, and the session is not marked connected.
+- **`add_connection` of a connection that is already tracked registers nothing
+  (#313 R1, Q4).** A Live connection keeps its generation and gets no second
+  observed-address watch. A Superseded, Closing or Closed connection is refused
+  and not closed by the call (its lifecycle state governs it), so a
+  re-registration can no longer resurrect a connection whose drain close is in
+  progress. A connection that is already closed is refused too.
+- **No winner-map insert orphans an untracked connection (#313 R1).** The
+  registrar and repromotion adopt an open, untracked value that they displace
+  as Superseded.
+- **`poll` keeps a winner that registered after its closed-connection scan
+  (#313 R1).** The removal is bounded to the closed connection the scan saw,
+  and no `ConnectionLost` is reported for a peer that already has a new winner.
+- **The reader-liveness probe sees a reader that started before its
+  connection was registered (#313 R1).** It compared the connection's
+  `stable_id` with the lifecycle generation, so the #368 janitor could close a
+  connection as `NoReader` while its reader ran.
+
 ### Tests
 
 - **Three replacement tests now make a genuinely new connection (#316).**

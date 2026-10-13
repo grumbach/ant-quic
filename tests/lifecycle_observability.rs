@@ -5,8 +5,8 @@ mod support;
 use std::collections::HashSet;
 use std::time::Duration;
 use support::{
-    lifecycle_events, make_node, normalize_local_addr, reset_lifecycle_events, spawn_accept_loop,
-    test_guard, wait_until,
+    RETIREMENT_WAIT, lifecycle_events, make_node, normalize_local_addr, reset_lifecycle_events,
+    spawn_accept_loop, test_guard, wait_until,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -50,7 +50,10 @@ async fn lifecycle_transitions_emit_structured_tracing_fields() {
         }
     }
 
-    wait_until(Duration::from_secs(5), || {
+    // A rejected newcomer reaches Closed at once. A superseded winner reaches
+    // Closed only when the arbiter retires it (ADR-017): Q = 30 s after the
+    // replacement became the winner, plus the probe exchanges and the drain.
+    wait_until(RETIREMENT_WAIT, || {
         lifecycle_events()
             .iter()
             .any(|event| event.fields.get("to_state") == Some(&"Closed".to_string()))

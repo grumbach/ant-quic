@@ -274,3 +274,86 @@ These are the tests we must pass before tagging 0.27.0:
   normal cleanup route rather than idle-close. Deferred decision —
   default stays as-is for 0.27.0 unless testing reveals a reason to
   change it.
+
+## Addendum (#313 Part 2, 2026-10-12): custody and retirement
+
+The "Deterministic replacement rule" above describes a generation-first
+comparator. The code compares the TLS-exporter `connection_id` for
+connections from different initiators, and `(generation, established_at, …)`
+for connections from the same initiator. Both ends agree on the first case.
+They can disagree on the second, because each end orders its own
+generations. This addendum describes how ant-quic keeps custody of every
+connection and retires superseded ones without that agreement.
+
+### Custody (slice R1)
+
+- Every connection is in the lifecycle. Hole-punch and accepted-coordination
+  winners, which were raw winner-map inserts, now go through the registrar
+  with their old winner choice: hole-punch keeps first-wins (a duplicate is
+  closed), and an accepted-coordination winner always takes the slot (the
+  connection it displaces becomes Superseded; nothing is closed).
+- A dial is bound to its authenticated identity before anything is published
+  (a mismatch closes only the new candidate).
+- A registration of a connection that is already tracked creates nothing: a
+  Live one keeps its generation; a Superseded, Closing or Closed one is
+  refused and not closed.
+- A winner-map insert never orphans an untracked value: it is adopted as
+  Superseded.
+- Entries of origin `Raw` keep the close behaviour they had while untracked
+  (no reader pre-cancel, no `NoReader` close, no reader-exit close while open,
+  no ACK-v2 liveness-timeout close). Only an explicit `disconnect(peer)` now
+  also closes them.
+- A Live entry of origin `Raw` never rejects a newcomer (master had no Live
+  entry to compare with): the newcomer takes the route and the Raw entry
+  becomes Superseded, still open.
+
+### Retirement (slice R2, ADR-017)
+
+The Superseded → Closing step is no longer a 5 s timer at the end that
+registered the replacement. It follows ADR-017 (single arbiter,
+evidence-gated):
+
+```
+ Live ──supersede──▶ Superseded ──claim (arbiter, E0-E4)──▶ Retiring
+   ▲                    │  ▲                                  │   │
+   │   repromote/follow │  └────────abort (winner died)───────┘   │
+   └────────────────────┘                             complete (drain done)
+                                                                  ▼
+                                                    Closing ──▶ Closed
+```
+
+- **Obligation.** Every transition to Superseded records an obligation epoch
+  in the lifecycle entry, independent of `accept` delivery. Repromotion clears
+  it; a new Superseded period gets a new epoch.
+- **Arbiter.** For each peer pair, the end with the greater PeerId retires;
+  the other end (the follower) never does. Neither end pre-cancels a reader
+  that starts late on a superseded connection: it reads the connection until
+  the arbiter's drain stops it, and a reader exit never retires.
+- **Claim.** The arbiter's executor claims a Superseded connection L only if:
+  its winner W is open, Live and read locally (E1); a probe pinned to W in W's
+  current Live period was answered at most 3 s before (E2); the follower sent
+  a request stream on W in that period, no stream arrived on L for Q = 30 s,
+  no relay stream or relay session runs on L (our own CONNECT-UDP handshake
+  counts from the moment it selects L), and W has been Live for at least Q
+  (E3); and L's obligation epoch matches (E4). The reader, activity
+  and relay evidence is checked again under locks at the claim.
+- **Drain and completion.** The claim moves L to `Retiring`. The executor
+  stops L's reader at its next accept boundary (only while the claim still
+  holds; the exit of that reader cleans up nothing), waits for its in-flight
+  uni reads and served relay streams, our ACK waiters on L and unacknowledged
+  send data (bounded by `stream_read_deadline`), then closes L with the
+  `Superseded` code. If W dies first, it aborts: L becomes Superseded again
+  (or is repromoted at once) and its reader restarts. The restart owns L's
+  reader until a reader that accepts streams runs, L closes, or the endpoint
+  shuts down: it never gives up while L is open, it waits for the stopped
+  reader to exit (and aborts it after 5 s if it still waits inside a
+  stream), and it keeps L marked as restart-pending meanwhile, so neither
+  repromotion nor the #368 janitor closes it as readerless. This covers
+  Raw connections too, which have no #368 backstop.
+- **Follow.** A follower that receives the arbiter's probe on a Superseded
+  connection X probes X itself; when that probe is answered it makes X its
+  Live winner. Its probe is also the arbiter's E3 evidence.
+- Without ACK-v2 on W, nothing is retired.
+
+Safety argument, residual bounds (F1-F6) and mixed-version behaviour:
+`docs/adr/ADR-017-single-arbiter-connection-retirement.md`.

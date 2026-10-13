@@ -18,15 +18,16 @@ mod support;
 use ant_quic::{ConnectionCloseReason, ConnectionError, PeerLifecycleEvent};
 use std::time::Duration;
 use support::{
-    CONNECT_TIMEOUT, make_isolated_node_with_keypair, normalize_local_addr, reset_lifecycle_events,
-    reusable_keypair, spawn_accept_loop, test_guard, wait_until,
+    CONNECT_TIMEOUT, RETIREMENT_WAIT, make_isolated_node_with_keypair, normalize_local_addr,
+    ordered_keypairs, reset_lifecycle_events, spawn_accept_loop, test_guard, wait_until,
 };
 use tokio::{sync::broadcast, time::timeout};
 
 /// Upper bound for lifecycle events and for the stale connection's close. A
 /// closes it after the 5 s superseded-reader drain grace; 20 s leaves a wide
 /// margin on a loaded runtime and stays below the 30 s idle timeout.
-const STALE_CLOSE_WAIT: Duration = Duration::from_secs(20);
+/// Under ADR-017 the arbiter retires the stale connection after Q (30 s).
+const STALE_CLOSE_WAIT: Duration = RETIREMENT_WAIT;
 
 async fn try_wait_for_peer_event(
     rx: &mut broadcast::Receiver<PeerLifecycleEvent>,
@@ -61,8 +62,10 @@ async fn stale_sender_connection_fails_after_supersede() {
     let _guard = test_guard().await;
     reset_lifecycle_events();
 
-    let b_keypair = reusable_keypair();
-    let a = make_isolated_node_with_keypair(reusable_keypair()).await;
+    // #313 R2 (ADR-017): A has the greater PeerId, so A is the pair's
+    // arbiter, the only end that retires the superseded C1.
+    let (a_keypair, b_keypair) = ordered_keypairs();
+    let a = make_isolated_node_with_keypair(a_keypair).await;
     let b = make_isolated_node_with_keypair(b_keypair.clone()).await;
     let b_addr = normalize_local_addr(b.local_addr().expect("b addr"));
     let a_id = a.peer_id();

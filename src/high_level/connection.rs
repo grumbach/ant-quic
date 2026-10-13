@@ -982,6 +982,17 @@ impl Connection {
         self.0.state.lock("stats").inner.stats()
     }
 
+    /// #313 R2: bytes this endpoint has sent on the connection's streams that
+    /// the peer has not acknowledged yet (the retirement drain waits for 0).
+    pub(crate) fn send_unacked_bytes(&self) -> u64 {
+        self.0
+            .state
+            .lock("send_unacked_bytes")
+            .inner
+            .buffered_snapshot()
+            .0
+    }
+
     /// Current state of the congestion control algorithm, for debugging purposes
     pub fn congestion_state(&self) -> Box<dyn Controller> {
         self.0
