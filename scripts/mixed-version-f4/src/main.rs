@@ -27,14 +27,25 @@
 //! and, after the first close, the time until B's application delivery
 //! resumes (the application re-dials when B has no connection). Then it checks:
 //! (a) every lost message (send returned Ok, never received) was sent inside
-//!     the ADR-017 F4 window: on L, after A's claim and before B saw L close;
-//!     or on W after B's own timer closed W;
+//!     the ADR-017 F4 window, from the measured boundaries: on L, from A's
+//!     claim (less CLAIM_SLACK, 1 ms) to B's observation of L's close (plus
+//!     SEND_SLACK, 1 ms); or on W at or after B's own close of W (less one
+//!     watcher interval). Any other loss is a violation;
 //! (b) delivery resumes within RECOVERY_BOUND;
 //! (c) whether the pair was ever left with no connection (total disconnect),
 //!     and that every total disconnect is the F4 coincidence (B's own timer
-//!     closed W within F4_COINCIDENCE of A completing L);
+//!     closed W within F4_COINCIDENCE of A completing L, plus one close-watcher
+//!     interval for the measurement resolution);
 //! (d) at the end both directions deliver, and both ends have the same number
 //!     of open connections.
+//!
+//! The run passes only if every requested iteration completed: a setup error,
+//! a failed iteration task, or an empty run fails it. Before the run, a self
+//! test checks the window predicate with losses just outside each boundary,
+//! and the completeness rule.
+//!
+//! Usage: `mixed-version-f4 [iterations per variant] [concurrency] [seed]
+//! [close watcher ms]` (defaults 200, 16, 3130258, 1).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -52,10 +63,20 @@ use tracing_subscriber::layer::SubscriberExt;
 const Q_END: Duration = Duration::from_secs(30);
 const WATCH_UNTIL: Duration = Duration::from_secs(40);
 const RECOVERY_BOUND: Duration = Duration::from_secs(15);
-const WINDOW_SLACK: Duration = Duration::from_millis(100);
+/// Slack at the claim end of the F4 window. A lost stream reached A after A
+/// stopped L's reader, which is after the claim; it was opened at most one
+/// one-way delay before it arrived, and A's claim event is logged just after
+/// the claim. Both are well under 1 ms on loopback.
+const CLAIM_SLACK: Duration = Duration::from_millis(1);
+/// Slack at the close end of the F4 window. B's observation of L's close
+/// (the watcher) is never earlier than B's processing of it; a send that B
+/// started before that processing returns at most one `send` call later
+/// (well under 1 ms on loopback).
+const SEND_SLACK: Duration = Duration::from_millis(1);
 const SEND_INTERVAL: Duration = Duration::from_millis(250);
 /// ADR-017 F4: a total loss needs B's own timer to close W within about one
-/// round trip of A's retirement of L. Loopback, with scheduling: 5 ms.
+/// round trip of A's retirement of L. Loopback, with scheduling: 5 ms. The
+/// check adds one close-watcher interval, the resolution of the measured gap.
 const F4_COINCIDENCE: Duration = Duration::from_millis(5);
 
 // ---------------------------------------------------------------- tracing
@@ -203,6 +224,8 @@ struct Params {
     variant: Variant,
     d: Duration,
     t_s: Option<Duration>,
+    /// The close watcher's interval (1 ms; 100 ms for the coarse run).
+    close_poll: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -230,6 +253,9 @@ struct Outcome {
     /// For each lost message: (route, after A's claim in us, before B saw
     /// the route close in us).
     lost_detail: Vec<String>,
+    /// For each lost message: (us after A's claim, us before B saw the route
+    /// close).
+    loss_margins_us: Vec<(i128, i128)>,
     window_sends: usize,
     total_disconnect: bool,
     redials: usize,
@@ -251,6 +277,96 @@ fn decode(data: &[u8]) -> Option<u32> {
         .nth(2)?
         .parse()
         .ok()
+}
+
+/// The ADR-017 F4 window, from the measured boundaries only. A lost send
+/// (`send` returned Ok, A never received it) is inside the window when it
+/// went on L after A's claim and before B saw L close, or on W at or after
+/// B's own timer closed W. `close_poll` is the watcher's interval: B's close
+/// of W can be seen up to one interval late.
+fn loss_in_f4_window(
+    at: Duration,
+    route: LossRoute,
+    claim: Option<Duration>,
+    l_close_seen: Option<Duration>,
+    w_close_seen: Option<Duration>,
+    close_poll: Duration,
+) -> bool {
+    match route {
+        LossRoute::L => match (claim, l_close_seen) {
+            (Some(claim), Some(close)) => at + CLAIM_SLACK >= claim && at <= close + SEND_SLACK,
+            _ => false,
+        },
+        LossRoute::W => w_close_seen.is_some_and(|close| at + close_poll >= close),
+        LossRoute::Other => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LossRoute {
+    L,
+    W,
+    Other,
+}
+
+/// Negative and positive controls for the window predicate and for the
+/// completeness rule. The gate does not run if one of them fails.
+fn self_test() -> Result<(), String> {
+    let ms = Duration::from_millis;
+    let poll = ms(1);
+    let claim = Some(ms(30_000));
+    let l_close = Some(ms(30_025));
+    let w_close = Some(ms(30_100));
+    let cases: [(&str, Duration, LossRoute, bool); 9] = [
+        ("L, 50 ms before the claim", ms(29_950), LossRoute::L, false),
+        ("L, 2 ms before the claim", ms(29_998), LossRoute::L, false),
+        (
+            "L, 1 ms before the claim (slack)",
+            ms(29_999),
+            LossRoute::L,
+            true,
+        ),
+        ("L, between claim and close", ms(30_010), LossRoute::L, true),
+        (
+            "L, 2 ms after B saw L close",
+            ms(30_027),
+            LossRoute::L,
+            false,
+        ),
+        (
+            "L, 50 ms after B saw L close",
+            ms(30_075),
+            LossRoute::L,
+            false,
+        ),
+        (
+            "W, 50 ms before B closed W",
+            ms(30_050),
+            LossRoute::W,
+            false,
+        ),
+        ("W, after B closed W", ms(30_100), LossRoute::W, true),
+        ("other route", ms(30_010), LossRoute::Other, false),
+    ];
+    for (name, at, route, expected) in cases {
+        let got = loss_in_f4_window(at, route, claim, l_close, w_close, poll);
+        if got != expected {
+            return Err(format!(
+                "window control '{name}': got {got}, expected {expected}"
+            ));
+        }
+    }
+    if loss_in_f4_window(ms(30_010), LossRoute::L, None, l_close, w_close, poll) {
+        return Err("window control: a loss with no claim must be outside".into());
+    }
+    let complete = |requested: usize, completed: usize, failed: usize| {
+        requested > 0 && completed == requested && failed == 0
+    };
+    if complete(0, 0, 0) || complete(600, 599, 0) || complete(600, 600, 1) || !complete(600, 600, 0)
+    {
+        return Err("completeness control failed".into());
+    }
+    Ok(())
 }
 
 async fn iteration(p: Params) -> Result<Outcome, String> {
@@ -386,7 +502,8 @@ async fn iteration(p: Params) -> Result<Outcome, String> {
     let l_id = b_l.stable_id();
     let w_id = b_w.stable_id();
 
-    // A 1 ms watcher records when B first sees L and W closed.
+    // A watcher records when B first sees L and W closed (every `close_poll`).
+    let close_poll = p.close_poll;
     type Seen = Option<(Duration, String)>;
     let closes: Arc<Mutex<(Seen, Seen)>> = Arc::new(Mutex::new((None, None)));
     let watcher_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -412,7 +529,7 @@ async fn iteration(p: Params) -> Result<Outcome, String> {
                         break;
                     }
                 }
-                sleep(Duration::from_millis(1)).await;
+                sleep(close_poll).await;
             }
         });
     }
@@ -563,60 +680,61 @@ async fn iteration(p: Params) -> Result<Outcome, String> {
 
     // (a) losses and the F4 window.
     let received = received.lock().map(|m| m.clone()).unwrap_or_default();
-    let window = |at: Duration| -> bool {
-        match (out.claim_at, out.b_l_close.as_ref()) {
-            (Some(claim), Some((close, _))) => {
-                at + WINDOW_SLACK >= claim && at <= *close + WINDOW_SLACK
-            }
-            _ => false,
-        }
-    };
+    let l_close_seen = out.b_l_close.as_ref().map(|(at, _)| *at);
+    let w_close_seen = out.b_w_close.as_ref().map(|(at, _)| *at);
     for send in &sends {
         if !send.ok {
             out.send_errors += 1;
             continue;
         }
         out.sent_ok += 1;
-        let on_l = send.route == Some(l_id) && l_id != w_id;
-        let on_w = send.route == Some(w_id);
-        if on_l && window(send.at) {
-            out.window_sends += 1;
-        }
-        let after_w_timer = on_w
-            && out
-                .b_w_close
-                .as_ref()
-                .is_some_and(|(close, _)| send.at + WINDOW_SLACK >= *close);
-        if after_w_timer {
+        let route = if send.route == Some(l_id) && l_id != w_id {
+            LossRoute::L
+        } else if send.route == Some(w_id) {
+            LossRoute::W
+        } else {
+            LossRoute::Other
+        };
+        let in_window = loss_in_f4_window(
+            send.at,
+            route,
+            out.claim_at,
+            l_close_seen,
+            w_close_seen,
+            p.close_poll,
+        );
+        if in_window {
             out.window_sends += 1;
         }
         if received.contains_key(&send.seq) {
             continue;
         }
-        let route = if on_l {
-            "L"
-        } else if on_w {
-            "W"
-        } else {
-            "other"
+        let route_name = match route {
+            LossRoute::L => "L",
+            LossRoute::W => "W",
+            LossRoute::Other => "other",
         };
-        out.lost.push((send.seq, send.at, route));
+        out.lost.push((send.seq, send.at, route_name));
         let after_claim = out
             .claim_at
             .map(|claim| send.at.as_micros() as i128 - claim.as_micros() as i128);
-        let close_seen = if on_l {
-            out.b_l_close.as_ref()
+        let close_seen = if route == LossRoute::L {
+            l_close_seen
         } else {
-            out.b_w_close.as_ref()
+            w_close_seen
         };
         let before_close =
-            close_seen.map(|(close, _)| close.as_micros() as i128 - send.at.as_micros() as i128);
+            close_seen.map(|close| close.as_micros() as i128 - send.at.as_micros() as i128);
+        if let (Some(after), Some(before)) = (after_claim, before_close) {
+            out.loss_margins_us.push((after, before));
+        }
         out.lost_detail.push(format!(
-            "seq={} route={route} after_claim_us={after_claim:?} before_close_seen_us={before_close:?}",
+            "seq={} route={route_name} after_claim_us={after_claim:?} before_close_seen_us={before_close:?}",
             send.seq
         ));
-        if !((on_l && window(send.at)) || after_w_timer) {
-            out.lost_outside_window.push((send.seq, send.at, route));
+        if !in_window {
+            out.lost_outside_window
+                .push((send.seq, send.at, route_name));
         }
     }
 
@@ -661,9 +779,24 @@ async fn main() {
     let per_variant: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
     let concurrency: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(16);
     let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(313_0258);
+    let close_poll_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let close_poll = Duration::from_millis(close_poll_ms.max(1));
     println!(
-        "f4gate: {per_variant} iterations per variant, concurrency {concurrency}, seed {seed}"
+        "f4gate: {per_variant} iterations per variant, concurrency {concurrency}, seed {seed}, close watcher {} ms",
+        close_poll.as_millis()
     );
+    if let Err(e) = self_test() {
+        println!("F4 RESULT: SELF-TEST FAILED: {e}");
+        std::process::exit(3);
+    }
+    println!("self-test: window and completeness controls pass");
+    if per_variant == 0 || concurrency == 0 {
+        println!(
+            "F4 RESULT: NOTHING TO RUN (iterations per variant and concurrency must be at least 1)"
+        );
+        std::process::exit(1);
+    }
+    let requested = per_variant * 3;
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut params = Vec::new();
@@ -691,6 +824,7 @@ async fn main() {
             variant,
             d,
             t_s,
+            close_poll,
         });
     }
 
@@ -700,12 +834,22 @@ async fn main() {
         let semaphore = Arc::clone(&semaphore);
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
+            // Negative control for the completeness rule: F4_INJECT_TASK_PANIC
+            // names one iteration index whose task fails.
+            if std::env::var("F4_INJECT_TASK_PANIC")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(p.index)
+            {
+                panic!("injected task failure for iteration {}", p.index);
+            }
             let result = iteration(p.clone()).await;
             (p, result)
         });
     }
 
     let mut results = Vec::new();
+    let mut task_failures = 0usize;
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((p, result)) => {
@@ -750,7 +894,10 @@ async fn main() {
                 }
                 results.push((p, result));
             }
-            Err(e) => println!("join error: {e}"),
+            Err(e) => {
+                task_failures += 1;
+                println!("ITERATION TASK FAILED: {e}");
+            }
         }
     }
 
@@ -828,7 +975,10 @@ async fn main() {
                 o.recovery.map(|r| r.as_micros()),
                 o.redials
             ));
-            if !gap_us.is_some_and(|gap| gap.abs() <= F4_COINCIDENCE.as_micros() as i128) {
+            // B's close of W is seen up to one watcher interval late, so the
+            // measured gap can exceed the true gap by up to `close_poll`.
+            let allowed = (F4_COINCIDENCE + close_poll).as_micros() as i128;
+            if gap_us.is_none_or(|gap| gap.abs() > allowed) {
                 violations.push(format!(
                     "iter {} (c): total disconnect outside the F4 coincidence (gap {gap_us:?} us)",
                     p.index
@@ -879,6 +1029,29 @@ async fn main() {
         percentile(&recoveries, 0.99).as_micros(),
         recoveries.last().map(|d| d.as_micros()).unwrap_or(0),
     );
+    let margins: Vec<(i128, i128)> = results
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .flat_map(|o| o.loss_margins_us.iter().copied())
+        .collect();
+    if !margins.is_empty() {
+        println!(
+            "loss margins us: after A's claim min={} max={}; before B saw the route close min={} max={}",
+            margins.iter().map(|m| m.0).min().unwrap_or(0),
+            margins.iter().map(|m| m.0).max().unwrap_or(0),
+            margins.iter().map(|m| m.1).min().unwrap_or(0),
+            margins.iter().map(|m| m.1).max().unwrap_or(0),
+        );
+    }
+    let completed = results.iter().filter(|(_, r)| r.is_ok()).count();
+    println!(
+        "completeness: requested {requested}, completed {completed}, setup errors {setup_errors}, failed tasks {task_failures}"
+    );
+    if completed != requested || task_failures != 0 {
+        violations.push(format!(
+            "completeness: requested {requested}, completed {completed}, failed tasks {task_failures}"
+        ));
+    }
     for v in &violations {
         println!("VIOLATION {v}");
     }
@@ -887,7 +1060,7 @@ async fn main() {
         println!("F4 RESULT: ALL CHECKS PASS");
     } else {
         println!(
-            "F4 RESULT: {} VIOLATIONS, {setup_errors} SETUP ERRORS",
+            "F4 RESULT: {} VIOLATIONS, {setup_errors} SETUP ERRORS, {task_failures} FAILED TASKS",
             violations.len()
         );
         std::process::exit(1);
