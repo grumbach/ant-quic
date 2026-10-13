@@ -357,3 +357,74 @@ evidence-gated):
 
 Safety argument, residual bounds (F1-F6) and mixed-version behaviour:
 `docs/adr/ADR-017-single-arbiter-connection-retirement.md`.
+
+### ADR-017 F4 mixed-version evidence (0.27.58 release gate)
+
+ADR-017 is Accepted and frozen, so the evidence for its F4 row is kept here.
+Harness: `scripts/mixed-version-f4` (a standalone crate, not in the
+workspace and not packaged). It runs the released 0.27.57 from crates.io as
+the follower B and this tree as the arbiter A, in one process, on loopback,
+with production timing (Q = 30 s, P = 3 s, B's own 5 s supersede timer).
+
+Schedule (the F4 example): B dials L and A registers the inbound L. B's own
+finalize of L is held (its `connect_addr` future is not polled again). B
+dials W; A registers W at t = 0, and L is Superseded at A. B sends on W every
+250 ms until t = d. At t = d, B finalizes L: L becomes B's winner, and B
+starts its 5 s timer on W. A keeps B's earlier requests on W as E3(a).
+Variants, 200 iterations each, with random timing:
+
+- `none`: d in [22, 30] s; B sends nothing after d;
+- `window`: d in [26, 29.5] s; B sends one message at t_s in [29.95, 30.10] s,
+  which is around A's claim, inside the F4 window;
+- `coincide`: d in [25.005, 25.035] s, so B's timer fires when A completes L
+  (the F4 total-loss interleaving).
+
+After the first close that B sees, B's application sends every 100 ms and
+dials again when it has no connection. Checks: (a) every lost message (`send`
+returned Ok, A never received it) was sent inside the F4 window, that is, on
+L after A's claim and before B saw L close, or on W after B's own timer;
+(b) delivery resumes within 15 s; (c) every total disconnect is the F4
+coincidence (B's timer closed W within 5 ms of A completing L); (d) at the
+end both directions deliver and both ends have the same number of open
+connections.
+
+Results on `release/0.27.58` (library code of `9ae09493`), two runs of 600
+iterations (seeds 3130258 and 3130259), plus a 90-iteration run of the
+committed harness (seed 3130260). All checks pass. These are the numbers of
+the run with 1 ms close timing (seed 3130259):
+
+| Variant | Outcome | Iterations |
+|---|---|---|
+| none | B's timer closed W first (d < 25.0 s); the pair kept L | 62 |
+| none | A retired L; B repromoted W; the pair kept W | 138 |
+| window | the message came before A's claim, so A did not claim; B's timer closed W; the pair kept L | 57 |
+| window | A retired L; the pair kept W | 143 |
+| coincide | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 73 |
+| coincide | A retired L before B's timer; the pair kept W | 115 |
+| coincide | B's timer closed W before A's claim; the pair kept L | 1 |
+| coincide | **total disconnect**: B's timer closed W from 72 us before to 2.4 ms after A completed L | 11 |
+
+- (a) Loss: 26 messages lost in 600 iterations, all in `window`, at most one
+  per iteration, and each one sent inside the F4 window. They were sent 1.2 to
+  21.5 ms after A's claim and 1.4 to 20.8 ms before B saw L close. The window
+  is A's drain (about 21 ms here) plus one way. No message was lost outside
+  the window, and none in `none` or `coincide`.
+- (b) Recovery after the first close that B sees: p50 191 us, p90 450 us,
+  p99 8.4 ms, max 15.3 ms (all 600 iterations). Each total disconnect
+  recovered with one dial by B's application, in 0.9 to 6.8 ms.
+- (c) Total disconnects: 0 of 400 iterations in `none` and `window`; 11 of
+  200 in `coincide`, all inside the coincidence (about 2 ms wide in d, in a
+  30 ms aim range). The other run with coarser close timing (seed 3130258) gave
+  15 of 200 and 0 of 400.
+- (d) In all 600 iterations both directions delivered at the end, and both
+  ends had one open connection.
+
+What this shows about F4. The total loss that F4 describes is real, and it
+is the only one: it needs B's own 5 s timer to close W within about 2 ms of
+A completing L (A's claim plus its drain). A timer that fires between A's
+claim and its completion makes A abort and keep L. Outside that band at least
+one connection survives. Each loss is bounded as F4 states (messages that B
+sent on L after A's claim), and the pair recovers when one end dials again.
+F4 also needs B to finalize L at least about 22 s after the handshake
+completed, a stalled old peer. The harness forces that stall; it does not
+occur in these runs without it.
