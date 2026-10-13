@@ -321,6 +321,11 @@ impl Iterator for Replace<'_> {
 
 impl Drop for Replace<'_> {
     fn drop(&mut self) {
+        // Never store an empty range: stored ranges must be non-empty, and an empty range
+        // would end a later `Replace` early.
+        if self.range.is_empty() {
+            return;
+        }
         // Ensure we drain all remaining overlapping ranges
         for _ in &mut *self {}
         // Insert the final aggregate range

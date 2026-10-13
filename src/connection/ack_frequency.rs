@@ -47,13 +47,18 @@ impl AckFrequencyState {
         config: &AckFrequencyConfig,
         peer_params: &TransportParameters,
     ) -> Duration {
-        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
         let min_ack_delay =
             Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
-        config
-            .max_ack_delay
-            .unwrap_or(self.peer_max_ack_delay)
-            .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+
+        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
+        let candidate = config.max_ack_delay.unwrap_or(self.peer_max_ack_delay);
+
+        // Must be no smaller than the `min_ack_delay` advertised by the peer
+        Ord::max(
+            // Should be less than the RTT (itself at least `MIN_AUTOMATIC_ACK_DELAY`)
+            Ord::min(candidate, Ord::max(rtt, MIN_AUTOMATIC_ACK_DELAY)),
+            min_ack_delay,
+        )
     }
 
     /// Returns the `max_ack_delay` for the purposes of calculating the PTO
