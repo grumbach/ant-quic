@@ -42,6 +42,12 @@ const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 /// own. Bounding it keeps the tracked range set within a fixed size. Ordinary
 /// reordered or lossy traffic keeps only the ranges of the packets in flight
 /// within a receive window open at once, well below this.
+///
+/// This value is coupled to the stream receive window: the live range count is
+/// at most `stream_receive_window / min_packet_payload` (about 1000 at the
+/// 1.25 MB default). 4096 keeps several times that headroom. If the stream
+/// receive window is ever raised far above the default, raise this in step
+/// (about `stream_receive_window / 300`).
 const MAX_RECVD_RANGES: usize = 4096;
 
 /// Helper to assemble unordered stream frames into an ordered stream
