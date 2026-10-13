@@ -167,11 +167,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ADR-017 F4 mixed-version gate (#313).** `scripts/mixed-version-f4` runs
   the released 0.27.57 as an old follower against this tree as the arbiter,
   with production timing, and reproduces the F4 schedule (the follower
-  finalizes its older connection late) over 600 randomised iterations. Losses
-  stay inside the F4 window, delivery resumes, and a total disconnect occurs
-  only in the F4 coincidence (the follower's own timer within about 2 ms of
-  the arbiter's retirement); the pair then recovers with one dial. Results:
-  `docs/design/connection-lifecycle-sync.md`.
+  finalizes its older connection late) over 600 randomised iterations per
+  run. In the definitive run (and a 100 ms-resolution repeat) every loss was
+  inside the F4 window, delivery resumed, and a total disconnect occurred only
+  in the F4 coincidence (the follower's own timer within about 2.6 ms of the
+  arbiter completing its retirement): 11 of 200 aimed iterations, 0 of 400
+  others. The pair then recovered with one dial. The harness fails on any
+  loss outside the window, any failed or missing iteration, and an empty run.
+  Results and scope: `docs/design/connection-lifecycle-sync.md`.
 - **Direct-stage budget regressions for PeerId dials (#304).** A loopback UDP
   gate holds the dialer's datagrams for 3 s, counted from the first datagram
   of the tested attempt, so the handshake cannot finish before the adaptive

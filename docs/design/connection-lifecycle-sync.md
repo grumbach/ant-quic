@@ -365,66 +365,126 @@ Harness: `scripts/mixed-version-f4` (a standalone crate, not in the
 workspace and not packaged). It runs the released 0.27.57 from crates.io as
 the follower B and this tree as the arbiter A, in one process, on loopback,
 with production timing (Q = 30 s, P = 3 s, B's own 5 s supersede timer).
+Usage: `cargo run --release -- [iterations per variant] [concurrency] [seed]
+[close watcher ms]`.
 
-Schedule (the F4 example): B dials L and A registers the inbound L. B's own
-finalize of L is held (its `connect_addr` future is not polled again). B
-dials W; A registers W at t = 0, and L is Superseded at A. B sends on W every
-250 ms until t = d. At t = d, B finalizes L: L becomes B's winner, and B
-starts its 5 s timer on W. A keeps B's earlier requests on W as E3(a).
-Variants, 200 iterations each, with random timing:
+Schedule (the F4 example; two connections, L and W, between one A and one
+B): B dials L and A registers the inbound L. B's own finalize of L is held
+(its `connect_addr` future is not polled again). B dials W; A registers W at
+t = 0, and L is Superseded at A. B sends on W every 250 ms until t = d. At
+t = d, B finalizes L: L becomes B's winner, and B starts its 5 s timer on W.
+A keeps B's earlier requests on W as E3(a). Variants, 200 iterations each per
+run, with random timing:
 
 - `none`: d in [22, 30] s; B sends nothing after d;
 - `window`: d in [26, 29.5] s; B sends one message at t_s in [29.95, 30.10] s,
   which is around A's claim, inside the F4 window;
-- `coincide`: d in [25.005, 25.035] s, so B's timer fires when A completes L
-  (the F4 total-loss interleaving).
+- `coincide`: d in [25.005, 25.035] s, so B's timer fires at about the time A
+  completes L (the F4 total-loss interleaving).
 
 After the first close that B sees, B's application sends every 100 ms and
-dials again when it has no connection. Checks: (a) every lost message (`send`
-returned Ok, A never received it) was sent inside the F4 window, that is, on
-L after A's claim and before B saw L close, or on W after B's own timer;
-(b) delivery resumes within 15 s; (c) every total disconnect is the F4
-coincidence (B's timer closed W within 5 ms of A completing L); (d) at the
-end both directions deliver and both ends have the same number of open
-connections.
+dials again when it has no connection. A watcher records B's close times
+(every 1 ms, or every 100 ms in the coarse run); A's claims and completions
+come from its tracing events. Checks:
 
-Results on `release/0.27.58` (library code of `9ae09493`), two runs of 600
-iterations (seeds 3130258 and 3130259), plus a 90-iteration run of the
-committed harness (seed 3130260). All checks pass. These are the numbers of
-the run with 1 ms close timing (seed 3130259):
+- (a) every lost message (`send` returned Ok, A never received it) is inside
+  the F4 window, from the measured boundaries only: on L, from A's claim less
+  1 ms to B's observation of L's close plus 1 ms; or on W at or after B's own
+  close of W, less one watcher interval. The 1 ms at the claim end covers the
+  one-way loopback delay and the lag of A's claim event; the 1 ms at the close
+  end covers one `send` call (the watcher never sees the close before B
+  processes it). Any other loss is a violation;
+- (b) delivery resumes within 15 s;
+- (c) every total disconnect is the F4 coincidence: B's timer closed W within
+  5 ms of A completing L, plus one watcher interval (the resolution of the
+  measured gap);
+- (d) at the end both directions deliver, and both ends have the same number
+  of open connections.
+
+The run passes only if every requested iteration completed (a setup error,
+a failed iteration task, an empty run or a zero concurrency fails it). Before
+each run, a self test checks the window predicate with losses just outside
+each boundary (2 ms and 50 ms before the claim, 2 ms and 50 ms after B saw L
+close, 50 ms before B's close of W) and the completeness rule. A control run
+with one injected task failure (`F4_INJECT_TASK_PANIC`) fails, and an empty
+run fails.
+
+#### Results of the final harness (library code of `9ae09493`)
+
+| Run | Seed | Watcher | Result |
+|---|---|---|---|
+| definitive | 3130263 | 1 ms | 600 of 600 iterations; ALL CHECKS PASS |
+| coarse | 3130264 | 100 ms | 600 of 600 iterations; ALL CHECKS PASS |
+
+Outcomes, definitive run:
 
 | Variant | Outcome | Iterations |
 |---|---|---|
-| none | B's timer closed W first (d < 25.0 s); the pair kept L | 62 |
-| none | A retired L; B repromoted W; the pair kept W | 138 |
-| window | the message came before A's claim, so A did not claim; B's timer closed W; the pair kept L | 57 |
-| window | A retired L; the pair kept W | 143 |
-| coincide | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 73 |
-| coincide | A retired L before B's timer; the pair kept W | 115 |
+| none | B's timer closed W first; the pair kept L | 54 |
+| none | A retired L; B repromoted W; the pair kept W | 145 |
+| none | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 1 |
+| window | the message came before A's claim, so A did not claim; the pair kept L | 53 |
+| window | A retired L; the pair kept W | 147 |
+| coincide | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 75 |
+| coincide | A retired L before B's timer; the pair kept W | 113 |
 | coincide | B's timer closed W before A's claim; the pair kept L | 1 |
-| coincide | **total disconnect**: B's timer closed W from 72 us before to 2.4 ms after A completed L | 11 |
+| coincide | **total disconnect** | 11 |
 
-- (a) Loss: 26 messages lost in 600 iterations, all in `window`, at most one
-  per iteration, and each one sent inside the F4 window. They were sent 1.2 to
-  21.5 ms after A's claim and 1.4 to 20.8 ms before B saw L close. The window
-  is A's drain (about 21 ms here) plus one way. No message was lost outside
-  the window, and none in `none` or `coincide`.
-- (b) Recovery after the first close that B sees: p50 191 us, p90 450 us,
-  p99 8.4 ms, max 15.3 ms (all 600 iterations). Each total disconnect
-  recovered with one dial by B's application, in 0.9 to 6.8 ms.
-- (c) Total disconnects: 0 of 400 iterations in `none` and `window`; 11 of
-  200 in `coincide`, all inside the coincidence (about 2 ms wide in d, in a
-  30 ms aim range). The other run with coarser close timing (seed 3130258) gave
-  15 of 200 and 0 of 400.
-- (d) In all 600 iterations both directions delivered at the end, and both
+- (a) Loss, definitive run: 41 messages in 600 iterations (39 in `window`, 2 in
+  `coincide`, 0 in `none`), at most one per iteration in this workload. All
+  were inside the F4 window: they were sent 1.13 to 21.84 ms after A's claim
+  and 1.45 to 23.66 ms before B saw L close. No loss was outside it. Coarse
+  run: 24 messages, all in `window`, all inside the window (1.12 to 21.76 ms
+  after A's claim; the close-end margins, 19.7 to 103.8 ms, have the 100 ms
+  watcher resolution).
+- (b) Recovery after the first close that B sees, definitive run: p50 192 us,
+  p90 1.24 ms, p99 13.7 ms, max 103 ms. Coarse run: p50 199 us, p99 1.48 ms,
+  max 10.2 ms.
+- (c) Total disconnects, definitive run: 0 of 400 iterations in `none` and
+  `window`; 11 of 200 in `coincide`. Their d values span 25.0147 to 25.0264 s
+  (about 12 ms, because A's completion time also varies from iteration to
+  iteration). The measured gap between B's close of W and A's completion of L
+  spans −18 us to +2.56 ms. Coarse run: 10 of 200 in `coincide`, and 1 of 200
+  in `none`, a random draw at d = 25.0140 s, inside the same band; their
+  measured gaps (54 to 66 ms) carry the 100 ms watcher resolution. Every total
+  disconnect recovered with one dial by B's application, in 0.9 ms to 103 ms.
+- (d) In all 1200 iterations both directions delivered at the end, and both
   ends had one open connection.
 
-What this shows about F4. The total loss that F4 describes is real, and it
-is the only one: it needs B's own 5 s timer to close W within about 2 ms of
-A completing L (A's claim plus its drain). A timer that fires between A's
-claim and its completion makes A abort and keep L. Outside that band at least
-one connection survives. Each loss is bounded as F4 states (messages that B
-sent on L after A's claim), and the pair recovers when one end dials again.
-F4 also needs B to finalize L at least about 22 s after the handshake
-completed, a stalled old peer. The harness forces that stall; it does not
-occur in these runs without it.
+#### Earlier runs (the first harness, commit `c85534ae`)
+
+- Seed 3130258 (600 iterations; close times sampled at up to 100 ms in the
+  recovery loop; its check (c) was "no total disconnect at all"): it ended
+  with 15 violations and exit code 1. All 15 were total disconnects in
+  `coincide` (0 in `none` and `window`), that is, this run reproduced the
+  total-loss exception that F4 permits, under the old assertion. (a), (b) and
+  (d) held.
+- Seed 3130259 (600 iterations; 1 ms watcher; check (c) as above, but the
+  loss window then had a 100 ms slack at each end): all checks passed. Its 26
+  recorded losses also satisfy the strict window above (1.19 to 21.55 ms after
+  A's claim, 1.36 to 20.82 ms before B saw L close).
+- Seed 3130260 (90 iterations of the committed first harness): all checks
+  passed.
+- During the harness fix, seeds 3130261 (1 ms) and 3130262 (100 ms) ran with
+  the strict window but with a check (c) that did not yet allow for the
+  watcher resolution. The 1 ms run passed. The 100 ms run reported its 11
+  `coincide` total disconnects as outside the 5 ms coincidence: their
+  measured gaps (52 to 60 ms) were the 100 ms watcher resolution, and their d
+  values were in the same band. The check now adds one watcher interval;
+  seeds 3130263 and 3130264 are the runs of the final harness.
+
+#### What this shows, and its scope
+
+For the sampled two-connection schedule (one old follower process with
+connections L and W to one new arbiter, in one process on loopback), the
+total loss that F4 describes is real and is the only total loss seen. It
+needs B's own 5 s timer to close W within about 2.6 ms of A completing L (A's
+claim plus its drain, about 21 ms); a timer that fires between A's claim and
+its completion makes A abort and keep L. In the other iterations at least one
+connection survived. Every loss was inside the F4 window (messages that B sent
+on L after A's claim and before it saw L close), and the pair recovered when
+one end dialled again. F4 also needs B to finalize L at least about 22 s after
+the handshake completed, a stalled old peer; the harness forces that stall.
+These runs do not cover three or more candidate connections with an old peer,
+separate processes, real networks, or other send rates, so "at most one lost
+message per iteration" is a result of this workload, not a bound.
