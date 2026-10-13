@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.59] - 2026-10-13
+
+### Fixed
+
+- **Tighter buffer accounting in the QUIC connection state.** The stream
+  reassembly buffer checks its chunk count after every insert and compacts
+  before it rejects a stream; it rejects a stream only when compaction cannot
+  bring the count under 1024 chunks, and small contiguous frames are merged.
+  Internal range bookkeeping is corrected. The datagram receive and
+  send queues count a fixed per-datagram overhead, so a datagram buffer can
+  hold a little less payload than its configured size; a datagram that cannot
+  fit the send buffer with that overhead returns `SendDatagramError::TooLarge`.
+  Connection-ID retirement applies its queue bound on every NEW_CONNECTION_ID
+  path. The ACK-frequency delay calculation uses explicit bounds.
+- **The P2P reader holds its stream budget permit for the whole read task.**
+  At most `READER_STREAM_BUDGET` (64) uni read tasks run per connection. When
+  all permits are taken, the accept loop of that connection waits until one
+  returns.
+
+### Dependencies
+
+- `Cargo.lock`: the lockfile-only quinn-proto entry moves to 0.11.18. It is
+  never compiled.
+- `deny.toml`: ignore the unsafe-libyaml unmaintained notice. Only operator
+  binaries and one integration test use `serde_yaml`.
+
 ## [0.27.58] - 2026-10-13
 
 ### Changed
