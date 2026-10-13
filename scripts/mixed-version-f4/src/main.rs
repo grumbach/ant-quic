@@ -33,9 +33,10 @@
 //!     watcher interval). Any other loss is a violation;
 //! (b) delivery resumes within RECOVERY_BOUND;
 //! (c) whether the pair was ever left with no connection (total disconnect),
-//!     and that every total disconnect is the F4 coincidence (B's own timer
-//!     closed W within F4_COINCIDENCE of A completing L, plus one close-watcher
-//!     interval for the measurement resolution);
+//!     and that every total disconnect is the F4 coincidence: B's own timer
+//!     closed W within F4_COINCIDENCE of A completing L. The watcher observes
+//!     a close late only, so the measured gap may exceed F4_COINCIDENCE by one
+//!     close-watcher interval on the late side, and not on the early side;
 //! (d) at the end both directions deliver, and both ends have the same number
 //!     of open connections.
 //!
@@ -75,8 +76,8 @@ const CLAIM_SLACK: Duration = Duration::from_millis(1);
 const SEND_SLACK: Duration = Duration::from_millis(1);
 const SEND_INTERVAL: Duration = Duration::from_millis(250);
 /// ADR-017 F4: a total loss needs B's own timer to close W within about one
-/// round trip of A's retirement of L. Loopback, with scheduling: 5 ms. The
-/// check adds one close-watcher interval, the resolution of the measured gap.
+/// round trip of A's retirement of L. Loopback, with scheduling: 5 ms. See
+/// `total_disconnect_is_f4_coincidence` for the one-sided measurement slack.
 const F4_COINCIDENCE: Duration = Duration::from_millis(5);
 
 // ---------------------------------------------------------------- tracing
@@ -309,8 +310,21 @@ enum LossRoute {
     Other,
 }
 
-/// Negative and positive controls for the window predicate and for the
-/// completeness rule. The gate does not run if one of them fails.
+/// Check (c): a total disconnect is the F4 coincidence when B's own close of W
+/// happened within F4_COINCIDENCE of A completing L. `gap_us` is the measured
+/// gap (B's observed close of W minus A's completion of L). The watcher only
+/// ever observes a close late, by at most one `close_poll`, so the measured
+/// gap can exceed the true gap by up to `close_poll` and is never smaller.
+/// The allowance is therefore one-sided:
+/// `-F4_COINCIDENCE <= gap <= F4_COINCIDENCE + close_poll`.
+fn total_disconnect_is_f4_coincidence(gap_us: Option<i128>, close_poll: Duration) -> bool {
+    let lower = -(F4_COINCIDENCE.as_micros() as i128);
+    let upper = (F4_COINCIDENCE + close_poll).as_micros() as i128;
+    gap_us.is_some_and(|gap| gap >= lower && gap <= upper)
+}
+
+/// Negative and positive controls for the window predicate, for check (c)
+/// and for the completeness rule. The gate does not run if one of them fails.
 fn self_test() -> Result<(), String> {
     let ms = Duration::from_millis;
     let poll = ms(1);
@@ -358,6 +372,67 @@ fn self_test() -> Result<(), String> {
     }
     if loss_in_f4_window(ms(30_010), LossRoute::L, None, l_close, w_close, poll) {
         return Err("window control: a loss with no claim must be outside".into());
+    }
+    // Check (c): the late-observation allowance applies above only.
+    let coincidence_cases: [(&str, Option<i128>, u64, bool); 10] = [
+        (
+            "100 ms watcher, W closed 50 ms before L completed",
+            Some(-50_000),
+            100,
+            false,
+        ),
+        (
+            "1 ms watcher, W closed 5.5 ms before L completed",
+            Some(-5_500),
+            1,
+            false,
+        ),
+        (
+            "1 ms watcher, W closed 4 ms before L completed",
+            Some(-4_000),
+            1,
+            true,
+        ),
+        (
+            "100 ms watcher, W closed 5 ms before L completed",
+            Some(-5_000),
+            100,
+            true,
+        ),
+        (
+            "1 ms watcher, W seen 5.9 ms after L completed",
+            Some(5_900),
+            1,
+            true,
+        ),
+        (
+            "1 ms watcher, W seen 6.5 ms after L completed",
+            Some(6_500),
+            1,
+            false,
+        ),
+        (
+            "100 ms watcher, W seen 104 ms after L completed",
+            Some(104_000),
+            100,
+            true,
+        ),
+        (
+            "100 ms watcher, W seen 106 ms after L completed",
+            Some(106_000),
+            100,
+            false,
+        ),
+        ("no measured gap", None, 1, false),
+        ("gap 0", Some(0), 1, true),
+    ];
+    for (name, gap, poll_ms, expected) in coincidence_cases {
+        let got = total_disconnect_is_f4_coincidence(gap, ms(poll_ms));
+        if got != expected {
+            return Err(format!(
+                "check (c) control '{name}': got {got}, expected {expected}"
+            ));
+        }
     }
     let complete = |requested: usize, completed: usize, failed: usize| {
         requested > 0 && completed == requested && failed == 0
@@ -975,10 +1050,7 @@ async fn main() {
                 o.recovery.map(|r| r.as_micros()),
                 o.redials
             ));
-            // B's close of W is seen up to one watcher interval late, so the
-            // measured gap can exceed the true gap by up to `close_poll`.
-            let allowed = (F4_COINCIDENCE + close_poll).as_micros() as i128;
-            if gap_us.is_none_or(|gap| gap.abs() > allowed) {
+            if !total_disconnect_is_f4_coincidence(gap_us, close_poll) {
                 violations.push(format!(
                     "iter {} (c): total disconnect outside the F4 coincidence (gap {gap_us:?} us)",
                     p.index

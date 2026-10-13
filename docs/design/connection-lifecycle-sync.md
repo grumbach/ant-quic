@@ -396,8 +396,10 @@ come from its tracing events. Checks:
   processes it). Any other loss is a violation;
 - (b) delivery resumes within 15 s;
 - (c) every total disconnect is the F4 coincidence: B's timer closed W within
-  5 ms of A completing L, plus one watcher interval (the resolution of the
-  measured gap);
+  5 ms of A completing L. The measured gap (B's observed close of W minus A's
+  completion of L) must be in [−5 ms, 5 ms + one watcher interval]: the
+  watcher only ever observes a close late, so the allowance for its
+  resolution applies on the late side only;
 - (d) at the end both directions deliver, and both ends have the same number
   of open connections.
 
@@ -405,16 +407,24 @@ The run passes only if every requested iteration completed (a setup error,
 a failed iteration task, an empty run or a zero concurrency fails it). Before
 each run, a self test checks the window predicate with losses just outside
 each boundary (2 ms and 50 ms before the claim, 2 ms and 50 ms after B saw L
-close, 50 ms before B's close of W) and the completeness rule. A control run
+close, 50 ms before B's close of W), check (c) on both sides of its band
+(for example a W close 50 ms before L's completion with a 100 ms watcher, or
+5.5 ms before with a 1 ms watcher, must be rejected), and the completeness
+rule. A control run
 with one injected task failure (`F4_INJECT_TASK_PANIC`) fails, and an empty
 run fails.
 
-#### Results of the final harness (library code of `9ae09493`)
+#### Results (library code of `9ae09493`)
 
-| Run | Seed | Watcher | Result |
-|---|---|---|---|
-| definitive | 3130263 | 1 ms | 600 of 600 iterations; ALL CHECKS PASS |
-| coarse | 3130264 | 100 ms | 600 of 600 iterations; ALL CHECKS PASS |
+These two runs used the harness with the strict loss window and the
+completeness rule, and a two-sided check (c). Their recorded total
+disconnects were re-evaluated with the one-sided check (c) of the final
+harness; all are inside its band.
+
+| Run | Seed | Watcher | Result | One-sided (c) |
+|---|---|---|---|---|
+| definitive | 3130263 | 1 ms | 600 of 600 iterations; ALL CHECKS PASS | 11 of 11 inside [−5 ms, +6 ms] |
+| coarse | 3130264 | 100 ms | 600 of 600 iterations; ALL CHECKS PASS | 11 of 11 inside [−5 ms, +105 ms] |
 
 Outcomes, definitive run:
 
@@ -445,9 +455,12 @@ Outcomes, definitive run:
   (about 12 ms, because A's completion time also varies from iteration to
   iteration). The measured gap between B's close of W and A's completion of L
   spans −18 us to +2.56 ms. Coarse run: 10 of 200 in `coincide`, and 1 of 200
-  in `none`, a random draw at d = 25.0140 s, inside the same band; their
-  measured gaps (54 to 66 ms) carry the 100 ms watcher resolution. Every total
-  disconnect recovered with one dial by B's application, in 0.9 ms to 103 ms.
+  in `none`, a random draw at d = 25.0140 s, inside the same d band; their
+  measured gaps, +54.34 to +66.29 ms, are inside that run's one-sided band
+  [−5 ms, +105 ms]. They are late-side observations with the 100 ms watcher
+  resolution, so that run does not establish the 2.56 ms figure by itself.
+  Every total disconnect recovered with one dial by B's application: in 0.9
+  ms to 103 ms (definitive run) and 0.9 ms to 2.5 ms (coarse run).
 - (d) In all 1200 iterations both directions delivered at the end, and both
   ends had one open connection.
 
@@ -470,8 +483,12 @@ Outcomes, definitive run:
   watcher resolution. The 1 ms run passed. The 100 ms run reported its 11
   `coincide` total disconnects as outside the 5 ms coincidence: their
   measured gaps (52 to 60 ms) were the 100 ms watcher resolution, and their d
-  values were in the same band. The check now adds one watcher interval;
-  seeds 3130263 and 3130264 are the runs of the final harness.
+  values were in the same band. The check then added one watcher interval to
+  both sides of the band; it now adds it on the late side only (a watcher
+  cannot observe a close early). Seeds 3130263 and 3130264 ran with the
+  two-sided version; re-evaluated with the one-sided band, all their total
+  disconnects are inside it (as are those of seeds 3130259, 3130261 and
+  3130262), so their verdicts do not change.
 
 #### What this shows, and its scope
 
