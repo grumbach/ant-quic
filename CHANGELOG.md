@@ -147,13 +147,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the released 0.27.57 as an old follower against this tree as the arbiter,
   with production timing, and reproduces the F4 schedule (the follower
   finalizes its older connection late) over 600 randomised iterations per
-  run. In the definitive run (and a 100 ms-resolution repeat) every loss was
-  inside the F4 window, delivery resumed, and a total disconnect occurred only
-  in the F4 coincidence (the follower's own timer within about 2.6 ms of the
-  arbiter completing its retirement): 11 of 200 aimed iterations, 0 of 400
-  others. The pair then recovered with one dial. The harness fails on any
-  loss outside the window, any failed or missing iteration, and an empty run.
-  Results and scope: `docs/design/connection-lifecycle-sync.md`.
+  run. Definitive run (seed 3130263, 1 ms close timing): every loss was
+  inside the F4 window, delivery resumed, and every total disconnect was the
+  F4 coincidence (the follower's own timer closed its newer connection from
+  18 us before to 2.56 ms after the arbiter completed its retirement): 11 of
+  200 aimed iterations, 0 of 400 others. Repeat with 100 ms close timing
+  (seed 3130264): every loss was inside the F4 window, and there were 10 total
+  disconnects in 200 aimed iterations plus 1 in 200 random ones (at a late
+  finalize of 25.0140 s, inside the same band); their measured gaps, +54 to
+  +66 ms, carry the 100 ms observation resolution. Every total disconnect
+  recovered with one dial. The harness fails on any loss outside the window,
+  any total disconnect outside the one-sided coincidence band, any failed or
+  missing iteration, and an empty run. Results and scope:
+  `docs/design/connection-lifecycle-sync.md`.
 - **Direct-stage budget regressions for PeerId dials (#304).** A loopback UDP
   gate holds the dialer's datagrams for 3 s, counted from the first datagram
   of the tested attempt, so the handshake cannot finish before the adaptive
