@@ -1939,6 +1939,12 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path.reset(now, &self.config);
+        // Resetting the path returns MTU discovery to the initial MTU, which can
+        // shrink the usable datagram size; drop any queued datagram that no
+        // longer fits so it cannot wedge the outgoing lane.
+        if let Some(max_datagram_size) = self.datagrams().max_size() {
+            drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+        }
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -2345,9 +2351,11 @@ impl Connection {
                     .congestion
                     .on_mtu_update(self.path.mtud.current_mtu());
                 if let Some(max_datagram_size) = self.datagrams().max_size() {
-                    if self.datagrams.drop_oversized(max_datagram_size) {
-                        self.events.push_back(Event::DatagramsUnblocked);
-                    }
+                    drop_oversized_datagrams(
+                        &mut self.datagrams,
+                        &mut self.events,
+                        max_datagram_size,
+                    );
                 }
             }
 
@@ -3831,6 +3839,14 @@ impl Connection {
             // We haven't updated the remote CID yet, this captures the remote CID we were using on
             // the previous path.
             self.prev_path = Some((self.rem_cids.active(), prev));
+        }
+
+        // A real address change builds a fresh path whose MTU discovery starts
+        // at the initial MTU, which can shrink the usable datagram size below a
+        // datagram queued for the old path; drop any that no longer fit so the
+        // outgoing lane cannot wedge behind them.
+        if let Some(max_datagram_size) = self.datagrams().max_size() {
+            drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
         }
 
         self.timers.set(
@@ -6242,6 +6258,21 @@ impl SideArgs {
             Self::Client { .. } => Side::Client,
             Self::Server { .. } => Side::Server,
         }
+    }
+}
+
+/// Drop queued outgoing datagrams that no longer fit `max_payload`, and emit
+/// [`Event::DatagramsUnblocked`] if that frees a previously blocked send.
+///
+/// Shared by every site that can shrink the usable datagram size: the MTU
+/// black-hole handler, `migrate`, and `path_changed`.
+fn drop_oversized_datagrams(
+    datagrams: &mut DatagramState,
+    events: &mut VecDeque<Event>,
+    max_payload: usize,
+) {
+    if datagrams.drop_oversized(max_payload) {
+        events.push_back(Event::DatagramsUnblocked);
     }
 }
 
