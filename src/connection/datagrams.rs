@@ -215,11 +215,18 @@ impl DatagramState {
     /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
     ///
     /// Used to ensure that reductions in MTU don't get us stuck in a state where we have a datagram
-    /// queued but can't send it.
-    pub(super) fn drop_oversized(&mut self, max_payload: usize) {
+    /// queued but can't send it. A datagram whose payload is exactly `max_payload` still fits and
+    /// is kept.
+    ///
+    /// Returns `true` if datagrams were dropped while a send was blocked, i.e. the caller should
+    /// emit [`Event::DatagramsUnblocked`]: dropping frees send-buffer space, but `poll_transmit`
+    /// only emits that event after a successful send, so otherwise a sender waiting on the event
+    /// after the queue was emptied would never be told it may retry.
+    pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
+        let before = self.outgoing.queue.len();
         self.outgoing.queue.retain(|datagram| {
-            let result = datagram.data.len() < max_payload;
-            if !result {
+            let keep = datagram.data.len() <= max_payload;
+            if !keep {
                 trace!(
                     "dropping {} byte datagram violating {} byte limit",
                     datagram.data.len(),
@@ -227,8 +234,15 @@ impl DatagramState {
                 );
                 self.outgoing.payload_bytes -= datagram.data.len();
             }
-            result
+            keep
         });
+        let dropped = before != self.outgoing.queue.len();
+        if dropped && self.send_blocked {
+            self.send_blocked = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
