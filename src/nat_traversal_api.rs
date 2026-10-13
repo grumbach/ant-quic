@@ -17492,6 +17492,7 @@ mod tests {
     /// that says Closed (for example, claimed while its transport close is
     /// still pending) is not resurrected by a re-registration of that handle:
     /// the re-registration is refused, and nothing is closed by it.
+    #[cfg(feature = "network-discovery")]
     #[tokio::test]
     async fn receive_generation_reused_stable_id_uses_new_registration() {
         let (_server, client, connection) = loopback_quic_connection().await;
@@ -17892,6 +17893,7 @@ mod tests {
     /// advances to `Closing { Superseded }` under the lifecycle lock and the
     /// underlying connection is closed with the reserved `Superseded`
     /// application error code.
+    #[cfg(feature = "network-discovery")]
     #[tokio::test]
     async fn close_superseded_claims_and_closes_still_superseded_generation() {
         let (_server, client, conn) = loopback_quic_connection().await;
@@ -17959,6 +17961,7 @@ mod tests {
     /// the atomic claim protects against — is left untouched: the call
     /// returns `false`, the entry stays `Live`, and the connection is NOT
     /// closed.
+    #[cfg(feature = "network-discovery")]
     #[tokio::test]
     async fn close_superseded_leaves_promoted_live_generation_open() {
         let (_server, client, conn) = loopback_quic_connection().await;
