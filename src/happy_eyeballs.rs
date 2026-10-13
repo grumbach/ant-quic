@@ -20,7 +20,8 @@
 //! 3. After a configurable delay (default 250ms), if no connection has succeeded, the next
 //!    attempt starts in parallel
 //! 4. On any failure, the next attempt starts immediately without waiting for the delay
-//! 5. The first successful connection wins; all other pending attempts are cancelled
+//! 5. The first successful connection wins; all other pending attempts are aborted
+//!    before the winner is returned (see `race_connect` for the exact guarantee)
 //!
 //! # Example
 //!
@@ -40,12 +41,15 @@
 //! }).await?;
 //! ```
 
+use std::any::Any;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 /// Which address family to prefer when interleaving connection attempts.
@@ -221,24 +225,44 @@ pub fn sort_addresses(addresses: &[SocketAddr], config: &HappyEyeballsConfig) ->
     result
 }
 
-/// Message sent from a spawned connection attempt back to the coordinator.
-enum AttemptResult<C> {
-    /// Connection succeeded with the connection value and the address used.
-    Success(C, SocketAddr),
-    /// Connection failed with the address and error description.
-    Failure(SocketAddr, String),
+/// What one spawned attempt returns: the address it dialled and its result.
+type AttemptOutcome<C> = (SocketAddr, Result<C, AttemptFailure>);
+
+/// The payload of a caught panic. Its destructor is arbitrary code, so the
+/// coordinator never drops one; the race hands it to the cleanup task (#294).
+type PanicPayload = Box<dyn Any + Send>;
+
+/// Why one attempt failed.
+struct AttemptFailure {
+    /// The error text that `AllAttemptsFailed` reports.
+    message: String,
+    /// The payload when the attempt (or the formatting of its error)
+    /// panicked. It is kept as a value so that it is not dropped in the
+    /// attempt task or on the coordinator.
+    panic_payload: Option<PanicPayload>,
 }
 
-/// Spawn a single connection attempt as a tokio task.
+/// Longest time the winner waits for the aborted losers to end.
 ///
-/// The task sends its result (success or failure) through the provided channel sender.
+/// A loser that yields normally ends soon after it is aborted, so the wait is
+/// normally short; scheduling does not guarantee it. A loser in a non-yielding
+/// section (blocking code) cannot be stopped from outside. This bound keeps
+/// such a loser from holding a ready winner; what is left after the bound goes
+/// to a detached cleanup task (#294).
+const LOSER_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
+
+/// Spawn a single connection attempt into the race's [`JoinSet`].
+///
+/// The set owns the task: dropping or shutting down the set stops the
+/// attempt. A panic in the attempt future, or in the formatting of its error,
+/// becomes a failed attempt, so the coordinator always gets one outcome per
+/// attempt. The panic payload is returned, not dropped.
 fn spawn_attempt<F, Fut, C, E>(
+    attempts: &mut JoinSet<AttemptOutcome<C>>,
     addr: SocketAddr,
     attempt_num: usize,
     connect_fn: &F,
-    tx: &tokio::sync::mpsc::UnboundedSender<AttemptResult<C>>,
-) -> JoinHandle<()>
-where
+) where
     F: Fn(SocketAddr) -> Fut,
     Fut: Future<Output = Result<C, E>> + Send + 'static,
     C: Send + 'static,
@@ -246,18 +270,75 @@ where
 {
     debug!(addr = %addr, attempt = attempt_num, "Starting connection attempt");
     let fut = connect_fn(addr);
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        match fut.await {
-            Ok(conn) => {
-                // Ignore send errors - receiver may have been dropped if another attempt won
-                let _ = tx_clone.send(AttemptResult::Success(conn, addr));
-            }
-            Err(e) => {
-                let _ = tx_clone.send(AttemptResult::Failure(addr, e.to_string()));
+    attempts.spawn(async move {
+        // Format the error inside the catch: a panicking `Display` is a failed
+        // attempt too.
+        let attempt = async move { fut.await.map_err(|e| e.to_string()) };
+        let outcome = match AssertUnwindSafe(attempt).catch_unwind().await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(message)) => Err(AttemptFailure {
+                message,
+                panic_payload: None,
+            }),
+            Err(payload) => Err(AttemptFailure {
+                message: "connection attempt panicked".to_string(),
+                panic_payload: Some(payload),
+            }),
+        };
+        (addr, outcome)
+    });
+}
+
+/// Keep the parts of a join result that have an arbitrary destructor, and
+/// drop the rest here.
+///
+/// A connected loser's value goes to `loser_values` and a panic payload goes
+/// to `panic_payloads`. What is dropped here has a trivial destructor: an
+/// error `String`, or a join error for a cancelled task (it carries no
+/// payload).
+fn keep_leftovers<C>(
+    joined: Result<AttemptOutcome<C>, tokio::task::JoinError>,
+    loser_values: &mut Vec<C>,
+    panic_payloads: &mut Vec<PanicPayload>,
+) {
+    match joined {
+        Ok((_, Ok(value))) => loser_values.push(value),
+        Ok((_, Err(failure))) => panic_payloads.extend(failure.panic_payload),
+        Err(join_error) => {
+            if let Ok(payload) = join_error.try_into_panic() {
+                panic_payloads.push(payload);
             }
         }
-    })
+    }
+}
+
+/// Hand what is left of a race to a detached cleanup task, so that the
+/// coordinator never drops a loser's value or a panic payload (#294).
+///
+/// The task drops the values that losers already returned (losers that also
+/// connected) and the panic payloads, then joins and drops the aborted losers
+/// that have not ended yet. It ends when the last loser ends. When nothing is
+/// left, no task is spawned.
+fn release_losers<C: Send + 'static>(
+    mut attempts: JoinSet<AttemptOutcome<C>>,
+    loser_values: Vec<C>,
+    panic_payloads: Vec<PanicPayload>,
+) {
+    if attempts.is_empty() && loser_values.is_empty() && panic_payloads.is_empty() {
+        return;
+    }
+    debug!(
+        still_running = attempts.len(),
+        connected_losers = loser_values.len(),
+        panic_payloads = panic_payloads.len(),
+        "Happy Eyeballs: a cleanup task releases the losing attempts"
+    );
+    tokio::spawn(async move {
+        drop(loser_values);
+        drop(panic_payloads);
+        // This task is the place where leftovers are dropped.
+        while attempts.join_next().await.is_some() {}
+    });
 }
 
 /// Race multiple connection attempts using the RFC 8305 Happy Eyeballs algorithm.
@@ -296,6 +377,46 @@ where
 /// 5. If the attempt failed, start the next attempt immediately
 /// 6. If the delay elapsed, start the next attempt in parallel
 /// 7. Repeat until one succeeds or all fail
+///
+/// # Cancellation
+///
+/// One [`JoinSet`] owns every spawned attempt (#294).
+/// - When an attempt wins, every other attempt is aborted before the winner
+///   is returned. The race then waits at most 50 ms for the aborted attempts
+///   to end. The race never drops a loser's value or a panic payload on the
+///   coordinator: the value of a loser that also connected, every panic
+///   payload (from an attempt, from the formatting of its error, or from a
+///   destructor that panicked when an aborted attempt was dropped) and any
+///   loser that has not ended yet go to a detached cleanup task. That task
+///   drops them and ends when the last loser ends. So neither a blocking poll
+///   nor a blocking destructor of a loser can hold the winner for more than
+///   the bound. Of the attempt outcomes, the coordinator itself drops only
+///   error strings and cancellation results, which have trivial destructors.
+/// - The race owns `connect_fn` (it takes `F` by value). It drops the
+///   callback, with everything that the callback captures, when
+///   `race_connect` returns or when its future is dropped. That drop runs on
+///   the caller's task, on the return path. `F` has no `Send + 'static`
+///   bound, so the race cannot move this drop to another task. A caller must
+///   therefore not let `connect_fn` capture anything whose drop blocks, or
+///   must keep the last reference to such a value elsewhere (for example,
+///   capture an `Arc` clone and keep another clone outside the race).
+/// - When the caller drops the returned future (for example an outer
+///   timeout), the set is dropped and every attempt is aborted. Results that
+///   are already complete are dropped in that drop, on the caller's thread.
+/// - An attempt that panics counts as a failed attempt; it does not stall the
+///   race. Its payload goes to the cleanup task when the race ends.
+///
+/// Assumptions. Tokio cancellation is cooperative: an aborted attempt ends at
+/// its next poll (its next `.await`), and the runtime then drops its future.
+/// A normal async dial ends within the bound, but scheduling does not
+/// guarantee it. An attempt in a non-yielding section, or a value with a
+/// blocking destructor, keeps what it holds until that code ends; the race
+/// cannot release it sooner. On a current-thread runtime the runtime drops
+/// aborted attempts on the same thread, so blocking code there blocks the
+/// whole runtime. An error value of `connect_fn` is formatted and dropped in
+/// its own attempt task. `connect_fn` must therefore not hold resources that
+/// the winner needs across blocking code, and its values and its captures
+/// should drop without blocking.
 pub async fn race_connect<F, Fut, C, E>(
     addresses: &[SocketAddr],
     config: &HappyEyeballsConfig,
@@ -318,126 +439,97 @@ where
         "Starting Happy Eyeballs connection racing"
     );
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AttemptResult<C>>();
-    let mut attempts = AttemptTasks::with_capacity(sorted.len());
+    let mut attempts: JoinSet<AttemptOutcome<C>> = JoinSet::new();
     let mut errors: Vec<(SocketAddr, String)> = Vec::new();
-    let mut next_index: usize = 0;
-    let total = sorted.len();
-    let mut in_flight: usize = 0;
+    // Payloads of attempts that panicked before the race ended. They go to
+    // the cleanup task at the end; the coordinator never drops them.
+    let mut panic_payloads: Vec<PanicPayload> = Vec::new();
+    let mut pending = sorted.iter().copied().enumerate().peekable();
 
     // Spawn the first attempt immediately
-    attempts.push(spawn_attempt(
-        sorted[next_index],
-        next_index + 1,
-        &connect_fn,
-        &tx,
-    ));
-    next_index += 1;
-    in_flight += 1;
+    if let Some((index, addr)) = pending.next() {
+        spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
+    }
 
     // Main event loop
     loop {
-        if next_index < total {
-            // We have more addresses to try. Race between delay timer and results.
+        let joined = if pending.peek().is_some() {
+            // More addresses to try: race the next result against the delay timer.
             tokio::select! {
                 biased;
 
                 // Prefer checking results over starting new attempts
-                result = rx.recv() => {
-                    match result {
-                        Some(AttemptResult::Success(conn, addr)) => {
-                            info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                            return Ok((conn, addr));
-                        }
-                        Some(AttemptResult::Failure(addr, err)) => {
-                            warn!(addr = %addr, error = %err, "Connection attempt failed");
-                            errors.push((addr, err));
-                            in_flight -= 1;
-
-                            // On failure, start next attempt immediately (RFC 8305 Section 5)
-                            if next_index < total {
-                                attempts.push(spawn_attempt(
-                                    sorted[next_index],
-                                    next_index + 1,
-                                    &connect_fn,
-                                    &tx,
-                                ));
-                                next_index += 1;
-                                in_flight += 1;
-                            }
-                        }
-                        None => {
-                            // Channel closed unexpectedly
-                            break;
-                        }
-                    }
-                }
+                joined = attempts.join_next() => joined,
 
                 // Timer fires: start next attempt in parallel
-                _ = tokio::time::sleep(config.connection_attempt_delay) => {
-                    if next_index < total {
+                () = tokio::time::sleep(config.connection_attempt_delay) => {
+                    if let Some((index, addr)) = pending.next() {
                         debug!(
-                            addr = %sorted[next_index],
-                            attempt = next_index + 1,
+                            addr = %addr,
+                            attempt = index + 1,
                             "Starting parallel attempt after delay"
                         );
-                        attempts.push(spawn_attempt(
-                            sorted[next_index],
-                            next_index + 1,
-                            &connect_fn,
-                            &tx,
-                        ));
-                        next_index += 1;
-                        in_flight += 1;
+                        spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
                     }
+                    continue;
                 }
             }
         } else {
-            // No more addresses to try - wait for all pending results
-            if in_flight == 0 {
-                break;
-            }
+            // No more addresses to try - wait for the attempts in flight
+            attempts.join_next().await
+        };
 
-            match rx.recv().await {
-                Some(AttemptResult::Success(conn, addr)) => {
-                    info!(addr = %addr, "Happy Eyeballs: connection succeeded");
-                    return Ok((conn, addr));
+        match joined {
+            Some(Ok((addr, Ok(conn)))) => {
+                info!(addr = %addr, "Happy Eyeballs: connection succeeded");
+                // Abort every losing attempt, then give the aborted attempts a
+                // bounded time to end. A loser that also connected returns a
+                // value; move it out, never drop it here: its destructor can
+                // block, and a timeout cannot interrupt a synchronous drop.
+                // The same applies to a panic payload.
+                attempts.abort_all();
+                let mut loser_values = Vec::new();
+                let _ = tokio::time::timeout(LOSER_SHUTDOWN_GRACE, async {
+                    while let Some(joined) = attempts.join_next().await {
+                        keep_leftovers(joined, &mut loser_values, &mut panic_payloads);
+                    }
+                })
+                .await;
+                release_losers(attempts, loser_values, panic_payloads);
+                return Ok((conn, addr));
+            }
+            Some(Ok((addr, Err(failure)))) => {
+                warn!(addr = %addr, error = %failure.message, "Connection attempt failed");
+                panic_payloads.extend(failure.panic_payload);
+                errors.push((addr, failure.message));
+            }
+            Some(Err(join_error)) => {
+                // Panics in an attempt are caught inside it, so this arm sees
+                // an external cancellation (runtime shutdown), or a panic in a
+                // destructor while the runtime dropped the task.
+                warn!(error = %join_error, "Connection attempt ended without a result");
+                if let Ok(payload) = join_error.try_into_panic() {
+                    panic_payloads.push(payload);
                 }
-                Some(AttemptResult::Failure(addr, err)) => {
-                    warn!(addr = %addr, error = %err, "Connection attempt failed");
-                    errors.push((addr, err));
-                    in_flight -= 1;
-                }
-                None => {
-                    // Channel closed
+            }
+            None => {
+                // No attempt in flight.
+                if pending.peek().is_none() {
                     break;
                 }
             }
         }
-    }
 
-    Err(HappyEyeballsError::AllAttemptsFailed { errors })
-}
-
-/// Owns every attempt so cancellation of the race also cancels its child tasks.
-struct AttemptTasks(Vec<JoinHandle<()>>);
-
-impl AttemptTasks {
-    fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
-    }
-
-    fn push(&mut self, handle: JoinHandle<()>) {
-        self.0.push(handle);
-    }
-}
-
-impl Drop for AttemptTasks {
-    fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.abort();
+        // An attempt ended without a winner: start the next attempt
+        // immediately (RFC 8305 Section 5).
+        if let Some((index, addr)) = pending.next() {
+            spawn_attempt(&mut attempts, addr, index + 1, &connect_fn);
         }
     }
+
+    // Every attempt has ended; only panic payloads can be left.
+    release_losers(attempts, Vec::new(), panic_payloads);
+    Err(HappyEyeballsError::AllAttemptsFailed { errors })
 }
 
 #[cfg(test)]
@@ -903,6 +995,447 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// #294: when a winner is found, a losing attempt that yields must
+    /// already be stopped when `race_connect` returns. An abort that is only
+    /// scheduled leaves the losing dial running (and holding its resources)
+    /// after the caller has the winner. The winner itself must not be dropped.
+    /// (A loser that does not yield is covered by
+    /// `blocking_loser_does_not_hold_ready_winner`.)
+    ///
+    /// Deterministic: explicit gates on the current-thread runtime. The
+    /// winning attempt waits until the losing dial has entered, and the check
+    /// runs with no yield after the race returns, so a loser that is only
+    /// scheduled for cancellation is still alive at the check.
+    #[tokio::test]
+    async fn winner_return_stops_losing_attempts_before_handoff() {
+        let loser_entered = Arc::new(tokio::sync::Notify::new());
+        let loser_dropped = Arc::new(AtomicUsize::new(0));
+        let winner_dropped = Arc::new(AtomicUsize::new(0));
+        let loser_entered_for_attempt = Arc::clone(&loser_entered);
+        let loser_dropped_for_attempt = Arc::clone(&loser_dropped);
+        let winner_dropped_for_attempt = Arc::clone(&winner_dropped);
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        let race = race_connect(&addrs, &config, move |addr| {
+            let loser_entered = Arc::clone(&loser_entered_for_attempt);
+            let loser_dropped = Arc::clone(&loser_dropped_for_attempt);
+            let winner_dropped = Arc::clone(&winner_dropped_for_attempt);
+            async move {
+                if addr == v6("[::1]:80") {
+                    let _witness = DropWitness {
+                        count: loser_dropped,
+                        dropped: Arc::new(tokio::sync::Notify::new()),
+                    };
+                    loser_entered.notify_one();
+                    std::future::pending::<Result<DropWitness, String>>().await
+                } else {
+                    // Gate: win only after the losing dial is in flight.
+                    loser_entered.notified().await;
+                    Ok(DropWitness {
+                        count: winner_dropped,
+                        dropped: Arc::new(tokio::sync::Notify::new()),
+                    })
+                }
+            }
+        });
+        let (winner, addr) = tokio::time::timeout(Duration::from_secs(5), race)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(addr, v4("10.0.0.1:80"));
+        assert_eq!(
+            loser_dropped.load(Ordering::SeqCst),
+            1,
+            "the losing attempt must be stopped before the winner is returned"
+        );
+        assert_eq!(
+            winner_dropped.load(Ordering::SeqCst),
+            0,
+            "stopping the losers must not drop the winning connection"
+        );
+        drop(winner);
+        assert_eq!(winner_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// #294: an attempt task that panics must count as a failed attempt.
+    /// Before the fix the coordinator kept its own channel sender, so it
+    /// waited for a result that never came and the race hung until an outer
+    /// timeout cancelled it.
+    ///
+    /// Deterministic in outcome: the race uses no timer (one address), so a
+    /// correct race ends on the attempt's first poll and a broken race never
+    /// ends. The guard only bounds how long the failure takes to report.
+    #[tokio::test]
+    async fn panicking_attempt_is_a_failed_attempt_not_a_hang() {
+        let addrs = vec![v6("[::1]:80")];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            race_connect(&addrs, &HappyEyeballsConfig::default(), |addr| async move {
+                if addr.is_ipv6() {
+                    // `resume_unwind` skips the panic hook, so the test log stays clean.
+                    std::panic::resume_unwind(Box::new("injected attempt panic"));
+                }
+                Ok::<String, String>(format!("connected to {addr}"))
+            }),
+        )
+        .await;
+
+        match outcome {
+            Ok(Err(HappyEyeballsError::AllAttemptsFailed { errors })) => {
+                assert_eq!(errors.len(), 1, "one failed attempt expected: {errors:?}");
+                assert_eq!(errors[0].0, v6("[::1]:80"));
+                assert!(
+                    errors[0].1.contains("panicked"),
+                    "failure must name the panic: {}",
+                    errors[0].1
+                );
+            }
+            Ok(other) => panic!("expected AllAttemptsFailed, got: {other:?}"),
+            Err(_) => panic!("race hung after its only attempt panicked"),
+        }
+    }
+
+    /// #294 round 2: a losing attempt that blocks in a non-yielding section
+    /// (here `block_in_place`) cannot be stopped from outside, because tokio
+    /// cancellation is cooperative. The race must still hand over a ready
+    /// winner after a bounded wait. It must not wait until the blocked loser
+    /// ends.
+    ///
+    /// Deterministic in outcome: the gate keeps the loser blocked until the
+    /// test releases it, so a race that waits for the loser cannot return
+    /// before the release. A race with a bounded wait returns long before the
+    /// 5 s guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_loser_does_not_hold_ready_winner() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let mut race = tokio::spawn(async move {
+            race_connect(&addrs, &config, move |addr| {
+                let entered = Arc::clone(&entered);
+                let release_rx = Arc::clone(&release_rx);
+                async move {
+                    if addr.is_ipv6() {
+                        entered.notify_one();
+                        // Blocking section: an abort cannot interrupt it.
+                        tokio::task::block_in_place(|| {
+                            let _ = release_rx.lock().unwrap().recv();
+                        });
+                        std::future::pending::<Result<u8, String>>().await
+                    } else {
+                        // Gate: win only after the loser is blocked.
+                        entered.notified().await;
+                        Ok(42)
+                    }
+                }
+            })
+            .await
+        });
+
+        let before_release = tokio::time::timeout(Duration::from_secs(5), &mut race).await;
+        // Release the blocked worker before any assertion, so that a failure
+        // cannot leave a blocked thread behind.
+        let _ = release_tx.send(());
+        let joined = match before_release {
+            Ok(joined) => joined,
+            Err(_) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), race).await;
+                panic!("the ready winner was held until the blocked loser was released");
+            }
+        };
+        let (winner, addr) = joined.unwrap().unwrap();
+        assert_eq!(winner, 42);
+        assert_eq!(addr, v4("10.0.0.1:80"));
+    }
+
+    /// A connection stand-in whose destructor can block until a gate opens.
+    struct GatedDrop {
+        gate: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for GatedDrop {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate.take() {
+                let _ = gate.lock().unwrap().recv();
+            }
+            self.dropped.notify_one();
+        }
+    }
+
+    /// #294 round 3: a loser that also connected returns a value, and that
+    /// value can have a blocking destructor. The race must not drop it on the
+    /// winner's handoff path: a timeout cannot interrupt a synchronous drop,
+    /// so an inline drop holds a ready winner without a bound. The value must
+    /// still be dropped later (no leak).
+    ///
+    /// Deterministic: current-thread runtime and explicit gates. The winner
+    /// completes first and wakes the loser, which completes in the same
+    /// scheduler pass, so both results are ready when the race resumes. A
+    /// separate thread opens the destructor gate only after the race returns
+    /// (or after a 5 s guard). A race that drops the loser value inline can
+    /// therefore return only after the gate opens.
+    #[tokio::test]
+    async fn blocking_loser_result_drop_does_not_hold_ready_winner() {
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = Arc::new(std::sync::Mutex::new(gate_rx));
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+        let gate_opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate_opened_by_thread = Arc::clone(&gate_opened);
+        let releaser = std::thread::spawn(move || {
+            let _ = returned_rx.recv_timeout(Duration::from_secs(5));
+            gate_opened_by_thread.store(true, Ordering::SeqCst);
+            let _ = gate_tx.send(());
+        });
+
+        let loser_may_finish = Arc::new(tokio::sync::Notify::new());
+        let loser_dropped = Arc::new(tokio::sync::Notify::new());
+        let winner_dropped = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let loser_dropped_for_attempt = Arc::clone(&loser_dropped);
+        let winner_dropped_for_attempt = Arc::clone(&winner_dropped);
+        let loser_may_finish_for_attempt = Arc::clone(&loser_may_finish);
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let gate_rx = Arc::clone(&gate_rx);
+            let loser_may_finish = Arc::clone(&loser_may_finish_for_attempt);
+            let loser_dropped = Arc::clone(&loser_dropped_for_attempt);
+            let winner_dropped = Arc::clone(&winner_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: also connects, right after the winner.
+                    loser_may_finish.notified().await;
+                    Ok::<GatedDrop, String>(GatedDrop {
+                        gate: Some(gate_rx),
+                        dropped: loser_dropped,
+                    })
+                } else {
+                    // Winner: wake the loser, then win.
+                    loser_may_finish.notify_one();
+                    Ok(GatedDrop {
+                        gate: None,
+                        dropped: winner_dropped,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let gate_was_open_at_return = gate_opened.load(Ordering::SeqCst);
+        let _ = returned_tx.send(());
+        releaser.join().unwrap();
+        assert_eq!(addr, v4("10.0.0.1:80"));
+        assert!(
+            !gate_was_open_at_return,
+            "the ready winner was held until the loser's destructor was released"
+        );
+
+        // No leak: the loser value is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), loser_dropped.notified())
+            .await
+            .unwrap();
+        drop(winner);
+        tokio::time::timeout(Duration::from_secs(1), winner_dropped.notified())
+            .await
+            .unwrap();
+    }
+
+    /// A panic payload whose destructor blocks until a gate opens.
+    struct BlockingPayload {
+        gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for BlockingPayload {
+        fn drop(&mut self) {
+            let _ = self.gate.lock().unwrap().recv();
+            self.dropped.notify_one();
+        }
+    }
+
+    /// A dial error whose `Display` panics with a [`BlockingPayload`].
+    struct PanickingDisplayError(std::sync::Mutex<Option<BlockingPayload>>);
+
+    impl std::fmt::Display for PanickingDisplayError {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let payload = self.0.lock().unwrap().take();
+            // `resume_unwind` skips the panic hook, so the test log stays clean.
+            std::panic::resume_unwind(Box::new(payload))
+        }
+    }
+
+    /// A future local that panics with a [`BlockingPayload`] when the
+    /// aborted future is dropped.
+    struct PanicOnCancel(Option<BlockingPayload>);
+
+    impl Drop for PanicOnCancel {
+        fn drop(&mut self) {
+            if let Some(payload) = self.0.take() {
+                std::panic::resume_unwind(Box::new(payload));
+            }
+        }
+    }
+
+    /// A gate that a separate thread opens only after the test reports that
+    /// the race returned, or after a 5 s guard.
+    struct ReleaseGate {
+        gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+        opened: Arc<std::sync::atomic::AtomicBool>,
+        returned: std::sync::mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl ReleaseGate {
+        fn new() -> Self {
+            let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+            let (returned, returned_rx) = std::sync::mpsc::channel::<()>();
+            let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let opened_by_thread = Arc::clone(&opened);
+            let thread = std::thread::spawn(move || {
+                let _ = returned_rx.recv_timeout(Duration::from_secs(5));
+                opened_by_thread.store(true, Ordering::SeqCst);
+                let _ = gate_tx.send(());
+            });
+            Self {
+                gate: Arc::new(std::sync::Mutex::new(gate_rx)),
+                opened,
+                returned,
+                thread,
+            }
+        }
+
+        /// Report that the race returned; return whether the gate was
+        /// already open at that time.
+        fn race_returned(self) -> bool {
+            let was_open = self.opened.load(Ordering::SeqCst);
+            let _ = self.returned.send(());
+            self.thread.join().unwrap();
+            was_open
+        }
+    }
+
+    /// #294 round 4 (Codex probe 1): a losing dial error whose `Display`
+    /// panics yields a panic payload. The race must not drop that payload on
+    /// the coordinator: its destructor can block, and a timeout cannot
+    /// interrupt a synchronous drop. The payload must still be dropped later.
+    ///
+    /// Deterministic: current-thread runtime and explicit gates. The winner
+    /// completes first and wakes the loser, which fails in the same scheduler
+    /// pass. A race that drops the payload inline can return only after the
+    /// gate thread opens the gate (5 s guard).
+    #[tokio::test]
+    async fn losing_error_display_panic_payload_does_not_hold_ready_winner() {
+        let gate = ReleaseGate::new();
+        let payload_gate = Arc::clone(&gate.gate);
+        let payload_dropped = Arc::new(tokio::sync::Notify::new());
+        let payload_dropped_for_attempt = Arc::clone(&payload_dropped);
+        let loser_may_finish = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let loser_may_finish = Arc::clone(&loser_may_finish);
+            let gate = Arc::clone(&payload_gate);
+            let dropped = Arc::clone(&payload_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: fails right after the winner; formatting the
+                    // error panics.
+                    loser_may_finish.notified().await;
+                    let payload = BlockingPayload { gate, dropped };
+                    Err(PanickingDisplayError(std::sync::Mutex::new(Some(payload))))
+                } else {
+                    // Winner: wake the loser, then win.
+                    loser_may_finish.notify_one();
+                    Ok(42u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!((winner, addr), (42, v4("10.0.0.1:80")));
+        assert!(
+            !gate.race_returned(),
+            "the ready winner was held until the loser's panic payload was released"
+        );
+        // No leak: the payload is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), payload_dropped.notified())
+            .await
+            .unwrap();
+    }
+
+    /// #294 round 4 (Codex probe 2): aborting a pending loser drops its
+    /// future, and a destructor in that future can panic. Tokio then returns
+    /// a panic-bearing join error. The race must not drop that error's
+    /// payload on the coordinator either. The payload must still be dropped
+    /// later.
+    ///
+    /// Deterministic: current-thread runtime and explicit gates, as above.
+    #[tokio::test]
+    async fn aborted_loser_panic_payload_does_not_hold_ready_winner() {
+        let gate = ReleaseGate::new();
+        let payload_gate = Arc::clone(&gate.gate);
+        let payload_dropped = Arc::new(tokio::sync::Notify::new());
+        let payload_dropped_for_attempt = Arc::clone(&payload_dropped);
+        let loser_entered = Arc::new(tokio::sync::Notify::new());
+        let addrs = vec![v6("[::1]:80"), v4("10.0.0.1:80")];
+        let config = HappyEyeballsConfig {
+            connection_attempt_delay: Duration::from_millis(1),
+            ..Default::default()
+        };
+
+        let (winner, addr) = race_connect(&addrs, &config, move |addr| {
+            let loser_entered = Arc::clone(&loser_entered);
+            let gate = Arc::clone(&payload_gate);
+            let dropped = Arc::clone(&payload_dropped_for_attempt);
+            async move {
+                if addr.is_ipv6() {
+                    // Loser: pending until aborted; the abort drops the bomb.
+                    let _bomb = PanicOnCancel(Some(BlockingPayload { gate, dropped }));
+                    loser_entered.notify_one();
+                    std::future::pending::<Result<u8, String>>().await
+                } else {
+                    // Winner: win after the loser is pending.
+                    loser_entered.notified().await;
+                    Ok(42u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!((winner, addr), (42, v4("10.0.0.1:80")));
+        assert!(
+            !gate.race_returned(),
+            "the ready winner was held until the aborted loser's panic payload was released"
+        );
+        // No leak: the payload is dropped after the handoff.
+        tokio::time::timeout(Duration::from_secs(5), payload_dropped.notified())
+            .await
+            .unwrap();
     }
 
     #[test]
