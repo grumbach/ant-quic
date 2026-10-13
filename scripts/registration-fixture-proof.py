@@ -12,7 +12,10 @@ from pathlib import Path
 
 AUTHORITATIVE_CHECK = """            if shutting_down.load(Ordering::Relaxed) {
                 drop(lifecycle);
-                return refuse_registration(&peer_id, connection);
+                return (
+                    refuse_registration(&peer_id, connection),
+                    RegistrationKind::New,
+                );
             }
 """
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
