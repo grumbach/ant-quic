@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.27.60] - 2026-10-13
+
+### Fixed
+
+- **`read_to_end` keeps one entry per contiguous run.** A chunk that
+  continues the previous one is appended to it, so the bytes held stay within
+  the caller's size limit for any framing. The number of separate entries is
+  capped at 4096; a read that needs more fails with `TooLong`, like the size
+  limit.
+- **Unordered stream reassembly bounds its disjoint received ranges** at 4096
+  per stream. Ordinary reordered or lossy traffic stays well below this at the
+  default stream receive window; the bound is documented next to the window
+  it depends on.
+- **Datagrams after a path change.** A datagram whose payload equals the path
+  limit is kept. After an MTU black hole, a migration or a path change, only
+  datagrams that no longer fit are dropped, and a blocked sender gets
+  `DatagramsUnblocked`.
+
 ## [0.27.59] - 2026-10-13
 
 ### Fixed
