@@ -11689,7 +11689,7 @@ impl P2pEndpoint {
                     let stream_activity = Arc::clone(&stream_activity);
                     let follow_tx = follow_tx.clone();
                     let recv_stream = recv_stream;
-                    let _budget_permit = _budget_permit;
+                    let budget_permit = _budget_permit;
                     // #313 R2: count this read task as in flight until it ends.
                     let in_flight = UniReadInFlight::enter(&uni_in_flight);
                     let peer_id = peer_id;
@@ -11698,6 +11698,11 @@ impl P2pEndpoint {
                     let stream_read_deadline = stream_read_deadline;
                     tokio::spawn(async move {
                         let _in_flight = in_flight;
+                        // #255 fix C: the task owns its budget permit until it ends, so
+                        // READER_STREAM_BUDGET bounds the uni read tasks in flight. A
+                        // binding outside this future would drop the permit as soon as the
+                        // task is spawned.
+                        let _budget_permit = budget_permit;
                         // #255 fix C: the deadline bounds the WHOLE
                         // per-stream pipeline — the sender-side read (a
                         // stream whose sender stalls mid-message never sends
