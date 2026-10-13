@@ -20,6 +20,17 @@ use tokio::io::ReadBuf;
 use super::connection::ConnectionRef;
 use crate::VarInt;
 
+/// Bound on the number of disjoint entries `read_to_end` accumulates
+///
+/// `read_to_end` appends each delivered chunk to the previous entry when it
+/// continues it, so a contiguous stream — however it is framed — is a single
+/// entry whose bytes are bounded by the caller's `size_limit`. A new entry is
+/// needed only across a gap. This cap is the independent ceiling on the entry
+/// count; it matches the stream assembler's bound on disjoint received ranges,
+/// so ordinary reordered or lossy traffic stays well under it while the
+/// per-read overhead stays bounded regardless of how the data is framed.
+const MAX_READ_TO_END_ENTRIES: usize = 4096;
+
 /// A stream that can only be used to receive data
 ///
 /// `stop(0)` is implicitly called on drop unless:
@@ -475,11 +486,13 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
                     self.end = self.end.max(end);
-                    // Copy bytes into an owned Vec<u8> IMMEDIATELY, dropping
-                    // the Bytes reference before the next poll cycle. This
-                    // prevents aliasing corruption from recycled packet
-                    // allocations under concurrent multi-stream load.
-                    self.read.push((chunk.bytes.to_vec(), chunk.offset));
+                    // Copy bytes into owned storage IMMEDIATELY, dropping the
+                    // Bytes reference before the next poll cycle. This prevents
+                    // aliasing corruption from recycled packet allocations under
+                    // concurrent multi-stream load.
+                    if let Err(e) = push_read_chunk(&mut self.read, &chunk.bytes, chunk.offset) {
+                        return Poll::Ready(Err(e));
+                    }
                 }
                 None => {
                     if self.end == 0 {
@@ -499,6 +512,35 @@ impl Future for ReadToEnd<'_> {
             }
         }
     }
+}
+
+/// Append a delivered chunk to the accumulating entry list.
+///
+/// Bytes are copied into owned storage immediately (see [`ReadToEnd`]), dropping
+/// the `Bytes` reference before the next poll cycle. When the chunk continues
+/// the last entry (its offset equals that entry's end) its bytes are appended
+/// to that entry instead of starting a new one, so a contiguous stream stays a
+/// single entry regardless of framing and the per-read overhead is bounded by
+/// the caller's `size_limit` plus the entry count. A new entry is needed only
+/// across a gap; the entry count is capped by [`MAX_READ_TO_END_ENTRIES`], and
+/// exceeding it fails the read with [`ReadToEndError::TooLong`], the same way
+/// the offset-span limit does.
+fn push_read_chunk(
+    read: &mut Vec<(Vec<u8>, u64)>,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ReadToEndError> {
+    if let Some((buf, start)) = read.last_mut() {
+        if start.checked_add(buf.len() as u64) == Some(offset) {
+            buf.extend_from_slice(bytes);
+            return Ok(());
+        }
+    }
+    if read.len() >= MAX_READ_TO_END_ENTRIES {
+        return Err(ReadToEndError::TooLong);
+    }
+    read.push((bytes.to_vec(), offset));
+    Ok(())
 }
 
 /// Assemble unordered chunks into a contiguous buffer
