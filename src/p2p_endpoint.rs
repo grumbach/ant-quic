@@ -15221,9 +15221,14 @@ mod tests {
             let endpoint = fixed_port_endpoint(addr).await;
             let held_addr = endpoint.local_addr().expect("endpoint local addr");
 
+            // #313 R1: the listener rejects an inbound connection that is
+            // already closed when it registers it, so accept() never returns
+            // it. This dialer shuts down at once, so the close can win that
+            // race (often in release builds). Bound the wait: the test checks
+            // the dialer's socket release, not the listener's accept.
             let accept_handle = tokio::spawn({
                 let listener = listener.clone();
-                async move { listener.accept().await }
+                async move { tokio::time::timeout(Duration::from_secs(5), listener.accept()).await }
             });
 
             let connection = tokio::time::timeout(
