@@ -6,7 +6,7 @@
 // Full details available at https://saorsalabs.com/licenses
 
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, max},
     collections::{BinaryHeap, binary_heap::PeekMut},
     mem,
 };
@@ -14,6 +14,24 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::range_set::RangeSet;
+
+/// Bound on the number of distinct spans kept for a stream
+///
+/// Independent of how much memory those spans over-allocate. A frame is rejected only
+/// if compaction cannot get the count back down to this.
+const MAX_CHUNKS: usize = 1024;
+
+/// Minimum size of a defragmented chunk that is retained without coalescing
+///
+/// Chunks below this size are copied on every compaction. 128 bytes balances being cheap
+/// to copy while reducing the overhead of many small buffer nodes.
+const MIN_RETAINED_CHUNK_SIZE: usize = 128;
+
+/// Chunk count past which `insert` compacts before deciding whether to reject
+///
+/// Above `MAX_CHUNKS`, so that a run of mergeable frames does not cause a
+/// defragmentation per frame.
+const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 
 /// Helper to assemble unordered stream frames into an ordered stream
 #[derive(Debug, Default)]
@@ -116,6 +134,9 @@ impl Assembler {
     /// This makes sure we're not unnecessarily holding on to many larger allocations.
     /// We merge contiguous chunks in the process of doing so.
     fn defragment(&mut self) {
+        // Chunks smaller than `min_chunk_size` are merged regardless of fragmentation, so the
+        // result stays within `MAX_CHUNKS` when it can.
+        let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
         let new = BinaryHeap::with_capacity(self.data.len());
         let old = mem::replace(&mut self.data, new);
         let mut buffers = old.into_sorted_vec();
@@ -127,7 +148,7 @@ impl Assembler {
             let size = chunk.bytes.len();
             offset = chunk.offset + size as u64;
             self.buffered += size;
-            if !chunk.defragmented {
+            if !chunk.defragmented || size < min_chunk_size {
                 fragmented_buffered += size;
             }
         }
@@ -135,11 +156,12 @@ impl Assembler {
         let mut buffer = BytesMut::with_capacity(fragmented_buffered);
         let mut offset = 0;
         for chunk in buffers.into_iter().rev() {
-            if chunk.defragmented {
-                // bytes might be empty after try_mark_defragment
-                if !chunk.bytes.is_empty() {
-                    self.data.push(chunk);
-                }
+            // bytes might be empty after try_mark_defragment
+            if chunk.bytes.is_empty() {
+                continue;
+            }
+            if chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
+                self.data.push(chunk);
                 continue;
             }
             // Overlap is resolved by try_mark_defragment
@@ -206,13 +228,14 @@ impl Assembler {
             }
         }
 
-        if bytes.is_empty() {
-            return Ok(());
+        // No early return when `bytes` is empty: the dedup loop above may already have pushed
+        // chunks, and the chunk bound below must count them.
+        if !bytes.is_empty() {
+            let buffer = Buffer::new(offset, bytes, allocation_size);
+            self.buffered += buffer.bytes.len();
+            self.allocated += buffer.allocation_size;
+            self.data.push(buffer);
         }
-        let buffer = Buffer::new(offset, bytes, allocation_size);
-        self.buffered += buffer.bytes.len();
-        self.allocated += buffer.allocation_size;
-        self.data.push(buffer);
         // `self.buffered` also counts duplicate bytes, therefore we use
         // `self.end - self.bytes_read` as an upper bound of buffered unique
         // bytes. This will cause a defragmentation if the amount of duplicate
@@ -227,10 +250,11 @@ impl Assembler {
         // buffered data. The constants are chosen somewhat arbitrarily and try to
         // balance between defragmentation overhead and over-allocation.
         let threshold = 32768.max(buffered * 3 / 2);
-        if over_allocation > threshold {
+        // Also bound the number of chunks, independent of over-allocation.
+        if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
             self.defragment();
             // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
-            if self.data.len() > 1024 {
+            if self.data.len() > MAX_CHUNKS {
                 return Err(TooManyChunks);
             }
         }

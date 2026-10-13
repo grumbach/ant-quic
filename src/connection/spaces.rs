@@ -9,7 +9,7 @@ use std::{
     cmp,
     collections::{BTreeMap, VecDeque},
     mem,
-    ops::{Bound, Index, IndexMut},
+    ops::{Bound, Index, IndexMut, Range},
 };
 
 use rand::Rng;
@@ -18,8 +18,9 @@ use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
-    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, connection::StreamsState,
-    crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet, shared::IssuedCid,
+    Dir, Duration, Instant, SocketAddr, StreamId, TransportError, VarInt, cid_queue::CidQueue,
+    connection::StreamsState, crypto::Keys, frame, packet::SpaceId, range_set::ArrayRangeSet,
+    shared::IssuedCid,
 };
 
 pub(super) struct PacketSpace {
@@ -351,6 +352,29 @@ pub struct Retransmits {
 }
 
 impl Retransmits {
+    /// Queue RETIRE_CONNECTION_ID frames for the sequence numbers in `cids`
+    ///
+    /// Fails with CONNECTION_ID_LIMIT_ERROR, and queues nothing, if the queue would exceed
+    /// `MAX_PENDING_RETIRED_CIDS`.
+    pub(super) fn retire_cids(&mut self, cids: Range<u64>) -> Result<(), TransportError> {
+        // We don't bother counting in-flight frames because those are bounded by congestion
+        // control.
+        let num = cids.end.saturating_sub(cids.start);
+        if (self.retire_cids.len() as u64).saturating_add(num) > Self::MAX_PENDING_RETIRED_CIDS {
+            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
+                "queued too many retired CIDs",
+            ));
+        }
+
+        self.retire_cids.extend(cids);
+        Ok(())
+    }
+
+    /// Ensure the pending RETIRE_CONNECTION_ID queue cannot grow without bound
+    ///
+    /// Limit is somewhat arbitrary but very permissive.
+    const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
+
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         !self.max_data
             && !self.max_stream_id.into_iter().any(|x| x)
