@@ -33,6 +33,17 @@ const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 /// defragmentation per frame.
 const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 
+/// Bound on the number of disjoint received ranges kept in unordered mode
+///
+/// In unordered mode `recvd` holds one range per non-contiguous received
+/// region and is coalesced only when a gap is filled; reading data out never
+/// trims it. Because delivered bytes return their flow-control credit at once,
+/// the stream and connection windows do not bound the range count on their
+/// own. Bounding it keeps the tracked range set within a fixed size. Ordinary
+/// reordered or lossy traffic keeps only the ranges of the packets in flight
+/// within a receive window open at once, well below this.
+const MAX_RECVD_RANGES: usize = 4096;
+
 /// Helper to assemble unordered stream frames into an ordered stream
 #[derive(Debug, Default)]
 pub(super) struct Assembler {
@@ -217,6 +228,14 @@ impl Assembler {
                 }
                 bytes.advance((duplicate.end - offset) as usize);
                 offset = duplicate.end;
+            }
+            // Bound the number of disjoint received ranges, the same way the
+            // buffered chunk count is bounded below. `recvd` is coalesced only
+            // when a gap is filled, so draining delivered chunks returns their
+            // flow-control credit while the range count keeps growing. Reject
+            // once it crosses the bound.
+            if recvd.len() > MAX_RECVD_RANGES {
+                return Err(TooManyChunks);
             }
         } else if offset < self.bytes_read {
             if (offset + bytes.len() as u64) <= self.bytes_read {
