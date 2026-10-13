@@ -1,0 +1,24 @@
+[package]
+name = "mixed-version-f4"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# ADR-017 F4 mixed-version gate (ant-quic 0.27.58): the released 0.27.57
+# ("old", the follower) against this tree ("new", the arbiter), in one
+# process, on loopback, with production timing (Q = 30 s, P = 3 s).
+#
+#   cargo run --release -- [iterations per variant] [concurrency] [seed]
+#
+# Not part of the ant-quic workspace and not packaged with the crate. Results
+# and how to read them: docs/design/connection-lifecycle-sync.md, "ADR-017 F4
+# mixed-version evidence".
+[dependencies]
+old = { package = "ant-quic", version = "=0.27.57" }
+new = { package = "ant-quic", path = "../.." }
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+
+[workspace]
