@@ -6,8 +6,8 @@ use ant_quic::{ConnectionCloseReason, PeerId, PeerLifecycleEvent};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{
-    CONNECT_TIMEOUT, make_isolated_node_with_keypair, normalize_local_addr, reusable_keypair,
-    spawn_accept_loop, test_guard,
+    CONNECT_TIMEOUT, RETIREMENT_WAIT, make_isolated_node_with_keypair, normalize_local_addr,
+    ordered_keypairs, spawn_accept_loop, test_guard,
 };
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout};
@@ -15,7 +15,9 @@ use tokio::time::{Instant, sleep, timeout};
 type PeerEventStore = Arc<Mutex<Vec<PeerLifecycleEvent>>>;
 type AllPeerEventStore = Arc<Mutex<Vec<(PeerId, PeerLifecycleEvent)>>>;
 
-const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Generous upper bound for every awaited event. The longest is the retired
+/// generation's reader exit, which under ADR-017 comes after Q (30 s).
+const EVENT_TIMEOUT: Duration = RETIREMENT_WAIT;
 
 fn spawn_peer_event_collector(
     mut rx: broadcast::Receiver<PeerLifecycleEvent>,
@@ -150,20 +152,21 @@ async fn wait_for_peer_stream_parity(
 /// genuinely new connection: the sender dials receiver', a second endpoint
 /// with the receiver's identity on another port, while its connection to the
 /// receiver is still live. The sender opens both connections, so they are in
-/// one lifecycle family and the newer one always wins. The sender is the
-/// deciding endpoint on its outbound path, so it retires the old generation
-/// after the drain grace.
+/// one lifecycle family and the newer one always wins. The sender has the
+/// greater PeerId, so it is the pair's arbiter (ADR-017): it retires the old
+/// generation once receiver' has read the replacement and the old one has
+/// been quiet for Q (30 s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_lifecycle_subscriptions_track_establish_replace_and_close() {
     let _guard = test_guard().await;
 
-    let receiver_keypair = reusable_keypair();
+    let (sender_keypair, receiver_keypair) = ordered_keypairs();
     let receiver = make_isolated_node_with_keypair(receiver_keypair.clone()).await;
     let receiver_addr = normalize_local_addr(receiver.local_addr().expect("receiver addr"));
     let receiver_id = receiver.peer_id();
     let accept_receiver = spawn_accept_loop(receiver.clone());
 
-    let sender = make_isolated_node_with_keypair(reusable_keypair()).await;
+    let sender = make_isolated_node_with_keypair(sender_keypair).await;
     let accept_sender = spawn_accept_loop(sender.clone());
 
     let (peer_events, peer_events_task) =

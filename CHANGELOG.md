@@ -20,14 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint with the peer's identity, on another port, while the first
   connection is still live. The same endpoint opens both connections, so the
   newer one always wins, and the test checks the same property as before.
-- **`simultaneous_connect_dedup::test_tiebreaker_deterministic` waits for both
-  ends to settle (#317).** It read `connected_peers()` as soon as both
-  `connect_addr` calls returned. At that moment the end that must register the
-  winner as an inbound connection has not yet done so, so the test saw each end
-  holding its own outbound connection and failed in 45–75% of runs. The
-  tiebreaker chose the same winner on both ends in every diagnosed run. The
-  test now waits (up to 10 s) until both ends keep the same QUIC connection,
-  then checks that they hold opposite sides of it.
 - **New `lifecycle_cross_family_tiebreak` test checks the cross-family decision
   itself (#317).** Agreement alone can also follow a wrong decision, because
   rejection closes and repromotion recover from it. The new test lets one
@@ -36,6 +28,180 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks from the lifecycle trace and the winner map that it keeps the greater
   lifecycle connection id. Each order is repeated until both outcomes occur, so
   a decision biased to one side or to registration order fails.
+
+## [0.27.58] - 2026-10-13
+
+### Changed
+
+- **Superseded connections are retired by one end of each pair, on evidence
+  (#313 Part 2, slice R2; ADR-017).** Before, the end that registered a
+  replacement on its outbound, relay or re-keyed accept path closed the
+  superseded connection after a fixed 5 s, and an inbound supersede never
+  closed it (#315). When the two ends kept opposite winners, both could close
+  the connection the other kept, so a pair could lose every connection. Now
+  only the pair's **arbiter** (the end with the greater PeerId) retires, and
+  only when: its winner is open and read locally; a probe on the winner was
+  answered at most 3 s before; the peer sent a request on the winner, and
+  nothing on the superseded connection for 30 s; no relay session (served,
+  or our own client session, counted from the moment our CONNECT-UDP
+  handshake selects the connection) runs on the superseded connection; and the
+  winner has been Live for 30 s. The reader, activity and relay evidence is
+  checked again, under locks, at the claim. The arbiter then drains the
+  connection (its reader stops at the next stream boundary; in-flight reads,
+  served relay streams, ACK waiters and unacknowledged sends finish, up to
+  `stream_read_deadline`) and closes it with the reserved `Superseded` code.
+  If the winner dies during the drain, or a repromotion takes the
+  connection back, the retirement is aborted: the connection is kept (it is
+  never closed as readerless while its reader restarts), a stale drain never
+  stops the reader of a connection it no longer holds, and the restarted
+  reader is seen as live by the #368 cleanup. The reader restart does not
+  give up while the connection is open: it waits for the stopped reader to
+  exit (it aborts that reader after 5 s if it still waits inside a stream)
+  and succeeds only when a reader that accepts streams runs. The other end (the **follower**) never retires; when the arbiter
+  probes a connection, the follower confirms it with its own probe and makes
+  it its winner. Neither end pre-cancels a reader that starts late on a
+  superseded connection any more: that reader reads it until the arbiter
+  retires it, and a reader exit never retires. Obligations live in the
+  lifecycle, independent of the accept queue (#315): an inbound superseded
+  connection that was accepted and read is retired by the arbiter; one that
+  `accept` skipped has no reader and is still closed by the #368 readerless
+  cleanup after 10 s, as before. No wire change: the roles come from the
+  authenticated identities, and the evidence uses the existing probe
+  exchange. Effects: a superseded connection that is read now stays open for
+  at least 30 s (and while the peer keeps using it); a follower never retires
+  one; a pair whose peer does not negotiate ACK-v2, or whose old-version
+  peer stays quiet, keeps its superseded connections until they idle out or
+  the peer closes them; and applications see more `Replaced` events at the
+  follower when it follows. Logs: the retirement summaries use the
+  `ant_quic::p2p_endpoint` target; the two #368 readerless-close records on
+  the `ant_quic::p2p_endpoint::lifecycle` target now carry `generation`,
+  `from_state`, `to_state` and `connection_id`.
+
+### Fixed
+
+- **Hole-punch and accepted-coordination winners are lifecycle-tracked
+  (#313 Part 2, slice R1).** These winners were raw winner-map inserts, so they
+  had no generation, and a coordinator winner left the tracked winner it
+  replaced Live beside it. They now go through the lifecycle registrar. The
+  winner choice does not change: a hole-punch winner keeps first-wins (a
+  duplicate is closed as before), and an accepted-coordination winner always
+  takes the slot (the connection it replaces becomes Superseded; nothing is
+  closed). A later registration decides as master did, too: a tracked winner
+  of this kind never rejects a newcomer (master had no Live entry to compare
+  with), so the newcomer takes the route and the earlier winner becomes
+  Superseded and stays open. Their generation is now the receive generation
+  of their data. They
+  keep the close behaviour they had while untracked: the #368 janitor and
+  repromotion never close them as `NoReader`, their reader is never
+  pre-cancelled, a reader exit never closes them while they are open, and the
+  ACK-v2 liveness timeout does not close them. One close now also reaches
+  them, as for every tracked connection: `disconnect` closes them.
+- **A hole-punch or accepted-coordination dial is bound to its authenticated
+  identity (#313 R1, Q6).** A connection that does not authenticate as the
+  expected peer is closed before anything is published. It is no longer stored
+  under the expected peer's key, and the session is not marked connected.
+- **`add_connection` of a connection that is already tracked registers nothing
+  (#313 R1, Q4).** A Live connection keeps its generation and gets no second
+  observed-address watch. A Superseded, Closing or Closed connection is refused
+  and not closed by the call (its lifecycle state governs it), so a
+  re-registration can no longer resurrect a connection whose drain close is in
+  progress. A connection that is already closed is refused too.
+- **No winner-map insert orphans an untracked connection (#313 R1).** The
+  registrar and repromotion adopt an open, untracked value that they displace
+  as Superseded.
+- **`poll` keeps a winner that registered after its closed-connection scan
+  (#313 R1).** The removal is bounded to the closed connection the scan saw,
+  and no `ConnectionLost` is reported for a peer that already has a new winner.
+- **The reader-liveness probe sees a reader that started before its
+  connection was registered (#313 R1).** It compared the connection's
+  `stable_id` with the lifecycle generation, so the #368 janitor could close a
+  connection as `NoReader` while its reader ran.
+- **PeerId dials that cannot hole-punch no longer abort a slow direct handshake
+  at the adaptive 2.08 s budget (#304, residual of #292).** The direct stage of
+  `connect_with_fallback` used the adaptive budget (4 × RTT + 750 ms, about
+  2.08 s at the default RTT) for every dial that carried a target PeerId. When
+  no hole-punch coordinator was available, the cutoff could only lead to relay
+  or to a terminal `AllStrategiesFailed`, even though the caller still had
+  establishment budget. Under CPU contention, loopback handshakes have taken
+  about 5.9 s. A dial now keeps the adaptive budget only when it can
+  hole-punch (an authentic target PeerId and a coordinator). Every other
+  automatic dial gives its direct stage the remaining budget, less a reserve
+  for a usable relay, as #293 did for address-only dials. When
+  `connect_peer`/`connect_peer_with_addrs` reach the ladder after a failed
+  direct pre-pass, the extension stops at the end of the caller's dial budget,
+  so a re-dial after a pre-pass timeout still waits at most the adaptive
+  budget. The direct pre-pass itself already gave each handshake the full
+  establishment budget and is unchanged. Explicit strategies stay
+  authoritative, and every stage stays bounded.
+- **Happy Eyeballs `race_connect` stops the losing attempts before it returns
+  the winner (#294).** Before, the race only scheduled an abort for the losing
+  attempts, so a losing dial was still alive when the caller got the winner.
+  An attempt that panicked never sent a result, so the race waited until an
+  outer timeout cancelled it. Now one `JoinSet` owns every attempt. When an
+  attempt wins, the race aborts the losers and waits at most 50 ms for them to
+  end. A loser that has not ended by then, the value of a loser that also
+  connected, and every panic payload go to a detached cleanup task, so neither
+  a blocking poll nor a blocking destructor of a loser holds a ready winner
+  for longer than that bound. A panic in an attempt is a failed attempt for
+  its address. Caller drop and an outer timeout still abort every attempt.
+  The public API, winner selection, the attempt stagger and
+  `AllAttemptsFailed` do not change. The `race_connect` docs state what the
+  race drops, and where.
+- **The bootstrap cache never selects the local node, and it keeps
+  IPv4-mapped IPv6 addresses as IPv4 (#269).** `reachability::socket_addr_scope`
+  classified `[::ffff:192.168.1.50]` as a Global address. So a LAN node that
+  recorded its own mapped LAN address got relay and coordinator capability,
+  and could select itself as a relay. Now `socket_addr_scope` classifies an
+  IPv4-mapped address by its IPv4 address. The cache stores every address in
+  canonical form (`[::ffff:a.b.c.d]:p` becomes `a.b.c.d:p`) at load, insert
+  and capability update, and removes the duplicates that this exposes. Relay
+  selection and `can_bridge` normalise the target before the family and scope
+  checks. The new `BootstrapCache::open_for_local_peer(config, local_peer_id)`
+  drops the local PeerId at load, ignores it at insert and filters it from
+  every selection; `P2pEndpoint` opens its cache with it, and
+  `BootstrapCache::open` keeps its old behaviour. The stored file format does
+  not change: old files load, with their addresses normalised.
+
+### Tests
+
+- **ADR-017 F4 mixed-version gate (#313).** `scripts/mixed-version-f4` runs
+  the released 0.27.57 as an old follower against this tree as the arbiter,
+  with production timing, and reproduces the F4 schedule (the follower
+  finalizes its older connection late) over 600 randomised iterations per
+  run. Definitive run (seed 3130263, 1 ms close timing): every loss was
+  inside the F4 window, delivery resumed, and every total disconnect was the
+  F4 coincidence (the follower's own timer closed its newer connection from
+  18 us before to 2.56 ms after the arbiter completed its retirement): 11 of
+  200 aimed iterations, 0 of 400 others. Repeat with 100 ms close timing
+  (seed 3130264): every loss was inside the F4 window, and there were 10 total
+  disconnects in 200 aimed iterations plus 1 in 200 random ones (at a late
+  finalize of 25.0140 s, inside the same band); their measured gaps, +54 to
+  +66 ms, carry the 100 ms observation resolution. Every total disconnect
+  recovered with one dial. The harness fails on any loss outside the window,
+  any total disconnect outside the one-sided coincidence band, any failed or
+  missing iteration, and an empty run. Results and scope:
+  `docs/design/connection-lifecycle-sync.md`.
+- **Direct-stage budget regressions for PeerId dials (#304).** A loopback UDP
+  gate holds the dialer's datagrams for 3 s, counted from the first datagram
+  of the tested attempt, so the handshake cannot finish before the adaptive
+  budget expires. The tests check that
+  `connect_with_fallback` with a PeerId, and the fallback re-dial of
+  `connect_peer_with_addrs` after a fast pre-pass failure, complete after the
+  gate opens. Guards check that the pre-pass path still completes and that
+  dials to a silent target stay bounded (no second full wait).
+- **`simultaneous_connect_dedup::test_tiebreaker_deterministic` waits for both
+  ends to settle (#317).** It read `connected_peers()` as soon as both
+  `connect_addr` calls returned. At that moment the end that must register the
+  winner as an inbound connection has not yet done so, so the test saw each end
+  holding its own outbound connection and failed in 45–75% of runs. The
+  tiebreaker chose the same winner on both ends in every diagnosed run. The
+  test now waits (up to 10 s) until both ends keep the same QUIC connection,
+  then checks that they hold opposite sides of it.
+- **Bootstrap-cache self-exclusion wiring test (#269).**
+  `tests/quick/bootstrap_cache_self_exclusion.rs` restarts a real `Node` on a
+  persistent cache that holds the node's own entry, and checks that the node
+  does not load, store or select that entry, and that a v4-mapped cached
+  address loads as IPv4.
 
 ## [0.27.57] - 2026-10-09
 

@@ -32,15 +32,29 @@ use tokio::{sync::broadcast, time::timeout};
 use tracing_subscriber::EnvFilter;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// Upper bound for the superseded reader to exit. B cancels it after the 5 s
-/// superseded-reader drain grace; 20 s leaves a wide margin on a loaded
-/// runtime and stays below the 30 s idle timeout.
-const SUPERSEDED_READER_EXIT_WAIT: Duration = Duration::from_secs(20);
+/// Upper bound for the superseded reader to exit. Under ADR-017, B (the
+/// pair's arbiter) retires C1 once A' has read C2 and C1 has been quiet for
+/// Q (30 s); 60 s leaves a wide margin. Keepalives keep C1 alive meanwhile.
+const SUPERSEDED_READER_EXIT_WAIT: Duration = Duration::from_secs(60);
 
 type Keypair = (MlDsaPublicKey, MlDsaSecretKey);
 
 fn new_keypair() -> Keypair {
     ant_quic::generate_ml_dsa_keypair().expect("keypair")
+}
+
+/// Two keypairs, the first with the greater `PeerId`: the arbiter of the
+/// pair under ADR-017.
+fn ordered_keypairs() -> (Keypair, Keypair) {
+    let first = new_keypair();
+    let second = new_keypair();
+    if ant_quic::derive_peer_id_from_public_key(&first.0).0
+        > ant_quic::derive_peer_id_from_public_key(&second.0).0
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
 }
 
 fn normalize(addr: SocketAddr) -> SocketAddr {
@@ -129,8 +143,10 @@ async fn recv_after_reconnect() {
         .with_test_writer()
         .try_init();
 
-    let a_keypair = new_keypair();
-    let b = make_node(new_keypair()).await;
+    // #313 R2 (ADR-017): B dials both connections and has the greater
+    // PeerId, so B is the pair's arbiter and retires the superseded C1.
+    let (b_keypair, a_keypair) = ordered_keypairs();
+    let b = make_node(b_keypair).await;
     let b_id = b.peer_id();
     let a = make_node(a_keypair.clone()).await;
     let a_addr = normalize(a.local_addr().expect("bound addr"));

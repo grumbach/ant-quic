@@ -274,3 +274,234 @@ These are the tests we must pass before tagging 0.27.0:
   normal cleanup route rather than idle-close. Deferred decision —
   default stays as-is for 0.27.0 unless testing reveals a reason to
   change it.
+
+## Addendum (#313 Part 2, 2026-10-12): custody and retirement
+
+The "Deterministic replacement rule" above describes a generation-first
+comparator. The code compares the TLS-exporter `connection_id` for
+connections from different initiators, and `(generation, established_at, …)`
+for connections from the same initiator. Both ends agree on the first case.
+They can disagree on the second, because each end orders its own
+generations. This addendum describes how ant-quic keeps custody of every
+connection and retires superseded ones without that agreement.
+
+### Custody (slice R1)
+
+- Every connection is in the lifecycle. Hole-punch and accepted-coordination
+  winners, which were raw winner-map inserts, now go through the registrar
+  with their old winner choice: hole-punch keeps first-wins (a duplicate is
+  closed), and an accepted-coordination winner always takes the slot (the
+  connection it displaces becomes Superseded; nothing is closed).
+- A dial is bound to its authenticated identity before anything is published
+  (a mismatch closes only the new candidate).
+- A registration of a connection that is already tracked creates nothing: a
+  Live one keeps its generation; a Superseded, Closing or Closed one is
+  refused and not closed.
+- A winner-map insert never orphans an untracked value: it is adopted as
+  Superseded.
+- Entries of origin `Raw` keep the close behaviour they had while untracked
+  (no reader pre-cancel, no `NoReader` close, no reader-exit close while open,
+  no ACK-v2 liveness-timeout close). Only an explicit `disconnect(peer)` now
+  also closes them.
+- A Live entry of origin `Raw` never rejects a newcomer (master had no Live
+  entry to compare with): the newcomer takes the route and the Raw entry
+  becomes Superseded, still open.
+
+### Retirement (slice R2, ADR-017)
+
+The Superseded → Closing step is no longer a 5 s timer at the end that
+registered the replacement. It follows ADR-017 (single arbiter,
+evidence-gated):
+
+```
+ Live ──supersede──▶ Superseded ──claim (arbiter, E0-E4)──▶ Retiring
+   ▲                    │  ▲                                  │   │
+   │   repromote/follow │  └────────abort (winner died)───────┘   │
+   └────────────────────┘                             complete (drain done)
+                                                                  ▼
+                                                    Closing ──▶ Closed
+```
+
+- **Obligation.** Every transition to Superseded records an obligation epoch
+  in the lifecycle entry, independent of `accept` delivery. Repromotion clears
+  it; a new Superseded period gets a new epoch.
+- **Arbiter.** For each peer pair, the end with the greater PeerId retires;
+  the other end (the follower) never does. Neither end pre-cancels a reader
+  that starts late on a superseded connection: it reads the connection until
+  the arbiter's drain stops it, and a reader exit never retires.
+- **Claim.** The arbiter's executor claims a Superseded connection L only if:
+  its winner W is open, Live and read locally (E1); a probe pinned to W in W's
+  current Live period was answered at most 3 s before (E2); the follower sent
+  a request stream on W in that period, no stream arrived on L for Q = 30 s,
+  no relay stream or relay session runs on L (our own CONNECT-UDP handshake
+  counts from the moment it selects L), and W has been Live for at least Q
+  (E3); and L's obligation epoch matches (E4). The reader, activity
+  and relay evidence is checked again under locks at the claim.
+- **Drain and completion.** The claim moves L to `Retiring`. The executor
+  stops L's reader at its next accept boundary (only while the claim still
+  holds; the exit of that reader cleans up nothing), waits for its in-flight
+  uni reads and served relay streams, our ACK waiters on L and unacknowledged
+  send data (bounded by `stream_read_deadline`), then closes L with the
+  `Superseded` code. If W dies first, it aborts: L becomes Superseded again
+  (or is repromoted at once) and its reader restarts. The restart owns L's
+  reader until a reader that accepts streams runs, L closes, or the endpoint
+  shuts down: it never gives up while L is open, it waits for the stopped
+  reader to exit (and aborts it after 5 s if it still waits inside a
+  stream), and it keeps L marked as restart-pending meanwhile, so neither
+  repromotion nor the #368 janitor closes it as readerless. This covers
+  Raw connections too, which have no #368 backstop.
+- **Follow.** A follower that receives the arbiter's probe on a Superseded
+  connection X probes X itself; when that probe is answered it makes X its
+  Live winner. Its probe is also the arbiter's E3 evidence.
+- Without ACK-v2 on W, nothing is retired.
+
+Safety argument, residual bounds (F1-F6) and mixed-version behaviour:
+`docs/adr/ADR-017-single-arbiter-connection-retirement.md`.
+
+### ADR-017 F4 mixed-version evidence (0.27.58 release gate)
+
+ADR-017 is Accepted and frozen, so the evidence for its F4 row is kept here.
+Harness: `scripts/mixed-version-f4` (a standalone crate, not in the
+workspace and not packaged). It runs the released 0.27.57 from crates.io as
+the follower B and this tree as the arbiter A, in one process, on loopback,
+with production timing (Q = 30 s, P = 3 s, B's own 5 s supersede timer).
+Usage: `cargo run --release -- [iterations per variant] [concurrency] [seed]
+[close watcher ms]`.
+
+Schedule (the F4 example; two connections, L and W, between one A and one
+B): B dials L and A registers the inbound L. B's own finalize of L is held
+(its `connect_addr` future is not polled again). B dials W; A registers W at
+t = 0, and L is Superseded at A. B sends on W every 250 ms until t = d. At
+t = d, B finalizes L: L becomes B's winner, and B starts its 5 s timer on W.
+A keeps B's earlier requests on W as E3(a). Variants, 200 iterations each per
+run, with random timing:
+
+- `none`: d in [22, 30] s; B sends nothing after d;
+- `window`: d in [26, 29.5] s; B sends one message at t_s in [29.95, 30.10] s,
+  which is around A's claim, inside the F4 window;
+- `coincide`: d in [25.005, 25.035] s, so B's timer fires at about the time A
+  completes L (the F4 total-loss interleaving).
+
+After the first close that B sees, B's application sends every 100 ms and
+dials again when it has no connection. A watcher records B's close times
+(every 1 ms, or every 100 ms in the coarse run); A's claims and completions
+come from its tracing events. Checks:
+
+- (a) every lost message (`send` returned Ok, A never received it) is inside
+  the F4 window, from the measured boundaries only: on L, from A's claim less
+  1 ms to B's observation of L's close plus 1 ms; or on W at or after B's own
+  close of W, less one watcher interval. The 1 ms at the claim end covers the
+  one-way loopback delay and the lag of A's claim event; the 1 ms at the close
+  end covers one `send` call (the watcher never sees the close before B
+  processes it). Any other loss is a violation;
+- (b) delivery resumes within 15 s;
+- (c) every total disconnect is the F4 coincidence: B's timer closed W within
+  5 ms of A completing L. The measured gap (B's observed close of W minus A's
+  completion of L) must be in [−5 ms, 5 ms + one watcher interval]: the
+  watcher only ever observes a close late, so the allowance for its
+  resolution applies on the late side only;
+- (d) at the end both directions deliver, and both ends have the same number
+  of open connections.
+
+The run passes only if every requested iteration completed (a setup error,
+a failed iteration task, an empty run or a zero concurrency fails it). Before
+each run, a self test checks the window predicate with losses just outside
+each boundary (2 ms and 50 ms before the claim, 2 ms and 50 ms after B saw L
+close, 50 ms before B's close of W), check (c) on both sides of its band
+(for example a W close 50 ms before L's completion with a 100 ms watcher, or
+5.5 ms before with a 1 ms watcher, must be rejected), and the completeness
+rule. A control run
+with one injected task failure (`F4_INJECT_TASK_PANIC`) fails, and an empty
+run fails.
+
+#### Results (library code of `9ae09493`)
+
+These two runs used the harness with the strict loss window and the
+completeness rule, and a two-sided check (c). Their recorded total
+disconnects were re-evaluated with the one-sided check (c) of the final
+harness; all are inside its band.
+
+| Run | Seed | Watcher | Result | One-sided (c) |
+|---|---|---|---|---|
+| definitive | 3130263 | 1 ms | 600 of 600 iterations; ALL CHECKS PASS | 11 of 11 inside [−5 ms, +6 ms] |
+| coarse | 3130264 | 100 ms | 600 of 600 iterations; ALL CHECKS PASS | 11 of 11 inside [−5 ms, +105 ms] |
+
+Outcomes, definitive run:
+
+| Variant | Outcome | Iterations |
+|---|---|---|
+| none | B's timer closed W first; the pair kept L | 54 |
+| none | A retired L; B repromoted W; the pair kept W | 145 |
+| none | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 1 |
+| window | the message came before A's claim, so A did not claim; the pair kept L | 53 |
+| window | A retired L; the pair kept W | 147 |
+| coincide | A claimed L, B's timer closed W during A's drain, A aborted and kept L | 75 |
+| coincide | A retired L before B's timer; the pair kept W | 113 |
+| coincide | B's timer closed W before A's claim; the pair kept L | 1 |
+| coincide | **total disconnect** | 11 |
+
+- (a) Loss, definitive run: 41 messages in 600 iterations (39 in `window`, 2 in
+  `coincide`, 0 in `none`), at most one per iteration in this workload. All
+  were inside the F4 window: they were sent 1.13 to 21.84 ms after A's claim
+  and 1.45 to 23.66 ms before B saw L close. No loss was outside it. Coarse
+  run: 24 messages, all in `window`, all inside the window (1.12 to 21.76 ms
+  after A's claim; the close-end margins, 19.7 to 103.8 ms, have the 100 ms
+  watcher resolution).
+- (b) Recovery after the first close that B sees, definitive run: p50 192 us,
+  p90 1.24 ms, p99 13.7 ms, max 103 ms. Coarse run: p50 199 us, p99 1.48 ms,
+  max 10.2 ms.
+- (c) Total disconnects, definitive run: 0 of 400 iterations in `none` and
+  `window`; 11 of 200 in `coincide`. Their d values span 25.0147 to 25.0264 s
+  (about 12 ms, because A's completion time also varies from iteration to
+  iteration). The measured gap between B's close of W and A's completion of L
+  spans −18 us to +2.56 ms. Coarse run: 10 of 200 in `coincide`, and 1 of 200
+  in `none`, a random draw at d = 25.0140 s, inside the same d band; their
+  measured gaps, +54.34 to +66.29 ms, are inside that run's one-sided band
+  [−5 ms, +105 ms]. They are late-side observations with the 100 ms watcher
+  resolution, so that run does not establish the 2.56 ms figure by itself.
+  Every total disconnect recovered with one dial by B's application: in 0.9
+  ms to 103 ms (definitive run) and 0.9 ms to 2.5 ms (coarse run).
+- (d) In all 1200 iterations both directions delivered at the end, and both
+  ends had one open connection.
+
+#### Earlier runs (the first harness, commit `c85534ae`)
+
+- Seed 3130258 (600 iterations; close times sampled at up to 100 ms in the
+  recovery loop; its check (c) was "no total disconnect at all"): it ended
+  with 15 violations and exit code 1. All 15 were total disconnects in
+  `coincide` (0 in `none` and `window`), that is, this run reproduced the
+  total-loss exception that F4 permits, under the old assertion. (a), (b) and
+  (d) held.
+- Seed 3130259 (600 iterations; 1 ms watcher; check (c) as above, but the
+  loss window then had a 100 ms slack at each end): all checks passed. Its 26
+  recorded losses also satisfy the strict window above (1.19 to 21.55 ms after
+  A's claim, 1.36 to 20.82 ms before B saw L close).
+- Seed 3130260 (90 iterations of the committed first harness): all checks
+  passed.
+- During the harness fix, seeds 3130261 (1 ms) and 3130262 (100 ms) ran with
+  the strict window but with a check (c) that did not yet allow for the
+  watcher resolution. The 1 ms run passed. The 100 ms run reported its 11
+  `coincide` total disconnects as outside the 5 ms coincidence: their
+  measured gaps (52 to 60 ms) were the 100 ms watcher resolution, and their d
+  values were in the same band. The check then added one watcher interval to
+  both sides of the band; it now adds it on the late side only (a watcher
+  cannot observe a close early). Seeds 3130263 and 3130264 ran with the
+  two-sided version; re-evaluated with the one-sided band, all their total
+  disconnects are inside it (as are those of seeds 3130259, 3130261 and
+  3130262), so their verdicts do not change.
+
+#### What this shows, and its scope
+
+For the sampled two-connection schedule (one old follower process with
+connections L and W to one new arbiter, in one process on loopback), the
+total loss that F4 describes is real and is the only total loss seen. It
+needs B's own 5 s timer to close W within about 2.6 ms of A completing L (A's
+claim plus its drain, about 21 ms); a timer that fires between A's claim and
+its completion makes A abort and keep L. In the other iterations at least one
+connection survived. Every loss was inside the F4 window (messages that B sent
+on L after A's claim and before it saw L close), and the pair recovered when
+one end dialled again. F4 also needs B to finalize L at least about 22 s after
+the handshake completed, a stalled old peer; the harness forces that stall.
+These runs do not cover three or more candidate connections with an old peer,
+separate processes, real networks, or other send rates, so "at most one lost
+message per iteration" is a result of this workload, not a bound.

@@ -190,6 +190,28 @@ pub fn reusable_keypair() -> ReusableKeypair {
     ant_quic::generate_ml_dsa_keypair().expect("keypair")
 }
 
+/// #313 R2 harness: two keypairs, the first with the greater `PeerId`. Under
+/// ADR-017 the end with the greater `PeerId` is the arbiter of a peer pair:
+/// the only end that retires a superseded connection.
+#[allow(dead_code)]
+pub fn ordered_keypairs() -> (ReusableKeypair, ReusableKeypair) {
+    let first = reusable_keypair();
+    let second = reusable_keypair();
+    if ant_quic::derive_peer_id_from_public_key(&first.0).0
+        > ant_quic::derive_peer_id_from_public_key(&second.0).0
+    {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+/// #313 R2 harness: upper bound for an arbiter to retire a superseded
+/// connection (ADR-017): Q = 30 s after the replacement became the winner,
+/// plus the probe exchanges, a few executor passes and the drain.
+#[allow(dead_code)]
+pub const RETIREMENT_WAIT: Duration = Duration::from_secs(60);
+
 pub async fn make_node(known_peers: Vec<SocketAddr>) -> Arc<P2pEndpoint> {
     Arc::new(
         P2pEndpoint::new(test_node_config(known_peers))

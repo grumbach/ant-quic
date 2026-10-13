@@ -9,6 +9,7 @@
 
 use crate::nat_traversal_api::PeerId;
 use crate::reachability::{ReachabilityScope, socket_addr_scope};
+use crate::shared::normalize_socket_addr;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -145,14 +146,22 @@ impl PeerCapabilities {
     }
 
     /// Record an externally observed address if we have not seen it before.
+    ///
+    /// An IPv4-mapped IPv6 address is recorded as plain IPv4 (#269).
     pub fn record_external_address(&mut self, addr: SocketAddr) {
+        let addr = normalize_socket_addr(addr);
         if !self.external_addresses.contains(&addr) {
             self.external_addresses.push(addr);
         }
     }
 
     /// Record a fresh, peer-verified direct observation.
+    ///
+    /// An IPv4-mapped IPv6 address is recorded as plain IPv4, so its scope is
+    /// the scope of the IPv4 address (#269). A mapped private address is LAN
+    /// evidence, not global evidence.
     pub fn record_direct_observation(&mut self, addr: SocketAddr, observed_at: SystemTime) {
+        let addr = normalize_socket_addr(addr);
         let scope = socket_addr_scope(addr).unwrap_or(ReachabilityScope::LocalNetwork);
         if let Some(existing) = self
             .reachable_addresses
@@ -174,6 +183,46 @@ impl PeerCapabilities {
             .map(|entry| entry.scope)
             .max();
 
+        self.refresh_effective_helper_flags();
+    }
+
+    /// Rewrite every stored address to its canonical form (IPv4-mapped IPv6
+    /// becomes plain IPv4) and drop the duplicates that the rewrite exposes
+    /// (#269).
+    ///
+    /// A rewritten direct-evidence record gets the scope of its IPv4 address;
+    /// when two records merge, the newer evidence is kept.
+    pub(crate) fn normalize_addresses(&mut self) {
+        normalize_address_list(&mut self.external_addresses);
+
+        let mut records: Vec<ReachableAddressRecord> =
+            Vec::with_capacity(self.reachable_addresses.len());
+        for mut record in self.reachable_addresses.drain(..) {
+            let canonical = normalize_socket_addr(record.address);
+            if canonical != record.address {
+                record.address = canonical;
+                record.scope =
+                    socket_addr_scope(canonical).unwrap_or(ReachabilityScope::LocalNetwork);
+            }
+            match records
+                .iter_mut()
+                .find(|existing| existing.address == record.address)
+            {
+                Some(existing) => {
+                    if record.verified_at > existing.verified_at {
+                        *existing = record;
+                    }
+                }
+                None => records.push(record),
+            }
+        }
+        self.reachable_addresses = records;
+
+        self.direct_reachability_scope = self
+            .reachable_addresses
+            .iter()
+            .map(|entry| entry.scope)
+            .max();
         self.refresh_effective_helper_flags();
     }
 
@@ -252,9 +301,11 @@ impl PeerCapabilities {
     }
 
     /// Check if this peer can bridge between source and target IP versions
+    ///
+    /// An IPv4-mapped IPv6 address counts as IPv4 (#269).
     pub fn can_bridge(&self, source: &SocketAddr, target: &SocketAddr) -> bool {
-        let source_v4 = source.is_ipv4();
-        let target_v4 = target.is_ipv4();
+        let source_v4 = normalize_socket_addr(*source).is_ipv4();
+        let target_v4 = normalize_socket_addr(*target).is_ipv4();
 
         // Same version - any peer can handle
         if source_v4 == target_v4 {
@@ -497,6 +548,18 @@ impl CachedPeer {
         addrs
     }
 
+    /// Rewrite every address in this entry to its canonical form (IPv4-mapped
+    /// IPv6 becomes plain IPv4) and drop the duplicates that the rewrite
+    /// exposes (#269). Covers the dial addresses, the capability evidence and
+    /// the relay locators.
+    pub(crate) fn normalize_addresses(&mut self) {
+        normalize_address_list(&mut self.addresses);
+        self.capabilities.normalize_addresses();
+        for hint in &mut self.relay_paths {
+            normalize_address_list(&mut hint.relay_locators);
+        }
+    }
+
     /// Merge addresses from another peer entry
     pub fn merge_addresses(&mut self, other: &CachedPeer) {
         for addr in &other.addresses {
@@ -509,6 +572,16 @@ impl CachedPeer {
             self.addresses.truncate(10);
         }
     }
+}
+
+/// Normalise every address in `list` and keep the first copy of each, in
+/// order.
+fn normalize_address_list(list: &mut Vec<SocketAddr>) {
+    let mut seen = HashSet::with_capacity(list.len());
+    list.retain_mut(|addr| {
+        *addr = normalize_socket_addr(*addr);
+        seen.insert(*addr)
+    });
 }
 
 /// Serde helper for PeerId serialization
