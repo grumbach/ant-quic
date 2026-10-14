@@ -1939,6 +1939,12 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path.reset(now, &self.config);
+        // Resetting the path returns MTU discovery to the initial MTU, which can
+        // shrink the usable datagram size; drop any queued datagram that no
+        // longer fits so it cannot wedge the outgoing lane.
+        if let Some(max_datagram_size) = self.datagrams().max_size() {
+            drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
+        }
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -2345,7 +2351,11 @@ impl Connection {
                     .congestion
                     .on_mtu_update(self.path.mtud.current_mtu());
                 if let Some(max_datagram_size) = self.datagrams().max_size() {
-                    self.datagrams.drop_oversized(max_datagram_size);
+                    drop_oversized_datagrams(
+                        &mut self.datagrams,
+                        &mut self.events,
+                        max_datagram_size,
+                    );
                 }
             }
 
@@ -3628,43 +3638,18 @@ impl Connection {
                         ));
                     }
 
-                    use crate::cid_queue::InsertError;
-                    match self.rem_cids.insert(frame) {
-                        Ok(None) => {}
-                        Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
-                            // We don't bother counting in-flight frames because those are bounded
-                            // by congestion control.
-                            if (pending_retired.len() as u64)
-                                .saturating_add(retired.end.saturating_sub(retired.start))
-                                > MAX_PENDING_RETIRED_CIDS
-                            {
-                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
-                                    "queued too many retired CIDs",
-                                ));
+                    match apply_new_connection_id(
+                        &mut self.rem_cids,
+                        &mut self.spaces[SpaceId::Data].pending,
+                        frame,
+                    )? {
+                        NewCidOutcome::AlreadyRetired => continue,
+                        NewCidOutcome::Stored { reset_token } => {
+                            if let Some(reset_token) = reset_token {
+                                self.set_reset_token(reset_token);
                             }
-                            pending_retired.extend(retired);
-                            self.set_reset_token(reset_token);
                         }
-                        Err(InsertError::ExceedsLimit) => {
-                            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
-                        }
-                        Err(InsertError::Retired) => {
-                            trace!("discarding already-retired");
-                            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
-                            // range of connection IDs larger than the active connection ID limit
-                            // was retired all at once via retire_prior_to.
-                            self.spaces[SpaceId::Data]
-                                .pending
-                                .retire_cids
-                                .push(frame.sequence);
-                            continue;
-                        }
-                    };
+                    }
 
                     if self.side.is_server() && self.rem_cids.active_seq() == 0 {
                         // We're a server still using the initial remote CID for the client, so
@@ -3845,6 +3830,14 @@ impl Connection {
             // We haven't updated the remote CID yet, this captures the remote CID we were using on
             // the previous path.
             self.prev_path = Some((self.rem_cids.active(), prev));
+        }
+
+        // A real address change builds a fresh path whose MTU discovery starts
+        // at the initial MTU, which can shrink the usable datagram size below a
+        // datagram queued for the old path; drop any that no longer fit so the
+        // outgoing lane cannot wedge behind them.
+        if let Some(max_datagram_size) = self.datagrams().max_size() {
+            drop_oversized_datagrams(&mut self.datagrams, &mut self.events, max_datagram_size);
         }
 
         self.timers.set(
@@ -6042,11 +6035,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self
-                .datagrams
-                .outgoing
-                .front()
-                .is_some_and(|x| x.size(true) <= max_size)
+            || self.datagrams.outgoing.can_send_1rtt(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
@@ -6260,6 +6249,21 @@ impl SideArgs {
             Self::Client { .. } => Side::Client,
             Self::Server { .. } => Side::Server,
         }
+    }
+}
+
+/// Drop queued outgoing datagrams that no longer fit `max_payload`, and emit
+/// [`Event::DatagramsUnblocked`] if that frees a previously blocked send.
+///
+/// Shared by every site that can shrink the usable datagram size: the MTU
+/// black-hole handler, `migrate`, and `path_changed`.
+fn drop_oversized_datagrams(
+    datagrams: &mut DatagramState,
+    events: &mut VecDeque<Event>,
+    max_payload: usize,
+) {
+    if datagrams.drop_oversized(max_payload) {
+        events.push_back(Event::DatagramsUnblocked);
     }
 }
 
@@ -7103,11 +7107,132 @@ impl Connection {
 #[path = "pqc_mtu_regression_tests.rs"]
 mod pqc_mtu_regression_tests;
 
+/// Outcome of applying a peer's NEW_CONNECTION_ID frame to the remote CID state
+#[derive(Debug, PartialEq, Eq)]
+enum NewCidOutcome {
+    /// The frame named a CID that is already retired. Only a RETIRE_CONNECTION_ID was
+    /// queued for it.
+    AlreadyRetired,
+    /// The CID was stored. `reset_token` is the reset token of the new active CID when
+    /// the active CID was retired.
+    Stored { reset_token: Option<ResetToken> },
+}
+
+/// Apply a peer's NEW_CONNECTION_ID frame to `rem_cids`, and queue in `pending` the
+/// RETIRE_CONNECTION_ID frames that it requires
+fn apply_new_connection_id(
+    rem_cids: &mut CidQueue,
+    pending: &mut Retransmits,
+    frame: frame::NewConnectionId,
+) -> Result<NewCidOutcome, TransportError> {
+    use crate::cid_queue::InsertError;
+    match rem_cids.insert(frame) {
+        Ok(None) => Ok(NewCidOutcome::Stored { reset_token: None }),
+        Ok(Some((retired, reset_token))) => {
+            pending.retire_cids(retired)?;
+            Ok(NewCidOutcome::Stored {
+                reset_token: Some(reset_token),
+            })
+        }
+        Err(InsertError::ExceedsLimit) => Err(TransportError::CONNECTION_ID_LIMIT_ERROR("")),
+        Err(InsertError::Retired) => {
+            trace!("discarding already-retired");
+            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
+            // range of connection IDs larger than the active connection ID limit
+            // was retired all at once via retire_prior_to.
+            pending.retire_cids(frame.sequence..frame.sequence.saturating_add(1))?;
+            Ok(NewCidOutcome::AlreadyRetired)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport_parameters::AddressDiscoveryConfig;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn new_cid_frame(sequence: u64, retire_prior_to: u64) -> frame::NewConnectionId {
+        frame::NewConnectionId {
+            sequence,
+            retire_prior_to,
+            id: ConnectionId::new(&[0xAB; 8]),
+            reset_token: ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE]),
+        }
+    }
+
+    /// RUSTSEC-2026-0339: a peer advances the remote CID window with a large
+    /// `retire_prior_to`, then floods NEW_CONNECTION_ID frames with sequence numbers below
+    /// that window. Each frame queues a RETIRE_CONNECTION_ID. The pending queue must stay
+    /// bounded; past the bound the frame must close the connection with
+    /// CONNECTION_ID_LIMIT_ERROR.
+    #[test]
+    fn peer_retired_new_connection_id_flood_is_bounded() {
+        const MAX_PENDING_RETIRED_CIDS: usize = CidQueue::LEN * 10;
+        let mut rem_cids = CidQueue::new(ConnectionId::new(&[0xFF; 8]));
+        let mut pending = Retransmits::default();
+
+        let advanced =
+            apply_new_connection_id(&mut rem_cids, &mut pending, new_cid_frame(1000, 1000))
+                .unwrap();
+        assert_eq!(
+            advanced,
+            NewCidOutcome::Stored {
+                reset_token: Some(ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE])),
+            }
+        );
+
+        let mut closed_with = None;
+        for _ in 0..10_000 {
+            match apply_new_connection_id(&mut rem_cids, &mut pending, new_cid_frame(7, 0)) {
+                Ok(outcome) => assert_eq!(outcome, NewCidOutcome::AlreadyRetired),
+                Err(e) => {
+                    closed_with = Some(e.code);
+                    break;
+                }
+            }
+            assert!(
+                pending.retire_cids.len() <= MAX_PENDING_RETIRED_CIDS,
+                "{} RETIRE_CONNECTION_ID frames queued (bound {MAX_PENDING_RETIRED_CIDS})",
+                pending.retire_cids.len()
+            );
+        }
+        assert_eq!(
+            closed_with,
+            Some(TransportErrorCode::CONNECTION_ID_LIMIT_ERROR),
+            "the flood never closed the connection"
+        );
+    }
+
+    /// RED: a path reset that shrinks the usable datagram size (MTU black hole,
+    /// `migrate` to a new path, or `path_changed`) must drop the datagrams that
+    /// no longer fit and emit `DatagramsUnblocked` so a sender blocked for lack
+    /// of space is told it may retry. Without the shared drop-and-emit the
+    /// oversized datagram wedges the outgoing lane and the sender stalls until
+    /// the connection dies.
+    #[test]
+    fn path_reset_drops_oversized_datagrams_and_unblocks() {
+        let mut datagrams = DatagramState::default();
+        // A datagram sized for the old, larger path MTU, with a prior send
+        // blocked for lack of buffer space.
+        datagrams.test_push_outgoing(Bytes::from(vec![0u8; 1500]));
+        datagrams.send_blocked = true;
+        let mut events: VecDeque<Event> = VecDeque::new();
+
+        // The new path allows only a 1200-byte datagram payload.
+        drop_oversized_datagrams(&mut datagrams, &mut events, 1200);
+
+        assert!(
+            datagrams.outgoing.is_empty(),
+            "the oversized datagram must be dropped after the path reset"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DatagramsUnblocked)),
+            "a blocked sender must be told it may retry after the drop frees space"
+        );
+    }
 
     #[test]
     fn nat_advertisement_address_validation_rejects_unspecified_and_zero_port() {

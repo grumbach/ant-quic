@@ -20,6 +20,17 @@ use tokio::io::ReadBuf;
 use super::connection::ConnectionRef;
 use crate::VarInt;
 
+/// Bound on the number of disjoint entries `read_to_end` accumulates
+///
+/// `read_to_end` appends each delivered chunk to the previous entry when it
+/// continues it, so a contiguous stream — however it is framed — is a single
+/// entry whose bytes are bounded by the caller's `size_limit`. A new entry is
+/// needed only across a gap. This cap is the independent ceiling on the entry
+/// count; it matches the stream assembler's bound on disjoint received ranges,
+/// so ordinary reordered or lossy traffic stays well under it while the
+/// per-read overhead stays bounded regardless of how the data is framed.
+const MAX_READ_TO_END_ENTRIES: usize = 4096;
+
 /// A stream that can only be used to receive data
 ///
 /// `stop(0)` is implicitly called on drop unless:
@@ -475,11 +486,13 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
                     self.end = self.end.max(end);
-                    // Copy bytes into an owned Vec<u8> IMMEDIATELY, dropping
-                    // the Bytes reference before the next poll cycle. This
-                    // prevents aliasing corruption from recycled packet
-                    // allocations under concurrent multi-stream load.
-                    self.read.push((chunk.bytes.to_vec(), chunk.offset));
+                    // Copy bytes into owned storage IMMEDIATELY, dropping the
+                    // Bytes reference before the next poll cycle. This prevents
+                    // aliasing corruption from recycled packet allocations under
+                    // concurrent multi-stream load.
+                    if let Err(e) = push_read_chunk(&mut self.read, &chunk.bytes, chunk.offset) {
+                        return Poll::Ready(Err(e));
+                    }
                 }
                 None => {
                     if self.end == 0 {
@@ -499,6 +512,35 @@ impl Future for ReadToEnd<'_> {
             }
         }
     }
+}
+
+/// Append a delivered chunk to the accumulating entry list.
+///
+/// Bytes are copied into owned storage immediately (see [`ReadToEnd`]), dropping
+/// the `Bytes` reference before the next poll cycle. When the chunk continues
+/// the last entry (its offset equals that entry's end) its bytes are appended
+/// to that entry instead of starting a new one, so a contiguous stream stays a
+/// single entry regardless of framing and the per-read overhead is bounded by
+/// the caller's `size_limit` plus the entry count. A new entry is needed only
+/// across a gap; the entry count is capped by [`MAX_READ_TO_END_ENTRIES`], and
+/// exceeding it fails the read with [`ReadToEndError::TooLong`], the same way
+/// the offset-span limit does.
+fn push_read_chunk(
+    read: &mut Vec<(Vec<u8>, u64)>,
+    bytes: &[u8],
+    offset: u64,
+) -> Result<(), ReadToEndError> {
+    if let Some((buf, start)) = read.last_mut() {
+        if start.checked_add(buf.len() as u64) == Some(offset) {
+            buf.extend_from_slice(bytes);
+            return Ok(());
+        }
+    }
+    if read.len() >= MAX_READ_TO_END_ENTRIES {
+        return Err(ReadToEndError::TooLong);
+    }
+    read.push((bytes.to_vec(), offset));
+    Ok(())
 }
 
 /// Assemble unordered chunks into a contiguous buffer
@@ -845,6 +887,64 @@ mod tests {
         let payload: Vec<u8> = (0..4096).map(|i| (i % 250 + 1) as u8).collect();
         let mut chunks = chunks_of(&payload, &[(0, 2048), (0, 2048), (2048, 4096)]);
         let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("duplicate is benign");
+        assert_eq!(buffer, payload);
+    }
+
+    /// RED: contiguous (in-order) one-byte chunks, one per frame, must not grow
+    /// the entry list — each continues the previous entry. Fails today: every
+    /// chunk is pushed as its own `(Vec<u8>, u64)`, so a peer sending one byte
+    /// per frame holds one heap allocation per byte up to the size limit, with
+    /// no coalescing and no cap, while `recvd` stays a single range.
+    #[test]
+    fn read_to_end_coalesces_adjacent_chunks() {
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        for i in 0..1024u64 {
+            push_read_chunk(&mut read, &[(i % 251) as u8], i).expect("contiguous push");
+        }
+        assert_eq!(
+            read.len(),
+            1,
+            "contiguous chunks must coalesce into one entry, not grow per byte"
+        );
+        assert_eq!(read[0].1, 0);
+        assert_eq!(read[0].0.len(), 1024);
+    }
+
+    /// Non-adjacent chunks cannot coalesce; the entry count is capped and the
+    /// read is rejected with `TooLong` rather than growing without bound.
+    #[test]
+    fn read_to_end_caps_entry_count_across_gaps() {
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut rejected_at = None;
+        for i in 0..(MAX_READ_TO_END_ENTRIES as u64 + 16) {
+            // One byte at every even offset: a one-byte gap keeps each chunk
+            // from continuing the previous entry.
+            match push_read_chunk(&mut read, &[1u8], i * 2) {
+                Ok(()) => {}
+                Err(ReadToEndError::TooLong) => {
+                    rejected_at = Some(i);
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        let rejected_at = rejected_at.expect("entry count must be capped");
+        assert_eq!(rejected_at as usize, MAX_READ_TO_END_ENTRIES);
+        assert!(read.len() <= MAX_READ_TO_END_ENTRIES);
+    }
+
+    /// Coalescing must preserve the assembled bytes: a stream delivered as many
+    /// one-byte chunks assembles to the same payload as the original.
+    #[test]
+    fn read_to_end_coalesced_entries_assemble_correctly() {
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 250 + 1) as u8).collect();
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        for (i, b) in payload.iter().enumerate() {
+            push_read_chunk(&mut read, &[*b], i as u64).expect("contiguous push");
+        }
+        assert_eq!(read.len(), 1);
+        let buffer = assemble_unordered_chunks(&mut read, 0, payload.len() as u64)
+            .expect("coalesced single entry must assemble");
         assert_eq!(buffer, payload);
     }
 }

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Regression tests for GHSA-5xgh-3jqx-h4c6 are public.** The advisory is
+  published, and 0.27.60 has the fix. The tests that the 0.27.59 and 0.27.60
+  releases held back are now on master: RUSTSEC-2026-0338, -0339, -0340, -0341
+  and -0342 in ant-quic's own connection code, the P2P read budget,
+  `read_to_end` buffering, and datagrams after a path change. One refactor,
+  with the same behaviour, moves the NEW_CONNECTION_ID step into
+  `apply_new_connection_id()`, so that the connection-ID test can call it.
+- **Master has the 0.27.59 and 0.27.60 fixes** (sections below). The crate
+  version on master does not change.
+
+### Dependencies
+
+- `Cargo.lock`: rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349). Lockfile only; the `Cargo.toml` requirement does not change.
+
 ### Tests
 
 - **Three replacement tests now make a genuinely new connection (#316).**
@@ -28,6 +45,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks from the lifecycle trace and the winner map that it keeps the greater
   lifecycle connection id. Each order is repeated until both outcomes occur, so
   a decision biased to one side or to registration order fails.
+
+## [0.27.60] - 2026-10-13
+
+### Fixed
+
+- **`read_to_end` keeps one entry per contiguous run.** A chunk that
+  continues the previous one is appended to it, so the bytes held stay within
+  the caller's size limit for any framing. The number of separate entries is
+  capped at 4096; a read that needs more fails with `TooLong`, like the size
+  limit.
+- **Unordered stream reassembly bounds its disjoint received ranges** at 4096
+  per stream. Ordinary reordered or lossy traffic stays well below this at the
+  default stream receive window; the bound is documented next to the window
+  it depends on.
+- **Datagrams after a path change.** A datagram whose payload equals the path
+  limit is kept. After an MTU black hole, a migration or a path change, only
+  datagrams that no longer fit are dropped, and a blocked sender gets
+  `DatagramsUnblocked`.
+
+## [0.27.59] - 2026-10-13
+
+### Fixed
+
+- **Tighter buffer accounting in the QUIC connection state.** The stream
+  reassembly buffer checks its chunk count after every insert and compacts
+  before it rejects a stream; it rejects a stream only when compaction cannot
+  bring the count under 1024 chunks, and small contiguous frames are merged.
+  Internal range bookkeeping is corrected. The datagram receive and
+  send queues count a fixed per-datagram overhead, so a datagram buffer can
+  hold a little less payload than its configured size; a datagram that cannot
+  fit the send buffer with that overhead returns `SendDatagramError::TooLarge`.
+  Connection-ID retirement applies its queue bound on every NEW_CONNECTION_ID
+  path. The ACK-frequency delay calculation uses explicit bounds.
+- **The P2P reader holds its stream budget permit for the whole read task.**
+  At most `READER_STREAM_BUDGET` (64) uni read tasks run per connection. When
+  all permits are taken, the accept loop of that connection waits until one
+  returns.
+
+### Dependencies
+
+- `Cargo.lock`: the lockfile-only quinn-proto entry moves to 0.11.18. It is
+  never compiled.
+- `deny.toml`: ignore the unsafe-libyaml unmaintained notice. Only operator
+  binaries and one integration test use `serde_yaml`.
 
 ## [0.27.58] - 2026-10-13
 
