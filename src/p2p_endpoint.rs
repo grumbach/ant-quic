@@ -17305,6 +17305,123 @@ mod tests {
         endpoint_b.shutdown().await;
     }
 
+    /// Sum of the uni read tasks in flight over every reader of `endpoint`.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    async fn uni_reads_in_flight(endpoint: &P2pEndpoint) -> usize {
+        endpoint
+            .reader_handles
+            .read()
+            .await
+            .values()
+            .flatten()
+            .map(|handle| handle.uni_in_flight.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// #255 fix C: the per-connection budget (`READER_STREAM_BUDGET`) bounds the uni
+    /// read tasks in flight. The sender opens more uni streams than the budget and never
+    /// finishes them, so each read task stays in flight. At most `READER_STREAM_BUDGET`
+    /// read tasks may run at once; the next stream waits in the accept loop until a
+    /// permit returns.
+    #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
+    #[tokio::test]
+    async fn unfinished_uni_streams_are_bounded_by_reader_stream_budget() {
+        // Below the default advertised uni stream credit (100), above the budget (64).
+        const UNFINISHED: usize = READER_STREAM_BUDGET + 32;
+
+        let endpoint_a = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                // Loopback only: no LAN multicast discovery or auto-connect.
+                .mdns_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_a should bind");
+        let endpoint_b = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    0,
+                ))
+                .port_mapping_enabled(false)
+                // Loopback only: no LAN multicast discovery or auto-connect.
+                .mdns_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint_b should bind");
+        let a_addr = localhost_addr(endpoint_a.local_addr().expect("endpoint_a addr"));
+
+        let a_id = endpoint_a.peer_id();
+        let accept_pump = {
+            let endpoint_a = endpoint_a.clone();
+            tokio::spawn(async move { while let Some(_conn) = endpoint_a.accept().await {} })
+        };
+        let connected =
+            tokio::time::timeout(Duration::from_secs(20), endpoint_b.connect_addr(a_addr))
+                .await
+                .expect("connect should not time out")
+                .expect("connect should succeed");
+        assert_eq!(connected.peer_id, a_id);
+        assert!(
+            await_connected(&endpoint_a, &endpoint_b.peer_id()).await,
+            "a must admit the inbound connection"
+        );
+        let conn_b_to_a = endpoint_b
+            .inner
+            .get_connection(&a_id)
+            .ok()
+            .flatten()
+            .expect("b holds a connection to a");
+
+        // Written but never finished; the SendStreams stay alive (no reset) for the
+        // whole measurement.
+        let mut unfinished = Vec::with_capacity(UNFINISHED);
+        for i in 0..UNFINISHED {
+            let mut s = conn_b_to_a.open_uni().await.expect("open uni stream");
+            s.write_all(format!("unfinished-{i:03}").as_bytes())
+                .await
+                .expect("write prefix");
+            unfinished.push(s);
+        }
+
+        // Wait for the reader to fill the budget, then keep sampling to catch any
+        // overshoot.
+        let mut max_in_flight = 0;
+        let fill_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while max_in_flight < READER_STREAM_BUDGET && tokio::time::Instant::now() < fill_deadline {
+            max_in_flight = max_in_flight.max(uni_reads_in_flight(&endpoint_a).await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while tokio::time::Instant::now() < settle_deadline {
+            max_in_flight = max_in_flight.max(uni_reads_in_flight(&endpoint_a).await);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            max_in_flight <= READER_STREAM_BUDGET,
+            "{max_in_flight} uni read tasks in flight on one connection \
+             (budget {READER_STREAM_BUDGET})"
+        );
+        assert_eq!(
+            max_in_flight, READER_STREAM_BUDGET,
+            "the reader never filled its budget; the test did not exercise the bound"
+        );
+
+        drop(unfinished);
+        accept_pump.abort();
+        endpoint_a.shutdown().await;
+        endpoint_b.shutdown().await;
+    }
+
     /// #255 fix A complement: connection-scoped loss must still end the
     /// reader (and trigger the normal disconnect path) — the classification
     /// must not swallow real connection death.

@@ -394,4 +394,15 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert_eq!(set.peek_min().unwrap(), 0..4);
     }
+
+    /// RUSTSEC-2026-0338: `replace` with an empty range must not store it.
+    #[test]
+    fn replace_empty() {
+        let mut set = RangeSet::new();
+        set.replace(3..3);
+        set.replace(6..10);
+        set.replace(5..5);
+        set.replace(2..7);
+        assert_eq!(set.0, [(2, 10)].into_iter().collect());
+    }
 }

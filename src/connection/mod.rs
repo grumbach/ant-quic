@@ -7152,6 +7152,58 @@ mod tests {
     use crate::transport_parameters::AddressDiscoveryConfig;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    fn new_cid_frame(sequence: u64, retire_prior_to: u64) -> frame::NewConnectionId {
+        frame::NewConnectionId {
+            sequence,
+            retire_prior_to,
+            id: ConnectionId::new(&[0xAB; 8]),
+            reset_token: ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE]),
+        }
+    }
+
+    /// RUSTSEC-2026-0339: a peer advances the remote CID window with a large
+    /// `retire_prior_to`, then floods NEW_CONNECTION_ID frames with sequence numbers below
+    /// that window. Each frame queues a RETIRE_CONNECTION_ID. The pending queue must stay
+    /// bounded; past the bound the frame must close the connection with
+    /// CONNECTION_ID_LIMIT_ERROR.
+    #[test]
+    fn peer_retired_new_connection_id_flood_is_bounded() {
+        const MAX_PENDING_RETIRED_CIDS: usize = CidQueue::LEN * 10;
+        let mut rem_cids = CidQueue::new(ConnectionId::new(&[0xFF; 8]));
+        let mut pending = Retransmits::default();
+
+        let advanced =
+            apply_new_connection_id(&mut rem_cids, &mut pending, new_cid_frame(1000, 1000))
+                .unwrap();
+        assert_eq!(
+            advanced,
+            NewCidOutcome::Stored {
+                reset_token: Some(ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE])),
+            }
+        );
+
+        let mut closed_with = None;
+        for _ in 0..10_000 {
+            match apply_new_connection_id(&mut rem_cids, &mut pending, new_cid_frame(7, 0)) {
+                Ok(outcome) => assert_eq!(outcome, NewCidOutcome::AlreadyRetired),
+                Err(e) => {
+                    closed_with = Some(e.code);
+                    break;
+                }
+            }
+            assert!(
+                pending.retire_cids.len() <= MAX_PENDING_RETIRED_CIDS,
+                "{} RETIRE_CONNECTION_ID frames queued (bound {MAX_PENDING_RETIRED_CIDS})",
+                pending.retire_cids.len()
+            );
+        }
+        assert_eq!(
+            closed_with,
+            Some(TransportErrorCode::CONNECTION_ID_LIMIT_ERROR),
+            "the flood never closed the connection"
+        );
+    }
+
     #[test]
     fn nat_advertisement_address_validation_rejects_unspecified_and_zero_port() {
         assert!(!is_valid_nat_advertisement_address(SocketAddr::new(

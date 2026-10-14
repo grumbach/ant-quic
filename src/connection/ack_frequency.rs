@@ -310,4 +310,46 @@ mod tests {
     fn max_rtt_error_is_20_percent() {
         assert!((MAX_RTT_ERROR - 0.2).abs() < f32::EPSILON);
     }
+
+    /// Peer transport parameters with `min_ack_delay` and `max_ack_delay` (ms), after a
+    /// wire round trip, so they have passed the same validation as a real peer's.
+    fn peer_params_from_wire(min_ack_delay_us: u32, max_ack_delay_ms: u32) -> TransportParameters {
+        let params = TransportParameters {
+            min_ack_delay: Some(min_ack_delay_us.into()),
+            max_ack_delay: max_ack_delay_ms.into(),
+            ..TransportParameters::default()
+        };
+        let mut encoded = Vec::new();
+        params.write(&mut encoded).unwrap();
+        TransportParameters::read(crate::Side::Client, &mut encoded.as_slice())
+            .expect("peer parameters must pass wire-level validation")
+    }
+
+    /// RUSTSEC-2026-0340: a peer may advertise a `min_ack_delay` above the RTT bound
+    /// (100 ms against a 5 ms RTT here). When ACK_FREQUENCY sending is enabled, computing
+    /// the candidate delay must not panic, and must respect the peer's minimum.
+    #[test]
+    fn peer_min_ack_delay_can_exceed_rtt() {
+        let params = peer_params_from_wire(100_000, 100);
+        let state = AckFrequencyState::new(Duration::from_millis(100));
+        let delay = state.candidate_max_ack_delay(
+            Duration::from_millis(5),
+            &AckFrequencyConfig::default(),
+            &params,
+        );
+        assert_eq!(delay, Duration::from_millis(100));
+    }
+
+    /// RUSTSEC-2026-0340: same, with a peer `max_ack_delay` above its `min_ack_delay`.
+    #[test]
+    fn peer_min_ack_delay_can_exceed_rtt_with_large_max() {
+        let params = peer_params_from_wire(100_000, 200);
+        let state = AckFrequencyState::new(Duration::from_millis(100));
+        let delay = state.candidate_max_ack_delay(
+            Duration::from_millis(5),
+            &AckFrequencyConfig::default(),
+            &params,
+        );
+        assert_eq!(delay, Duration::from_millis(100));
+    }
 }

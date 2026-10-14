@@ -2159,4 +2159,171 @@ mod tests {
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(should_transmit.should_transmit());
     }
+
+    /// Opens the client uni stream `id` on `server` with one frame at offset 0, then
+    /// reads it once in unordered mode, as `RecvStream::read_to_end` does.
+    fn open_unordered_uni(server: &mut StreamsState, id: StreamId, first: &'static [u8]) {
+        let _ = server
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(first),
+                },
+                first.len(),
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: server,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(false).unwrap();
+        assert!(chunks.next(usize::MAX).unwrap().is_some());
+        let _ = chunks.finalize();
+    }
+
+    /// Reads every chunk now available on the unordered stream `id`.
+    ///
+    /// Returns the number of bytes delivered and whether the stream finished.
+    fn drain_unordered(server: &mut StreamsState, id: StreamId) -> (u64, bool) {
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: server,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(false).unwrap();
+        let mut delivered = 0;
+        let finished = loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => delivered += chunk.bytes.len() as u64,
+                Ok(None) => break true,
+                Err(crate::ReadError::Blocked) => break false,
+                Err(e) => panic!("unexpected read error: {e:?}"),
+            }
+        };
+        let _ = chunks.finalize();
+        (delivered, finished)
+    }
+
+    /// Sends the RUSTSEC-2026-0338 trigger from a remote peer on the unordered uni stream
+    /// `id`: a zero-length STREAM frame, then two frames that overlap the bytes around it,
+    /// with application reads in between.
+    ///
+    /// Returns the number of bytes the application received.
+    fn send_zero_length_trigger(server: &mut StreamsState, id: StreamId) -> u64 {
+        let mut delivered = 0;
+        for (offset, data) in [(11u64, &b""[..]), (12, &b"2"[..]), (10, &b"012"[..])] {
+            let _ = server
+                .received(
+                    frame::Stream {
+                        id,
+                        offset,
+                        fin: false,
+                        data: Bytes::copy_from_slice(data),
+                    },
+                    data.len().max(1),
+                )
+                .unwrap();
+            delivered += drain_unordered(server, id).0;
+        }
+        delivered
+    }
+
+    /// RUSTSEC-2026-0338: a remote peer sends zero-length STREAM frames on a stream that
+    /// the local reader reads in unordered mode (as `read_to_end` does). Each byte must be
+    /// delivered once, and the stream must still finish when the FIN arrives.
+    #[test]
+    fn peer_zero_length_stream_frames_unordered() {
+        static FIRST: [u8; 10] = [0x5A; 10];
+        let mut server = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        open_unordered_uni(&mut server, id, &FIRST);
+
+        let delivered = send_zero_length_trigger(&mut server, id);
+        assert_eq!(delivered, 3, "the application received duplicate bytes");
+
+        let _ = server
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 13,
+                    fin: true,
+                    data: Bytes::new(),
+                },
+                1,
+            )
+            .unwrap();
+        let (_, finished) = drain_unordered(&mut server, id);
+        assert!(finished, "the stream never finished after FIN");
+    }
+
+    /// RUSTSEC-2026-0338: after the zero-length trigger, a RESET_STREAM from the peer must
+    /// not issue more connection flow-control credit than the stream consumed.
+    #[test]
+    fn peer_reset_after_zero_length_stream_frames() {
+        static FIRST: [u8; 10] = [0x5A; 10];
+        let mut server = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let initial_max_data = server.local_max_data;
+        open_unordered_uni(&mut server, id, &FIRST);
+        send_zero_length_trigger(&mut server, id);
+
+        let _ = server
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 0u32.into(),
+                final_offset: 13u32.into(),
+            })
+            .unwrap();
+        assert!(
+            server.local_max_data <= initial_max_data + 13,
+            "RESET_STREAM issued {} bytes of credit for a 13-byte stream",
+            server.local_max_data - initial_max_data
+        );
+    }
+
+    /// RUSTSEC-2026-0341: a remote peer floods one uni stream with small gapped STREAM
+    /// frames after the local reader has put the stream in unordered mode and then
+    /// stalls. Each frame is charged only its own length, so the over-allocation
+    /// trigger never fires. The stream layer must reject the flood with a transport
+    /// error, not buffer it without bound.
+    #[test]
+    fn peer_gapped_stream_flood_is_rejected() {
+        const FRAME_LEN: usize = 6;
+        const MAX_FRAMES: usize = 8 * 1024;
+        // Compaction threshold (2 * 1024 chunks) plus the frame that trips it.
+        const CHUNK_BOUND: usize = 2 * 1024 + 1;
+        static PAYLOAD: [u8; FRAME_LEN] = [0xAB; FRAME_LEN];
+
+        let mut server = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        open_unordered_uni(&mut server, id, &PAYLOAD);
+
+        let mut offset = (FRAME_LEN + 1) as u64;
+        let mut rejected_at = None;
+        for i in 0..MAX_FRAMES {
+            let frame = frame::Stream {
+                id,
+                offset,
+                fin: false,
+                data: Bytes::from_static(&PAYLOAD),
+            };
+            if let Err(e) = server.received(frame, FRAME_LEN) {
+                assert_eq!(e.code, TransportErrorCode::INTERNAL_ERROR);
+                rejected_at = Some(i);
+                break;
+            }
+            offset += (FRAME_LEN + 1) as u64; // 6 data bytes, 1 byte gap
+        }
+        let rejected_at =
+            rejected_at.expect("a peer flood of gapped STREAM frames was never rejected");
+        assert!(
+            rejected_at <= CHUNK_BOUND,
+            "flood rejected only after {rejected_at} buffered frames (bound {CHUNK_BOUND})"
+        );
+    }
 }

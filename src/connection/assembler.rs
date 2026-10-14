@@ -974,6 +974,142 @@ mod test {
         );
     }
 
+    /// RUSTSEC-2026-0341: gapped frames whose `allocation_size` equals their length keep
+    /// `over_allocation` at zero, so the over-allocation trigger never fires. The chunk
+    /// count must still be bounded.
+    #[test]
+    fn bounded_chunks_under_low_over_allocation() {
+        let mut x = Assembler::new();
+        // Withhold offset 0 so an ordered reader can never drain anything.
+        let mut offset = 1u64;
+        let mut result = Ok(());
+        for _ in 0..(MAX_CHUNKS * 8) {
+            result = x.insert(offset, Bytes::from_static(b"gap"), 3);
+            if result.is_err() {
+                break;
+            }
+            offset += 3 + 1; // 3 data bytes, 1 byte gap
+        }
+        assert_matches!(result, Err(TooManyChunks));
+        assert!(
+            x.data.len() <= COMPACT_THRESHOLD + 1,
+            "chunk count {} exceeded the bound",
+            x.data.len()
+        );
+    }
+
+    /// RUSTSEC-2026-0341: overlapping frames whose tail is already received. The
+    /// unordered dedup loop pushes the fresh head byte and leaves `bytes` empty, and
+    /// `end` never rises, so the flood costs the peer no flow control.
+    #[test]
+    fn bounded_chunks_unordered_overlap_flood() {
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        let top = 1_000_000u64;
+        x.insert(top, Bytes::from_static(b"ab"), 2).unwrap();
+        for k in 0..(4 * MAX_CHUNKS as u64) {
+            x.insert(top - k - 1, Bytes::from_static(b"ab"), 2).unwrap();
+            assert!(
+                x.data.len() <= COMPACT_THRESHOLD + 1,
+                "chunk count {} exceeded the bound at k={k}",
+                x.data.len()
+            );
+        }
+    }
+
+    /// RUSTSEC-2026-0341: duplicates against a stream already at the cap. Ordered mode
+    /// does not dedup, so each one pushes a chunk. They must not be rejected, and the
+    /// buffer must not compact on every frame.
+    #[test]
+    fn bounded_chunks_duplicate_flood() {
+        let mut x = Assembler::new();
+        // Withhold offset 0 so nothing can be drained.
+        for i in 0..MAX_CHUNKS as u64 {
+            x.insert(1 + i * 4, Bytes::from_static(b"abc"), 3).unwrap();
+        }
+        let mut max_len = x.data.len();
+        for _ in 0..(3 * MAX_CHUNKS) {
+            x.insert(1, Bytes::from_static(b"abc"), 3)
+                .expect("duplicate flood must not be rejected");
+            max_len = max_len.max(x.data.len());
+            assert!(
+                x.data.len() <= COMPACT_THRESHOLD + 1,
+                "chunk count {} exceeded the bound",
+                x.data.len()
+            );
+        }
+        // Compacting on every frame would pin the count at `MAX_CHUNKS`.
+        assert!(
+            max_len > MAX_CHUNKS,
+            "buffer compacted on every frame (max observed len {max_len})"
+        );
+    }
+
+    /// Guard for the RUSTSEC-2026-0341 fix: a contiguous lossless stream of small
+    /// frames must never be rejected by the chunk bound.
+    #[test]
+    fn ordered_lossless_stream_is_not_rejected() {
+        const FRAME_LEN: usize = 32;
+
+        let mut x = Assembler::new();
+        let data = Bytes::from(vec![0; FRAME_LEN]);
+        let mut offset = 0u64;
+        while offset < (2 * COMPACT_THRESHOLD * FRAME_LEN) as u64 {
+            x.insert(offset, data.clone(), FRAME_LEN)
+                .expect("contiguous lossless data must not be rejected");
+            offset += FRAME_LEN as u64;
+        }
+    }
+
+    /// RUSTSEC-2026-0341: `defragment` must coalesce small defragmented chunks so that
+    /// the count stays within `MAX_CHUNKS`.
+    #[test]
+    fn defrag_respects_max_chunks_at_rounding_boundary() {
+        let mut x = Assembler::new();
+        let data = Bytes::from(vec![0; MIN_RETAINED_CHUNK_SIZE]);
+        let mut offset = 0;
+        // Fill with minimum sized chunks.
+        for _ in 0..MAX_CHUNKS {
+            x.insert(offset, data.clone(), data.len()).unwrap();
+            offset += data.len() as u64;
+        }
+        // Add 1 extra chunk, defragment must coalesce the previous
+        // chunks to stay within MAX_CHUNKS
+        x.insert(offset, Bytes::from_static(b"x"), 1).unwrap();
+        x.defragment();
+        assert!(x.data.len() <= MAX_CHUNKS);
+    }
+
+    /// RUSTSEC-2026-0338: a zero-length STREAM frame in unordered mode must not leave an
+    /// empty range in `recvd`. That range stops the dedup loop early, so a later frame
+    /// delivers bytes the application already read and `bytes_read` passes `end`.
+    #[test]
+    fn unordered_zero_length_frame_does_not_break_dedup() {
+        let data = Bytes::from_static(b"0123456789");
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        let mut delivered = Vec::new();
+        for (offset, len) in [(1u64, 0usize), (2, 1), (0, 3)] {
+            let start = offset as usize;
+            x.insert(offset, data.slice(start..start + len), len)
+                .unwrap();
+            while let Some(chunk) = x.read(usize::MAX, false) {
+                delivered.push((chunk.offset, chunk.bytes.len()));
+            }
+        }
+        let total: usize = delivered.iter().map(|&(_, len)| len).sum();
+        assert_eq!(
+            total, 3,
+            "unordered reads delivered duplicate bytes: {delivered:?}"
+        );
+        assert!(
+            x.bytes_read() <= x.end,
+            "bytes_read {} passed end {}",
+            x.bytes_read(),
+            x.end
+        );
+    }
+
     fn next_unordered(x: &mut Assembler) -> Chunk {
         x.read(usize::MAX, false).unwrap()
     }

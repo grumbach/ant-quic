@@ -427,6 +427,99 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// RUSTSEC-2026-0342: a peer sends a flood of zero-length DATAGRAM frames (DATAGRAM
+    /// frames are not flow controlled). Each queued datagram must consume receive buffer
+    /// space, so the incoming queue stays bounded by the window.
+    #[test]
+    fn peer_zero_length_datagram_flood_is_bounded() {
+        const WINDOW: usize = 1024;
+        let mut state = DatagramState::default();
+        let window = Some(WINDOW);
+        for _ in 0..100_000 {
+            state
+                .received(Datagram { data: Bytes::new() }, &window)
+                .unwrap();
+        }
+        // Every queued datagram costs at least its fixed in-memory size.
+        let bound = WINDOW / size_of::<Datagram>();
+        assert!(
+            state.incoming.queue.len() <= bound,
+            "{} empty datagrams queued in a {WINDOW}-byte receive buffer (bound {bound})",
+            state.incoming.queue.len()
+        );
+    }
+
+    /// RUSTSEC-2026-0342 (send side): empty outgoing datagrams also consume send buffer
+    /// space.
+    #[test]
+    fn make_space_for_accounts_for_empty_datagram_metadata() {
+        let mut state = DatagramState::default();
+        for _ in 0..2 {
+            state.outgoing.push_back(Datagram { data: Bytes::new() });
+        }
+        let window = 2 * size_of::<Datagram>();
+
+        assert!(!state.has_send_buffer_space(0, window));
+        state.make_space_for(0, window);
+        assert_eq!(state.outgoing.queue.len(), 1);
+        assert!(state.has_send_buffer_space(0, window));
+        state.outgoing.push_back(Datagram { data: Bytes::new() });
+        assert_eq!(state.outgoing.memory_used(), window);
+    }
+
+    #[test]
+    fn make_space_for_accounts_for_new_datagram() {
+        let mut state = DatagramState::default();
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from_static(&[0; 7]),
+        });
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from_static(&[0; 2]),
+        });
+        state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
+
+        assert_eq!(state.outgoing.queue.len(), 1);
+        assert_eq!(state.outgoing.queue[0].data.len(), 2);
+        assert_eq!(state.outgoing.payload_bytes, 2);
+    }
+
+    #[test]
+    fn make_space_for_handles_overflowing_capacity_check() {
+        let mut state = DatagramState::default();
+        state.outgoing.queue.push_back(Datagram {
+            data: Bytes::from_static(&[0]),
+        });
+        state.outgoing.payload_bytes = usize::MAX - 1;
+
+        state.make_space_for(2, usize::MAX);
+
+        assert!(state.outgoing.is_empty());
+        assert_eq!(state.outgoing.payload_bytes, usize::MAX - 2);
+    }
+
+    #[test]
+    fn send_buffer_space_handles_metadata_overflow() {
+        assert!(!DatagramState::default().has_send_buffer_space(usize::MAX, usize::MAX));
+    }
+
+    /// RUSTSEC-2026-0343 guard: sustained eviction must keep `payload_bytes` equal to the
+    /// queued payload (no double subtraction when the oldest datagram is dropped).
+    #[test]
+    fn sustained_eviction_keeps_send_accounting_in_sync() {
+        const SEND_BUFFER: usize = 4096;
+        let mut state = DatagramState::default();
+        for i in 0..10_000usize {
+            let len = i % 300;
+            state.make_space_for(len, SEND_BUFFER);
+            state.outgoing.push_back(Datagram {
+                data: Bytes::from(vec![0u8; len]),
+            });
+            let queued: usize = state.outgoing.queue.iter().map(|d| d.data.len()).sum();
+            assert_eq!(state.outgoing.payload_bytes, queued);
+            assert!(state.outgoing.memory_used() <= SEND_BUFFER);
+        }
+    }
+
     #[test]
     fn test_datagram_received_oversized() {
         let mut state = DatagramState::default();
