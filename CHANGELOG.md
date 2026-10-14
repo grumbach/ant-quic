@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Master has the 0.27.59 and 0.27.60 fixes** (sections below). The crate
   version on master does not change.
 
+### Dependencies
+
+- `Cargo.lock`: rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349). Lockfile only; the `Cargo.toml` requirement does not change.
+
 ### Tests
 
 - **Three replacement tests now make a genuinely new connection (#316).**
