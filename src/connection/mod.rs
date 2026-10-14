@@ -7204,6 +7204,36 @@ mod tests {
         );
     }
 
+    /// RED: a path reset that shrinks the usable datagram size (MTU black hole,
+    /// `migrate` to a new path, or `path_changed`) must drop the datagrams that
+    /// no longer fit and emit `DatagramsUnblocked` so a sender blocked for lack
+    /// of space is told it may retry. Without the shared drop-and-emit the
+    /// oversized datagram wedges the outgoing lane and the sender stalls until
+    /// the connection dies.
+    #[test]
+    fn path_reset_drops_oversized_datagrams_and_unblocks() {
+        let mut datagrams = DatagramState::default();
+        // A datagram sized for the old, larger path MTU, with a prior send
+        // blocked for lack of buffer space.
+        datagrams.test_push_outgoing(Bytes::from(vec![0u8; 1500]));
+        datagrams.send_blocked = true;
+        let mut events: VecDeque<Event> = VecDeque::new();
+
+        // The new path allows only a 1200-byte datagram payload.
+        drop_oversized_datagrams(&mut datagrams, &mut events, 1200);
+
+        assert!(
+            datagrams.outgoing.is_empty(),
+            "the oversized datagram must be dropped after the path reset"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DatagramsUnblocked)),
+            "a blocked sender must be told it may retry after the drop frees space"
+        );
+    }
+
     #[test]
     fn nat_advertisement_address_validation_rejects_unspecified_and_zero_port() {
         assert!(!is_valid_nat_advertisement_address(SocketAddr::new(

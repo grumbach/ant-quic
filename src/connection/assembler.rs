@@ -77,6 +77,16 @@ impl Assembler {
         self.buffered
     }
 
+    /// Number of disjoint received ranges tracked in unordered mode, or `None`
+    /// in ordered mode. Test-only.
+    #[cfg(test)]
+    fn recvd_ranges(&self) -> Option<usize> {
+        match &self.state {
+            State::Unordered { recvd } => Some(recvd.len()),
+            State::Ordered => None,
+        }
+    }
+
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
@@ -928,6 +938,88 @@ mod test {
             erred_at < MAX_INSERTS,
             "TooManyChunks fired only at the loop bound, not because of the cap"
         );
+    }
+
+    /// Active-reader analogue of `gapped_flood_with_withheld_prefix_is_bounded`.
+    ///
+    /// A reader that drains every chunk as it arrives keeps `self.data` near
+    /// empty, so the `MAX_CHUNKS` bound on buffered chunks never trips. But in
+    /// unordered mode the `recvd` RangeSet keeps one disjoint range per
+    /// never-filled gap and is never trimmed by reads, so without a bound on
+    /// `recvd` it grows one entry per frame while the peer keeps its
+    /// flow-control credit (delivered bytes return credit at once). The
+    /// assembler must reject the flood with `TooManyChunks` once the
+    /// disjoint-range count crosses the cap.
+    #[test]
+    fn gapped_flood_on_active_unordered_reader_is_bounded() {
+        // The cap on disjoint received ranges is 4096.
+        const CAP: usize = 4096;
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        const ALLOC: usize = 4096; // model a full packet's worth of over-allocation
+        const MAX_INSERTS: u64 = 200_000; // generous bound; the cap must trip well before this
+
+        let mut erred_at = None;
+        for i in 0..MAX_INSERTS {
+            let offset = i * 2; // 0, 2, 4, ... — odd offsets stay a one-byte gap
+            let byte = [(offset % 251) as u8];
+            match x.insert(offset, Bytes::copy_from_slice(&byte), ALLOC) {
+                Ok(()) => {
+                    // Drain immediately so buffered chunks never accumulate;
+                    // only `recvd` can grow here.
+                    while x.read(usize::MAX, false).is_some() {}
+                }
+                Err(TooManyChunks) => {
+                    erred_at = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let erred_at = erred_at.expect(
+            "assembler accepted an unbounded gapped flood on an active reader without \
+             yielding TooManyChunks",
+        );
+        assert!(
+            erred_at < MAX_INSERTS,
+            "TooManyChunks fired only at the loop bound, not because of the cap"
+        );
+        let ranges = x
+            .recvd_ranges()
+            .expect("stream is in unordered mode after ensure_ordering(false)");
+        assert!(
+            ranges <= CAP + 1,
+            "disjoint received ranges {} exceeded the cap {}",
+            ranges,
+            CAP
+        );
+    }
+
+    /// A legitimate reordered stream keeps only a transient gap open at any
+    /// instant — each gap closes when the delayed frame arrives and the
+    /// neighbouring ranges coalesce — so the `recvd` range cap must never
+    /// reject it even though it repairs far more gaps over its lifetime than
+    /// the cap. The stream stays contiguous from offset 0, so `recvd` settles
+    /// back to a single range every round.
+    #[test]
+    fn reordered_unordered_stream_with_repaired_gaps_is_not_rejected() {
+        const CAP: usize = 4096;
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        const ALLOC: usize = 1200;
+        for round in 0..(CAP as u64 * 4) {
+            let base = round * 2;
+            // Local reorder: the second byte of the pair arrives before the
+            // first, opening a one-byte gap that the next insert immediately
+            // fills, so the stream never leaves a permanent hole.
+            x.insert(base + 1, Bytes::copy_from_slice(&[1u8]), ALLOC)
+                .expect("out-of-order byte must be accepted");
+            x.insert(base, Bytes::copy_from_slice(&[2u8]), ALLOC)
+                .expect("filling the gap must coalesce, not be rejected");
+            while x.read(usize::MAX, false).is_some() {}
+        }
+        // Everything coalesced into one contiguous received range.
+        assert_eq!(x.recvd_ranges(), Some(1));
     }
 
     /// Regression test for recv-boundary-aliasing corruption

@@ -889,4 +889,62 @@ mod tests {
         let buffer = assemble_unordered_chunks(&mut chunks, 0, 4096).expect("duplicate is benign");
         assert_eq!(buffer, payload);
     }
+
+    /// RED: contiguous (in-order) one-byte chunks, one per frame, must not grow
+    /// the entry list — each continues the previous entry. Fails today: every
+    /// chunk is pushed as its own `(Vec<u8>, u64)`, so a peer sending one byte
+    /// per frame holds one heap allocation per byte up to the size limit, with
+    /// no coalescing and no cap, while `recvd` stays a single range.
+    #[test]
+    fn read_to_end_coalesces_adjacent_chunks() {
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        for i in 0..1024u64 {
+            push_read_chunk(&mut read, &[(i % 251) as u8], i).expect("contiguous push");
+        }
+        assert_eq!(
+            read.len(),
+            1,
+            "contiguous chunks must coalesce into one entry, not grow per byte"
+        );
+        assert_eq!(read[0].1, 0);
+        assert_eq!(read[0].0.len(), 1024);
+    }
+
+    /// Non-adjacent chunks cannot coalesce; the entry count is capped and the
+    /// read is rejected with `TooLong` rather than growing without bound.
+    #[test]
+    fn read_to_end_caps_entry_count_across_gaps() {
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut rejected_at = None;
+        for i in 0..(MAX_READ_TO_END_ENTRIES as u64 + 16) {
+            // One byte at every even offset: a one-byte gap keeps each chunk
+            // from continuing the previous entry.
+            match push_read_chunk(&mut read, &[1u8], i * 2) {
+                Ok(()) => {}
+                Err(ReadToEndError::TooLong) => {
+                    rejected_at = Some(i);
+                    break;
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        let rejected_at = rejected_at.expect("entry count must be capped");
+        assert_eq!(rejected_at as usize, MAX_READ_TO_END_ENTRIES);
+        assert!(read.len() <= MAX_READ_TO_END_ENTRIES);
+    }
+
+    /// Coalescing must preserve the assembled bytes: a stream delivered as many
+    /// one-byte chunks assembles to the same payload as the original.
+    #[test]
+    fn read_to_end_coalesced_entries_assemble_correctly() {
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 250 + 1) as u8).collect();
+        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        for (i, b) in payload.iter().enumerate() {
+            push_read_chunk(&mut read, &[*b], i as u64).expect("contiguous push");
+        }
+        assert_eq!(read.len(), 1);
+        let buffer = assemble_unordered_chunks(&mut read, 0, payload.len() as u64)
+            .expect("coalesced single entry must assemble");
+        assert_eq!(buffer, payload);
+    }
 }

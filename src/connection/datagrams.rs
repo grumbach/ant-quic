@@ -127,6 +127,13 @@ pub(super) struct DatagramState {
 }
 
 impl DatagramState {
+    /// Queue an outgoing datagram directly, for tests that exercise the
+    /// path-reset drop path without a full send handshake.
+    #[cfg(test)]
+    pub(super) fn test_push_outgoing(&mut self, data: Bytes) {
+        self.outgoing.push_back(Datagram { data });
+    }
+
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
@@ -532,5 +539,84 @@ mod tests {
         let result = state.received(datagram, &window);
 
         assert!(result.is_err());
+    }
+
+    /// A datagram whose payload is exactly the usable limit still fits and must
+    /// survive `drop_oversized` (`<=`, not `<`); dropping a larger one must
+    /// clear the send block and report that the caller should emit
+    /// `DatagramsUnblocked`, and must keep the payload accounting in sync.
+    #[test]
+    fn drop_oversized_keeps_limit_sized_datagram_and_unblocks() {
+        let mut state = DatagramState::default();
+        let max_payload = 1200usize;
+
+        // Exactly at the limit — must be kept.
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from(vec![0u8; max_payload]),
+        });
+        // One byte over the limit — must be dropped.
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from(vec![0u8; max_payload + 1]),
+        });
+        // A prior send was blocked for lack of space.
+        state.send_blocked = true;
+
+        let newly_unblocked = state.drop_oversized(max_payload);
+
+        // The exactly-limit-sized datagram survives (`<=`, not `<`).
+        assert_eq!(
+            state.outgoing.queue.len(),
+            1,
+            "drop_oversized must keep the datagram whose payload equals the limit"
+        );
+        assert_eq!(
+            state.outgoing.queue.front().unwrap().data.len(),
+            max_payload
+        );
+        // payload accounting stays in sync with the queue.
+        assert_eq!(state.outgoing.payload_bytes, max_payload);
+        // Dropping the oversized datagram freed space, so the block is cleared
+        // and the caller is told to emit DatagramsUnblocked.
+        assert!(
+            !state.send_blocked,
+            "drop_oversized must clear send_blocked after it frees space"
+        );
+        assert!(
+            newly_unblocked,
+            "drop_oversized must report that a blocked send is now unblocked"
+        );
+    }
+
+    /// drop_oversized must NOT signal an unblock when it drops nothing, nor when
+    /// nothing was blocked — otherwise the caller would emit a spurious
+    /// DatagramsUnblocked.
+    #[test]
+    fn drop_oversized_does_not_signal_unblock_without_a_drop() {
+        // Nothing oversized: no drop, no signal, flag untouched.
+        let mut state = DatagramState::default();
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from(vec![0u8; 1000]),
+        });
+        state.send_blocked = true;
+        assert!(
+            !state.drop_oversized(1200),
+            "no drop means no unblock signal"
+        );
+        assert_eq!(state.outgoing.queue.len(), 1);
+        assert!(
+            state.send_blocked,
+            "the flag must be left set when nothing is dropped"
+        );
+
+        // Oversized dropped but no prior block: no signal.
+        let mut state = DatagramState::default();
+        state.outgoing.push_back(Datagram {
+            data: Bytes::from(vec![0u8; 1500]),
+        });
+        assert!(
+            !state.drop_oversized(1200),
+            "dropping without a prior block must not signal an unblock"
+        );
+        assert!(state.outgoing.is_empty());
     }
 }
