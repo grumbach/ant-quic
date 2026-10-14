@@ -3638,27 +3638,18 @@ impl Connection {
                         ));
                     }
 
-                    use crate::cid_queue::InsertError;
-                    match self.rem_cids.insert(frame) {
-                        Ok(None) => {}
-                        Ok(Some((retired, reset_token))) => {
-                            self.spaces[SpaceId::Data].pending.retire_cids(retired)?;
-                            self.set_reset_token(reset_token);
+                    match apply_new_connection_id(
+                        &mut self.rem_cids,
+                        &mut self.spaces[SpaceId::Data].pending,
+                        frame,
+                    )? {
+                        NewCidOutcome::AlreadyRetired => continue,
+                        NewCidOutcome::Stored { reset_token } => {
+                            if let Some(reset_token) = reset_token {
+                                self.set_reset_token(reset_token);
+                            }
                         }
-                        Err(InsertError::ExceedsLimit) => {
-                            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
-                        }
-                        Err(InsertError::Retired) => {
-                            trace!("discarding already-retired");
-                            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
-                            // range of connection IDs larger than the active connection ID limit
-                            // was retired all at once via retire_prior_to.
-                            self.spaces[SpaceId::Data]
-                                .pending
-                                .retire_cids(frame.sequence..frame.sequence.saturating_add(1))?;
-                            continue;
-                        }
-                    };
+                    }
 
                     if self.side.is_server() && self.rem_cids.active_seq() == 0 {
                         // We're a server still using the initial remote CID for the client, so
@@ -7115,6 +7106,45 @@ impl Connection {
 #[cfg(test)]
 #[path = "pqc_mtu_regression_tests.rs"]
 mod pqc_mtu_regression_tests;
+
+/// Outcome of applying a peer's NEW_CONNECTION_ID frame to the remote CID state
+#[derive(Debug, PartialEq, Eq)]
+enum NewCidOutcome {
+    /// The frame named a CID that is already retired. Only a RETIRE_CONNECTION_ID was
+    /// queued for it.
+    AlreadyRetired,
+    /// The CID was stored. `reset_token` is the reset token of the new active CID when
+    /// the active CID was retired.
+    Stored { reset_token: Option<ResetToken> },
+}
+
+/// Apply a peer's NEW_CONNECTION_ID frame to `rem_cids`, and queue in `pending` the
+/// RETIRE_CONNECTION_ID frames that it requires
+fn apply_new_connection_id(
+    rem_cids: &mut CidQueue,
+    pending: &mut Retransmits,
+    frame: frame::NewConnectionId,
+) -> Result<NewCidOutcome, TransportError> {
+    use crate::cid_queue::InsertError;
+    match rem_cids.insert(frame) {
+        Ok(None) => Ok(NewCidOutcome::Stored { reset_token: None }),
+        Ok(Some((retired, reset_token))) => {
+            pending.retire_cids(retired)?;
+            Ok(NewCidOutcome::Stored {
+                reset_token: Some(reset_token),
+            })
+        }
+        Err(InsertError::ExceedsLimit) => Err(TransportError::CONNECTION_ID_LIMIT_ERROR("")),
+        Err(InsertError::Retired) => {
+            trace!("discarding already-retired");
+            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
+            // range of connection IDs larger than the active connection ID limit
+            // was retired all at once via retire_prior_to.
+            pending.retire_cids(frame.sequence..frame.sequence.saturating_add(1))?;
+            Ok(NewCidOutcome::AlreadyRetired)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
