@@ -148,13 +148,16 @@ impl DatagramState {
             Some(x) => *x,
         };
 
-        // Charge the fixed per-datagram overhead too, so that every queued datagram uses
-        // receive buffer space.
-        let size_with_overhead = datagram.data.len().saturating_add(size_of::<Datagram>());
-
-        if size_with_overhead > window {
+        // `window` is `datagram_receive_buffer_size`, which is also the advertised
+        // `max_datagram_frame_size`. A payload that fits that limit is legal. The
+        // fixed in-memory overhead is charged only when deciding which queued
+        // datagrams to evict, so it must not turn a legal payload into a
+        // protocol violation.
+        if datagram.data.len() > window {
             return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
         }
+
+        let size_with_overhead = datagram.data.len().saturating_add(size_of::<Datagram>());
 
         let was_empty = self.incoming.is_empty();
         let mut dropped_count = 0;
@@ -178,7 +181,9 @@ impl DatagramState {
                     "dropping stale datagram (buffer full) - application not reading fast enough"
                 );
             } else {
-                // Buffer is empty but still can't fit - shouldn't happen with valid window
+                // The payload fits the advertised limit, but payload plus the
+                // in-memory overhead exceeds `window` and nothing older is
+                // queued. Keep the datagram so a legal frame is delivered.
                 break;
             }
         }
@@ -525,6 +530,35 @@ mod tests {
             assert_eq!(state.outgoing.payload_bytes, queued);
             assert!(state.outgoing.memory_used() <= SEND_BUFFER);
         }
+    }
+
+    /// `datagram_receive_buffer_size` is advertised as `max_datagram_frame_size`.
+    /// A payload of that limit minus the DATAGRAM frame bound (1024 - 9 = 1015)
+    /// is legal and must be queued. A payload past the advertised limit is a
+    /// protocol violation.
+    #[test]
+    fn legal_datagram_payload_within_advertised_limit_is_delivered() {
+        let mut state = DatagramState::default();
+        let window = Some(1024);
+        let max_legal = 1024 - Datagram::SIZE_BOUND;
+        assert_eq!(max_legal, 1015);
+
+        let data = Bytes::from(vec![0x5Au8; max_legal]);
+        let result = state
+            .received(Datagram { data: data.clone() }, &window)
+            .expect("legal payload must not close the connection");
+        assert!(result.was_empty);
+        assert_eq!(result.dropped_count, 0);
+        assert_eq!(state.recv(), Some(data));
+
+        let oversized = Datagram {
+            data: Bytes::from(vec![0u8; 1025]),
+        };
+        let err = state.received(oversized, &window).unwrap_err();
+        assert_eq!(
+            err,
+            TransportError::PROTOCOL_VIOLATION("oversized datagram")
+        );
     }
 
     #[test]

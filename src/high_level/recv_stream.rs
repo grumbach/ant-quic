@@ -6,6 +6,7 @@
 // Full details available at https://saorsalabs.com/licenses
 
 use std::{
+    collections::BTreeMap,
     future::{Future, poll_fn},
     io,
     pin::Pin,
@@ -22,13 +23,14 @@ use crate::VarInt;
 
 /// Bound on the number of disjoint entries `read_to_end` accumulates
 ///
-/// `read_to_end` appends each delivered chunk to the previous entry when it
-/// continues it, so a contiguous stream — however it is framed — is a single
-/// entry whose bytes are bounded by the caller's `size_limit`. A new entry is
-/// needed only across a gap. This cap is the independent ceiling on the entry
-/// count; it matches the stream assembler's bound on disjoint received ranges,
-/// so ordinary reordered or lossy traffic stays well under it while the
-/// per-read overhead stays bounded regardless of how the data is framed.
+/// `read_to_end` keeps delivered chunks ordered by offset and merges a chunk
+/// into every neighbour it touches, so a contiguous stream — however it is
+/// framed or reordered — is a single entry whose bytes are bounded by the
+/// caller's `size_limit`. A new entry is needed only across a gap that is
+/// still open. This cap is the ceiling on the entry count after that merge;
+/// it matches the stream assembler's bound on disjoint received ranges, so
+/// ordinary reordered or lossy traffic stays well under it while the per-read
+/// overhead stays bounded regardless of how the data is framed.
 const MAX_READ_TO_END_ENTRIES: usize = 4096;
 
 /// A stream that can only be used to receive data
@@ -286,7 +288,7 @@ impl RecvStream {
         ReadToEnd {
             stream: self,
             size_limit,
-            read: Vec::new(),
+            read: BTreeMap::new(),
             start: u64::MAX,
             end: 0,
         }
@@ -468,7 +470,7 @@ impl<T> From<(Option<T>, Option<crate::ReadError>)> for ReadStatus<T> {
 /// See: FINDING-recv-boundary-aliasing.md
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
-    read: Vec<(Vec<u8>, u64)>,
+    read: BTreeMap<u64, Vec<u8>>,
     start: u64,
     end: u64,
     size_limit: usize,
@@ -500,7 +502,11 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Ok(Vec::new()));
                     }
                     let (start, end) = (self.start, self.end);
-                    return match assemble_unordered_chunks(&mut self.read, start, end) {
+                    let mut ordered: Vec<(Vec<u8>, u64)> = std::mem::take(&mut self.read)
+                        .into_iter()
+                        .map(|(offset, data)| (data, offset))
+                        .collect();
+                    return match assemble_unordered_chunks(&mut ordered, start, end) {
                         Some(buffer) => Poll::Ready(Ok(buffer)),
                         // End-of-stream was signaled but ranges in [start, end)
                         // were consumed elsewhere (e.g. by a dropped earlier
@@ -514,33 +520,252 @@ impl Future for ReadToEnd<'_> {
     }
 }
 
-/// Append a delivered chunk to the accumulating entry list.
+/// Insert a delivered chunk, merging it into every neighbour it touches.
 ///
 /// Bytes are copied into owned storage immediately (see [`ReadToEnd`]), dropping
-/// the `Bytes` reference before the next poll cycle. When the chunk continues
-/// the last entry (its offset equals that entry's end) its bytes are appended
-/// to that entry instead of starting a new one, so a contiguous stream stays a
-/// single entry regardless of framing and the per-read overhead is bounded by
-/// the caller's `size_limit` plus the entry count. A new entry is needed only
-/// across a gap; the entry count is capped by [`MAX_READ_TO_END_ENTRIES`], and
-/// exceeding it fails the read with [`ReadToEndError::TooLong`], the same way
-/// the offset-span limit does.
+/// the `Bytes` reference before the next poll cycle. Entries stay ordered by
+/// offset. A chunk that continues an entry, precedes one, or closes the gap
+/// between two is absorbed, so a contiguous stream stays a single entry
+/// whichever order the chunks arrive in. The entry count is capped by
+/// [`MAX_READ_TO_END_ENTRIES`] after that merge. A chunk that still needs its
+/// own entry past the cap fails the read with [`ReadToEndError::TooLong`], the
+/// same way the offset-span limit does.
+///
+/// Overlapping bytes must match. A mismatch is the same integrity failure
+/// [`assemble_unordered_chunks`] reports, and fails the read with
+/// [`ReadToEndError::MissingData`].
 fn push_read_chunk(
-    read: &mut Vec<(Vec<u8>, u64)>,
+    read: &mut BTreeMap<u64, Vec<u8>>,
     bytes: &[u8],
     offset: u64,
 ) -> Result<(), ReadToEndError> {
-    if let Some((buf, start)) = read.last_mut() {
-        if start.checked_add(buf.len() as u64) == Some(offset) {
-            buf.extend_from_slice(bytes);
-            return Ok(());
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(new_end) = offset.checked_add(bytes.len() as u64) else {
+        return Err(ReadToEndError::TooLong);
+    };
+
+    if extend_exact_predecessor(read, bytes, offset, new_end) {
+        return Ok(());
+    }
+    if prepend_exact_successor(read, bytes, offset, new_end) {
+        return Ok(());
+    }
+    merge_overlapping_or_insert(read, bytes, offset, new_end)
+}
+
+/// Append `bytes` when they start exactly where an existing entry ends.
+///
+/// Returns `false` when the chunk overlaps that entry or a later one, so the
+/// caller can merge with an integrity check instead of overwriting bytes.
+fn extend_exact_predecessor(
+    read: &mut BTreeMap<u64, Vec<u8>>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> bool {
+    let Some((&prev_off, prev)) = read.range(..=offset).next_back() else {
+        return false;
+    };
+    let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+        return false;
+    };
+    if prev_end != offset {
+        return false;
+    }
+    // A later entry that starts inside this chunk overlaps it.
+    if read.range(offset..new_end).next().is_some() {
+        return false;
+    }
+    let Some(prev) = read.get_mut(&prev_off) else {
+        return false;
+    };
+    prev.extend_from_slice(bytes);
+    absorb_following(read, prev_off);
+    true
+}
+
+/// Place `bytes` immediately before the entry that starts at `new_end`.
+///
+/// Returns `false` when any stored entry overlaps the new chunk.
+fn prepend_exact_successor(
+    read: &mut BTreeMap<u64, Vec<u8>>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> bool {
+    if let Some((&prev_off, prev)) = read.range(..=offset).next_back() {
+        let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+            return false;
+        };
+        if prev_end > offset {
+            return false;
         }
     }
-    if read.len() >= MAX_READ_TO_END_ENTRIES {
+    if read.range(offset..new_end).next().is_some() {
+        return false;
+    }
+    let Some(next) = read.remove(&new_end) else {
+        return false;
+    };
+    let mut merged = bytes.to_vec();
+    merged.extend_from_slice(&next);
+    read.insert(offset, merged);
+    let start = absorb_preceding(read, offset);
+    absorb_following(read, start);
+    true
+}
+
+/// Fold the entry that ends at `start` into that entry. Returns the key of the
+/// combined entry.
+fn absorb_preceding(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) -> u64 {
+    let Some((&prev_off, prev)) = read.range(..start).next_back() else {
+        return start;
+    };
+    let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+        return start;
+    };
+    if prev_end != start {
+        return start;
+    }
+    let Some(current) = read.remove(&start) else {
+        return start;
+    };
+    let Some(prev) = read.get_mut(&prev_off) else {
+        read.insert(start, current);
+        return start;
+    };
+    prev.extend_from_slice(&current);
+    prev_off
+}
+
+/// Append every entry that now starts where `start` ends.
+fn absorb_following(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) {
+    loop {
+        let Some(buf) = read.get(&start) else {
+            return;
+        };
+        let Some(end) = start.checked_add(buf.len() as u64) else {
+            return;
+        };
+        let Some(next) = read.remove(&end) else {
+            return;
+        };
+        let Some(buf) = read.get_mut(&start) else {
+            read.insert(end, next);
+            return;
+        };
+        buf.extend_from_slice(&next);
+    }
+}
+
+/// Merge `bytes` into every entry they overlap, or insert them as a new entry.
+///
+/// The cap is applied after the merge: a chunk absorbed by a neighbour does
+/// not consume a new slot.
+fn merge_overlapping_or_insert(
+    read: &mut BTreeMap<u64, Vec<u8>>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> Result<(), ReadToEndError> {
+    let mut merge_from = offset;
+    if let Some((&prev_off, prev)) = read.range(..=offset).next_back() {
+        if let Some(prev_end) = prev_off.checked_add(prev.len() as u64)
+            && prev_end > offset
+        {
+            merge_from = prev_off;
+        }
+    }
+
+    let keys: Vec<u64> = read
+        .range(merge_from..=new_end)
+        .map(|(&key, _)| key)
+        .collect();
+    if keys.is_empty() {
+        if read.len() >= MAX_READ_TO_END_ENTRIES {
+            return Err(ReadToEndError::TooLong);
+        }
+        read.insert(offset, bytes.to_vec());
+        return Ok(());
+    }
+
+    let first = keys[0];
+    let last = keys[keys.len() - 1];
+    let last_len = read.get(&last).map_or(0, Vec::len);
+    let Some(last_end) = last.checked_add(last_len as u64) else {
+        return Err(ReadToEndError::TooLong);
+    };
+    let merged_start = first.min(offset);
+    let merged_end = last_end.max(new_end);
+    let Ok(merged_len) = usize::try_from(merged_end - merged_start) else {
+        return Err(ReadToEndError::TooLong);
+    };
+    let mut merged = vec![0u8; merged_len];
+    for key in &keys {
+        let Some(buf) = read.get(key) else {
+            continue;
+        };
+        let base = usize::try_from(*key - merged_start).unwrap_or(merged_len);
+        let end = base.saturating_add(buf.len());
+        if end > merged.len() || base > merged.len() {
+            return Err(ReadToEndError::TooLong);
+        }
+        merged[base..end].copy_from_slice(buf);
+    }
+
+    let base = usize::try_from(offset - merged_start).unwrap_or(merged_len);
+    for (i, &byte) in bytes.iter().enumerate() {
+        let idx = base.saturating_add(i);
+        let abs = offset + i as u64;
+        if let Some(existing) = stored_byte(read, &keys, abs) {
+            if existing != byte {
+                let first_diff = bytes.iter().enumerate().position(|(j, b)| {
+                    stored_byte(read, &keys, offset + j as u64).is_some_and(|prev| prev != *b)
+                });
+                tracing::error!(
+                    target: "ant_quic::data_integrity",
+                    stream_offset = offset,
+                    overlap_len = bytes.len(),
+                    first_diff_within_overlap = first_diff,
+                    "DATA INTEGRITY VIOLATION: overlapping stream chunks have \
+                     different byte content at the same offset — the transport \
+                     delivered corrupt data. Dropping message to prevent silent \
+                     corruption of signed payloads."
+                );
+                return Err(ReadToEndError::MissingData);
+            }
+        } else if idx >= merged.len() {
+            return Err(ReadToEndError::TooLong);
+        } else {
+            merged[idx] = byte;
+        }
+    }
+
+    for key in &keys {
+        read.remove(key);
+    }
+    read.insert(merged_start, merged);
+    if read.len() > MAX_READ_TO_END_ENTRIES {
         return Err(ReadToEndError::TooLong);
     }
-    read.push((bytes.to_vec(), offset));
     Ok(())
+}
+
+fn stored_byte(read: &BTreeMap<u64, Vec<u8>>, keys: &[u64], abs: u64) -> Option<u8> {
+    for key in keys {
+        let Some(buf) = read.get(key) else {
+            continue;
+        };
+        let Some(end) = key.checked_add(buf.len() as u64) else {
+            continue;
+        };
+        if abs >= *key && abs < end {
+            return buf.get((abs - key) as usize).copied();
+        }
+    }
+    None
 }
 
 /// Assemble unordered chunks into a contiguous buffer
@@ -897,7 +1122,7 @@ mod tests {
     /// no coalescing and no cap, while `recvd` stays a single range.
     #[test]
     fn read_to_end_coalesces_adjacent_chunks() {
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         for i in 0..1024u64 {
             push_read_chunk(&mut read, &[(i % 251) as u8], i).expect("contiguous push");
         }
@@ -906,15 +1131,16 @@ mod tests {
             1,
             "contiguous chunks must coalesce into one entry, not grow per byte"
         );
-        assert_eq!(read[0].1, 0);
-        assert_eq!(read[0].0.len(), 1024);
+        let (&start, buf) = read.iter().next().expect("one coalesced entry");
+        assert_eq!(start, 0);
+        assert_eq!(buf.len(), 1024);
     }
 
     /// Non-adjacent chunks cannot coalesce; the entry count is capped and the
     /// read is rejected with `TooLong` rather than growing without bound.
     #[test]
     fn read_to_end_caps_entry_count_across_gaps() {
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         let mut rejected_at = None;
         for i in 0..(MAX_READ_TO_END_ENTRIES as u64 + 16) {
             // One byte at every even offset: a one-byte gap keeps each chunk
@@ -933,18 +1159,69 @@ mod tests {
         assert!(read.len() <= MAX_READ_TO_END_ENTRIES);
     }
 
+    /// Chunks delivered as offsets 1,0,3,2,... are one contiguous stream. Each
+    /// gap-filling byte has to merge with the neighbours on either side, so
+    /// the 4096-entry cap is not spent on a reordered run that still fits in
+    /// `size_limit`. `read_to_end` then assembles the original payload.
+    #[test]
+    fn read_to_end_accepts_out_of_order_gap_fill_past_entry_cap() {
+        let count = MAX_READ_TO_END_ENTRIES + 2;
+        let size_limit = 16 * 1024 * 1024;
+        assert!(count > MAX_READ_TO_END_ENTRIES);
+        assert!(count <= size_limit);
+
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; count];
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for pair in 0..(count / 2) {
+            for offset in [pair * 2 + 1, pair * 2] {
+                let byte = ((offset * 17) % 251) as u8;
+                payload[offset] = byte;
+                let offset = offset as u64;
+                start = start.min(offset);
+                let chunk_end = offset + 1;
+                assert!(
+                    chunk_end - start <= size_limit as u64,
+                    "span exceeded size_limit"
+                );
+                end = end.max(chunk_end);
+                push_read_chunk(&mut read, &[byte], offset)
+                    .expect("gap-filling chunk under the entry cap");
+            }
+        }
+        assert_eq!(start, 0);
+        assert_eq!(end, count as u64);
+        assert_eq!(
+            read.len(),
+            1,
+            "contiguous out-of-order chunks must merge into one entry"
+        );
+        let buffer =
+            assemble_entries(&read, start, end).expect("read_to_end assembles a contiguous stream");
+        assert_eq!(buffer, payload);
+    }
+
     /// Coalescing must preserve the assembled bytes: a stream delivered as many
     /// one-byte chunks assembles to the same payload as the original.
     #[test]
     fn read_to_end_coalesced_entries_assemble_correctly() {
         let payload: Vec<u8> = (0..2048u32).map(|i| (i % 250 + 1) as u8).collect();
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         for (i, b) in payload.iter().enumerate() {
             push_read_chunk(&mut read, &[*b], i as u64).expect("contiguous push");
         }
         assert_eq!(read.len(), 1);
-        let buffer = assemble_unordered_chunks(&mut read, 0, payload.len() as u64)
+        let buffer = assemble_entries(&read, 0, payload.len() as u64)
             .expect("coalesced single entry must assemble");
         assert_eq!(buffer, payload);
+    }
+
+    fn assemble_entries(read: &BTreeMap<u64, Vec<u8>>, start: u64, end: u64) -> Option<Vec<u8>> {
+        let mut chunks: Vec<(Vec<u8>, u64)> = read
+            .iter()
+            .map(|(&offset, data)| (data.clone(), offset))
+            .collect();
+        assemble_unordered_chunks(&mut chunks, start, end)
     }
 }
