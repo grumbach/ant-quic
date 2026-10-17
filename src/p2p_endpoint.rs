@@ -3606,6 +3606,11 @@ fn emit_peer_lifecycle_event(
     peer_id: PeerId,
     event: PeerLifecycleEvent,
 ) {
+    // Hold the write lock across both sends so concurrent emitters cannot
+    // interleave them: subscribers to the all-peer and per-peer streams must
+    // observe one peer's events in the same order (#322). Both sends are
+    // non-blocking, so the critical section stays short.
+    let channels = peer_event_channels.write();
     if let Err(e) = peer_event_tx.send((peer_id, event.clone())) {
         tracing::warn!(
             target: "ant_quic::silent_drop",
@@ -3615,7 +3620,7 @@ fn emit_peer_lifecycle_event(
             "silent drop"
         );
     }
-    if let Some(sender) = peer_event_channels.read().get(&peer_id).cloned() {
+    if let Some(sender) = channels.get(&peer_id) {
         if let Err(e) = sender.send(event) {
             tracing::warn!(
                 target: "ant_quic::silent_drop",
@@ -12730,6 +12735,63 @@ impl Clone for P2pEndpoint {
 
 #[cfg(test)]
 mod tests {
+    /// #322: concurrent emitters for one peer must not interleave the
+    /// all-peer and per-peer sends, or the two streams disagree on order.
+    #[test]
+    fn concurrent_lifecycle_emits_keep_stream_order_in_parity() {
+        use super::*;
+
+        const THREADS: u64 = 4;
+        const EVENTS_PER_THREAD: u64 = 50;
+        const ROUNDS: usize = 50;
+
+        let peer_id = PeerId([7u8; 32]);
+        for round in 0..ROUNDS {
+            let (peer_event_tx, mut all_rx) = broadcast::channel(PEER_EVENT_CHANNEL_CAPACITY);
+            let channels = Arc::new(ParkingRwLock::new(HashMap::new()));
+            let mut per_peer_rx = peer_event_sender(&channels, peer_id).subscribe();
+            let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let peer_event_tx = peer_event_tx.clone();
+                    let channels = Arc::clone(&channels);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for i in 0..EVENTS_PER_THREAD {
+                            emit_peer_lifecycle_event(
+                                &peer_event_tx,
+                                &channels,
+                                peer_id,
+                                PeerLifecycleEvent::Established {
+                                    generation: t * 1_000 + i,
+                                },
+                            );
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("emitter thread");
+            }
+
+            let mut all_order = Vec::new();
+            while let Ok((_, event)) = all_rx.try_recv() {
+                all_order.push(event);
+            }
+            let mut per_peer_order = Vec::new();
+            while let Ok(event) = per_peer_rx.try_recv() {
+                per_peer_order.push(event);
+            }
+            assert_eq!(all_order.len() as u64, THREADS * EVENTS_PER_THREAD);
+            assert_eq!(
+                all_order, per_peer_order,
+                "round {round}: all-peer and per-peer streams diverged"
+            );
+        }
+    }
+
     #[cfg(all(test, feature = "network-discovery"))]
     async fn shim_node() -> Arc<P2pEndpoint> {
         Arc::new(
