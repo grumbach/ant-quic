@@ -400,8 +400,8 @@ pub(super) struct SecurityValidationState {
     coordination_requests: VecDeque<CoordinationRequest>,
     /// Maximum coordination requests per time window
     max_coordination_per_window: u32,
-    /// Address validation cache to avoid repeated validation
-    address_validation_cache: HashMap<SocketAddr, AddressValidationResult>,
+    /// Address validation results and their validation times
+    address_validation_cache: HashMap<SocketAddr, (AddressValidationResult, Instant)>,
     /// Cache timeout for address validation
     validation_cache_timeout: Duration,
 }
@@ -795,13 +795,15 @@ impl SecurityValidationState {
     /// Validate an address for security concerns
     fn validate_address(&mut self, addr: SocketAddr, now: Instant) -> AddressValidationResult {
         // Check cache first
-        if let Some(&cached_result) = self.address_validation_cache.get(&addr) {
-            return cached_result;
+        if let Some(&(cached_result, validated_at)) = self.address_validation_cache.get(&addr) {
+            if now.saturating_duration_since(validated_at) < self.validation_cache_timeout {
+                return cached_result;
+            }
         }
         let result = self.perform_address_validation(addr);
 
         // Cache the result
-        self.address_validation_cache.insert(addr, result);
+        self.address_validation_cache.insert(addr, (result, now));
 
         // Clean up old cache entries periodically
         if self.address_validation_cache.len() > 1000 {
@@ -854,8 +856,9 @@ impl SecurityValidationState {
             }
         }
 
-        // Check port range
-        if addr.port() == 0 || addr.port() < 1024 {
+        // Apply the same QUIC port allowlist used for configured peer addresses.
+        if addr.port() < 1024 && !crate::config::validation::is_allowed_privileged_port(addr.port())
+        {
             return AddressValidationResult::Suspicious;
         }
 
@@ -888,9 +891,12 @@ impl SecurityValidationState {
     }
 
     /// Clean up old address validation cache entries
-    fn cleanup_address_cache(&mut self, _now: Instant) {
-        // Simple cleanup - remove random entries to keep size bounded
-        // In production, this would use LRU or timestamp-based cleanup
+    fn cleanup_address_cache(&mut self, now: Instant) {
+        self.address_validation_cache
+            .retain(|_, (_, validated_at)| {
+                now.saturating_duration_since(*validated_at) < self.validation_cache_timeout
+            });
+        // Keep the cache bounded even when all remaining entries are fresh.
         if self.address_validation_cache.len() > 500 {
             let keys_to_remove: Vec<_> = self
                 .address_validation_cache
@@ -3980,6 +3986,152 @@ impl BootstrapCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_243_quic_ports_form_remote_candidate_pairs() {
+        let now = Instant::now();
+        let ipv4 = Ipv4Addr::new(93, 184, 215, 123);
+        let ips = [
+            IpAddr::V4(ipv4),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)),
+            IpAddr::V6(ipv4.to_ipv6_mapped()),
+        ];
+
+        for ip in ips {
+            for port in [443, 80, 853, 1024, 65535] {
+                let mut state = create_test_state();
+                let local = SocketAddr::new(ip, 5000);
+                let remote = SocketAddr::new(ip, port);
+                state.add_local_candidate(local, CandidateSource::Local, now);
+                let sequence = VarInt::from_u32(1);
+
+                state
+                    .add_remote_candidate(sequence, remote, VarInt::from_u32(100), now)
+                    .unwrap_or_else(|error| panic!("candidate {remote} rejected: {error}"));
+
+                assert_eq!(state.remote_candidates[&sequence].address, remote);
+                assert!(
+                    state
+                        .candidate_pairs
+                        .iter()
+                        .any(|pair| { pair.local_addr == local && pair.remote_addr == remote })
+                );
+                assert_eq!(state.stats.security_rejections, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn issue_243_port_allowlist_preserves_security_checks() {
+        let mut state = create_test_state();
+        let now = Instant::now();
+        for port in [0, 22, 53, 1023] {
+            assert!(matches!(
+                state.add_remote_candidate(
+                    VarInt::from_u32(1),
+                    SocketAddr::from(([93, 184, 215, 123], port)),
+                    VarInt::from_u32(100),
+                    now,
+                ),
+                Err(NatTraversalError::SecurityValidationFailed)
+            ));
+        }
+        for addr in [
+            SocketAddr::from(([0, 0, 0, 0], 443)),
+            SocketAddr::from(([224, 0, 0, 1], 443)),
+            SocketAddr::from(([192, 0, 2, 1], 443)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 443),
+            SocketAddr::from(([0xff02, 0, 0, 0, 0, 0, 0, 1], 443)),
+        ] {
+            assert!(
+                state
+                    .add_remote_candidate(VarInt::from_u32(1), addr, VarInt::from_u32(100), now)
+                    .is_err()
+            );
+        }
+        assert!(state.remote_candidates.is_empty());
+        assert!(state.candidate_pairs.is_empty());
+    }
+
+    #[test]
+    fn issue_243_validation_cache_expires_all_verdicts() {
+        let mut security = SecurityValidationState::new();
+        let now = Instant::now();
+        for (addr, expected) in [
+            (
+                SocketAddr::from(([93, 184, 215, 123], 5000)),
+                AddressValidationResult::Valid,
+            ),
+            (
+                SocketAddr::from(([0, 0, 0, 0], 5000)),
+                AddressValidationResult::Invalid,
+            ),
+            (
+                SocketAddr::from(([224, 0, 0, 1], 5000)),
+                AddressValidationResult::Suspicious,
+            ),
+        ] {
+            assert_eq!(security.validate_address(addr, now), expected);
+        }
+        let expiry = now + security.validation_cache_timeout;
+        security.cleanup_address_cache(expiry - Duration::from_nanos(1));
+        assert_eq!(security.address_validation_cache.len(), 3);
+
+        let fresh = SocketAddr::from(([93, 184, 215, 124], 5000));
+        assert_eq!(
+            security.validate_address(fresh, expiry),
+            AddressValidationResult::Valid
+        );
+        security.cleanup_address_cache(expiry);
+        assert_eq!(security.address_validation_cache.len(), 1);
+        assert!(security.address_validation_cache.contains_key(&fresh));
+    }
+
+    #[test]
+    fn issue_243_cache_lookup_revalidates_without_extending_on_hits() {
+        let now = Instant::now();
+        for (addr, cached, expected) in [
+            (
+                SocketAddr::from(([93, 184, 215, 123], 443)),
+                AddressValidationResult::Suspicious,
+                AddressValidationResult::Valid,
+            ),
+            (
+                SocketAddr::from(([93, 184, 215, 123], 443)),
+                AddressValidationResult::Invalid,
+                AddressValidationResult::Valid,
+            ),
+            (
+                SocketAddr::from(([0, 0, 0, 0], 443)),
+                AddressValidationResult::Valid,
+                AddressValidationResult::Invalid,
+            ),
+        ] {
+            let mut security = SecurityValidationState::new();
+            // Seed an earlier verdict without changing process-wide environment variables.
+            security
+                .address_validation_cache
+                .insert(addr, (cached, now));
+            let expiry = now + security.validation_cache_timeout;
+            assert_eq!(
+                security.validate_address(addr, expiry - Duration::from_nanos(1)),
+                cached
+            );
+            assert_eq!(security.address_validation_cache[&addr].1, now);
+            assert_eq!(security.validate_address(addr, expiry), expected);
+            assert_eq!(security.address_validation_cache[&addr], (expected, expiry));
+        }
+    }
+
+    #[test]
+    fn issue_243_validation_cache_remains_bounded_with_fresh_entries() {
+        let mut security = SecurityValidationState::new();
+        let now = Instant::now();
+        for port in 5000..6200 {
+            security.validate_address(SocketAddr::from(([93, 184, 215, 123], port)), now);
+            assert!(security.address_validation_cache.len() <= 1000);
+        }
+    }
 
     // v0.13.0: Role parameter removed - all nodes are symmetric P2P nodes
     /// #262: seeding local candidates (the endpoint-side fix) makes pairs
