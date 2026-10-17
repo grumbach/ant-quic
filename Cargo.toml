@@ -112,8 +112,9 @@ dirs = "5.0"
 keyring = "3"
 
 # Crypto dependencies (required for PQC)
-# RUSTSEC-2026-0285 requires >=0.23.45; retains MLKEM1024 support from 0.23.40 (issue #223).
-rustls = { version = "0.23.45", default-features = false, features = ["std", "aws-lc-rs"] }
+# RUSTSEC-2026-0285 requires >=0.23.45 and RUSTSEC-2026-0346..0349 require >=0.23.46;
+# retains MLKEM1024 support from 0.23.40 (issue #223).
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws-lc-rs"] }
 aws-lc-rs = { version = "1.16", default-features = false, features = ["unstable", "aws-lc-sys", "prebuilt-nasm"] }
 rustls-platform-verifier = { version = "0.6", optional = true }
 # PQC crypto - required in v0.12.0+

@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Dependencies
 
-- `Cargo.lock`: rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
-  -0349). Lockfile only; the `Cargo.toml` requirement does not change.
+- rustls 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349). The
+  `Cargo.toml` requirement is now `0.23.46`, so a fresh resolve cannot select
+  an affected version; `Cargo.lock` already had 0.23.46.
 
 ### Tests
 
