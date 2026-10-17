@@ -20335,6 +20335,16 @@ mod tests {
             what: &str,
             accept: impl Fn(&QuicConnection) -> bool,
         ) -> QuicConnection {
+            wait_for_winner_with_diag(node, peer, what, accept, String::new).await
+        }
+
+        async fn wait_for_winner_with_diag(
+            node: &P2pEndpoint,
+            peer: &PeerId,
+            what: &str,
+            accept: impl Fn(&QuicConnection) -> bool,
+            diag: impl Fn() -> String,
+        ) -> QuicConnection {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
                 if let Some(connection) = winner(node, peer).await
@@ -20344,7 +20354,8 @@ mod tests {
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "timed out waiting until {what}"
+                    "timed out waiting until {what}{}",
+                    diag()
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -21139,6 +21150,15 @@ mod tests {
         /// nothing else. No outer peer record, no lifecycle event, no
         /// lifecycle entry beyond the registrar's own (#313 R1 tracks the
         /// winner), and the winner map still routes to the same connection.
+        ///
+        /// Fixture scheduling note: B's CoordinationAccepted dial to A can be
+        /// followed by an A→B inbound (punch/dial back) during the settle
+        /// sleep. B's accept path then registers the outer peer and may
+        /// supersede C_B — the same class of fixture race as n1_opposite
+        /// (concurrent path mutates state before the observation completes).
+        /// Hold B's inbounds until after the C4 asserts so adoption is the
+        /// only path under test. Reproduces on base master with a forced
+        /// `raw_dial(&a, b_addr)` while `_accept_b` runs.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn raw_winner_adoption_is_reader_only() {
             let a = shim_node().await;
@@ -21149,6 +21169,9 @@ mod tests {
             let _accept_a = shim_accept(&a);
             let _accept_b = shim_accept(&b);
             let _accept_z = shim_accept(&z);
+            // Park A→B inbounds before registration so accept cannot install
+            // an outer peer (or supersede C_B) during the settle window.
+            let _inbound_hold = b.inner.arm_inbound_hold_for_test();
             let mut b_events = b.subscribe_all_peer_events();
 
             let unrelated = raw_dial(&b, shim_addr(&z)).await;
@@ -21168,19 +21191,22 @@ mod tests {
             wait_for_reader(&b, &a_peer, c_b.stable_id(), "B's adopted reader on C_B").await;
             tokio::time::sleep(Duration::from_millis(500)).await;
 
+            let lifecycle = b.inner.lifecycle_entries_for_test(&a_peer);
+            let outer = b.connected_peers.read().await.get(&a_peer).cloned();
             assert!(
-                !b.connected_peers.read().await.contains_key(&a_peer),
-                "a reader adoption must not record an outer peer"
+                outer.is_none(),
+                "a reader adoption must not record an outer peer; \
+                 c_b={} lifecycle={lifecycle:?} outer={outer:?}",
+                c_b.stable_id(),
             );
             assert_eq!(
-                b.inner
-                    .lifecycle_entries_for_test(&a_peer)
+                lifecycle
                     .iter()
                     .map(|(stable_id, _, _)| *stable_id)
                     .collect::<Vec<_>>(),
                 vec![c_b.stable_id()],
                 "R1: the lifecycle holds only the registrar's entry for C_B; the adoption \
-                 adds none"
+                 adds none; lifecycle={lifecycle:?} outer={outer:?}"
             );
             let routed = winner(&b, &a_peer).await.expect("B still routes to A");
             assert_eq!(routed.stable_id(), c_b.stable_id(), "routing unchanged");
@@ -22135,6 +22161,15 @@ mod tests {
             /// could close both. Under N1, in both role assignments, the
             /// follower follows the arbiter's winner (A6), only the arbiter
             /// retires, a common connection survives, and the pair converges.
+            ///
+            /// Fixture scheduling note: `Timing::fast()` uses Q = 1.5 s. If A
+            /// is allowed to retire superseded H while B's first registration
+            /// is still parked, H is `LocallyClosed` before `gate.release()`
+            /// and B rejects it (`!is_open()`), so the wait for "H is B's
+            /// winner" times out (Intel macOS Platforms). Hold quiet/follow
+            /// until opposite winners are installed, then restore fast N1.
+            /// Reproduces on base master with the same fixture; not caused by
+            /// the receive-path changes in this PR.
             #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
             async fn n1_opposite_choices_keep_a_survivor_and_converge() {
                 for a_is_arbiter in [true, false] {
@@ -22150,6 +22185,19 @@ mod tests {
                     let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
                     let _accept_a = shim_accept(&a);
                     let _accept_b = shim_accept(&b);
+                    // Keep H open while parked: long quiet + no follow until
+                    // the opposite-winner fixture check completes.
+                    let fixture_timing = retirement_test_hooks::Timing {
+                        quiet: Duration::from_secs(60),
+                        ..retirement_test_hooks::Timing::fast()
+                    };
+                    set_timing(&a, fixture_timing);
+                    set_timing(&b, fixture_timing);
+                    for node in [&a, &b] {
+                        hooks(node)
+                            .follow_suppressed
+                            .store(true, AtomicOrdering::SeqCst);
+                    }
                     let gate = b.inner.arm_first_registration_gate_for_test();
 
                     a.inner
@@ -22179,18 +22227,74 @@ mod tests {
                         connection.stable_id() != h.stable_id()
                     })
                     .await;
+                    let g_c =
+                        wait_for_generation(&b, &a_peer, "B registers C first", |_| true).await;
                     let b_c = wait_for_winner(&b, &a_peer, "B registers C first", |_| true).await;
                     wait_for_reader(&b, &a_peer, b_c.stable_id(), "B's reader on C").await;
+                    assert!(
+                        h.close_reason().is_none(),
+                        "a_is_arbiter={a_is_arbiter}: H must stay open until B registers it; \
+                         A_open={:?} B_open={:?} claims(A)={} completions(A)={}",
+                        open_ids(&a, &b_peer),
+                        open_ids(&b, &a_peer),
+                        claims(&a),
+                        completions(&a),
+                    );
                     gate.release();
-                    let b_h = wait_for_winner(&b, &a_peer, "H is B's winner", |connection| {
-                        connection.stable_id() != b_c.stable_id()
-                    })
+                    wait_for_generation(
+                        &b,
+                        &a_peer,
+                        "B registers H as the newer generation",
+                        |g| g > g_c,
+                    )
+                    .await;
+                    let b_h = wait_for_winner_with_diag(
+                        &b,
+                        &a_peer,
+                        "H is B's winner",
+                        |connection| connection.stable_id() != b_c.stable_id(),
+                        || {
+                            format!(
+                                "; a_is_arbiter={a_is_arbiter}; gate released; \
+                                 H.close={:?}; C.close={:?}; b_c.stable_id={}; \
+                                 A_open={:?}; B_open={:?}; B_winner={:?}; \
+                                 claims(A/B)={}/{}; follows(A/B)={}/{}; \
+                                 completions(A/B)={}/{}",
+                                h.close_reason(),
+                                c.close_reason(),
+                                b_c.stable_id(),
+                                open_ids(&a, &b_peer),
+                                open_ids(&b, &a_peer),
+                                b.inner
+                                    .get_connection(&a_peer)
+                                    .ok()
+                                    .flatten()
+                                    .map(|w| w.stable_id()),
+                                claims(&a),
+                                claims(&b),
+                                follows(&a),
+                                follows(&b),
+                                completions(&a),
+                                completions(&b),
+                            )
+                        },
+                    )
                     .await;
                     assert_ne!(
                         connection_id_of(&a, &b_peer, c.stable_id()),
                         connection_id_of(&b, &a_peer, b_h.stable_id()),
-                        "fixture: the two ends keep opposite winners"
+                        "fixture: the two ends keep opposite winners \
+                         (a_is_arbiter={a_is_arbiter})"
                     );
+
+                    // Restore fast N1 so convergence / retirement still run.
+                    for node in [&a, &b] {
+                        hooks(node)
+                            .follow_suppressed
+                            .store(false, AtomicOrdering::SeqCst);
+                    }
+                    set_timing(&a, retirement_test_hooks::Timing::fast());
+                    set_timing(&b, retirement_test_hooks::Timing::fast());
 
                     let kept = wait_for_convergence(&a, &b, RETIRE_WITHIN).await;
                     let (arbiter, follower) = if a_is_arbiter { (&a, &b) } else { (&b, &a) };

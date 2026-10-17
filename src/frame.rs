@@ -201,7 +201,7 @@ pub(crate) enum Frame {
     PathChallenge(u64),
     PathResponse(u64),
     Close(Close),
-    Datagram(Datagram),
+    Datagram(Datagram, usize),
     AckFrequency(AckFrequency),
     ImmediateAck,
     HandshakeDone,
@@ -248,7 +248,7 @@ impl Frame {
             NewConnectionId { .. } => FrameType::NEW_CONNECTION_ID,
             Crypto(_) => FrameType::CRYPTO,
             NewToken(_) => FrameType::NEW_TOKEN,
-            Datagram(_) => FrameType(*DATAGRAM_TYS.start()),
+            Datagram(..) => FrameType(*DATAGRAM_TYS.start()),
             AckFrequency(_) => FrameType::ACK_FREQUENCY,
             ImmediateAck => FrameType::IMMEDIATE_ACK,
             HandshakeDone => FrameType::HANDSHAKE_DONE,
@@ -744,6 +744,7 @@ impl Iter {
     }
 
     fn try_next(&mut self) -> Result<Frame, IterErr> {
+        let frame_start = self.bytes.remaining();
         let ty = self.bytes.get::<FrameType>()?;
         self.last_ty = Some(ty);
         Ok(match ty {
@@ -913,13 +914,16 @@ impl Iter {
                         },
                     })
                 } else if let Some(d) = ty.datagram() {
-                    Frame::Datagram(Datagram {
-                        data: if d.len() {
-                            self.take_len()?
-                        } else {
-                            self.take_remaining()
-                        },
-                    })
+                    let data = if d.len() {
+                        self.take_len()?
+                    } else {
+                        self.take_remaining()
+                    };
+                    // `Frame::Datagram` carries the encoded frame length (type,
+                    // optional length and payload): RFC 9221 §3 checks that,
+                    // not the payload, against `max_datagram_frame_size`.
+                    let frame_len = frame_start - self.bytes.remaining();
+                    Frame::Datagram(Datagram { data }, frame_len)
                 } else {
                     return Err(IterErr::InvalidFrameId);
                 }
@@ -1130,6 +1134,9 @@ impl FrameStruct for Datagram {
 }
 
 impl Datagram {
+    /// Encoded size of an empty DATAGRAM frame with a length field.
+    pub(crate) const MIN_LENGTH_PREFIXED_SIZE: usize = 2;
+
     pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
         if self.try_encode(length, out).is_err() {
             log_encode_overflow("Datagram");

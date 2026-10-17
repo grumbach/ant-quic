@@ -698,3 +698,64 @@ pub(crate) use frame::Frame;
 pub use token::TokenStore;
 pub(crate) use token::{NoneTokenLog, ResetToken, TokenLog};
 pub(crate) use token_memory_cache::TokenMemoryCache;
+
+/// Test-only allocator that can tally requested bytes on the current thread.
+///
+/// Used by `high_level::recv_stream` copy-cost regressions so a silent
+/// `VecDeque` rebuild in `StoredRun::prepend_new` cannot dodge the counter.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static REQUESTED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    fn note(size: usize) {
+        ACTIVE.with(|active| {
+            if active.get() {
+                REQUESTED.with(|requested| {
+                    requested.set(requested.get().saturating_add(size as u64));
+                });
+            }
+        });
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    pub(crate) fn begin() {
+        REQUESTED.with(|requested| requested.set(0));
+        ACTIVE.with(|active| active.set(true));
+    }
+
+    pub(crate) fn end() -> u64 {
+        ACTIVE.with(|active| active.set(false));
+        REQUESTED.with(|requested| requested.get())
+    }
+}

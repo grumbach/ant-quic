@@ -3422,7 +3422,7 @@ impl Connection {
                 Frame::Stream(f) => {
                     trace!(id = %f.id, offset = f.offset, len = f.data.len(), fin = f.fin, "got stream frame");
                 }
-                Frame::Datagram(f) => {
+                Frame::Datagram(f, _) => {
                     trace!(len = f.data.len(), "got datagram frame");
                 }
                 f => {
@@ -3681,11 +3681,13 @@ impl Connection {
                     trace!("got new token");
                     token_store.insert(server_name, token);
                 }
-                Frame::Datagram(datagram) => {
+                Frame::Datagram(datagram, frame_len) => {
                     datagram_received = true;
-                    let result = self
-                        .datagrams
-                        .received(datagram, &self.config.datagram_receive_buffer_size)?;
+                    let result = self.datagrams.received(
+                        datagram,
+                        frame_len,
+                        &self.config.datagram_receive_buffer_size,
+                    )?;
                     if result.was_empty {
                         self.events.push_back(Event::DatagramReceived);
                     }

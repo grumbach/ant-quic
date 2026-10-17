@@ -80,12 +80,14 @@ impl Datagrams<'_> {
         let max_size = self.conn.path.current_mtu() as usize
             - self.conn.predict_1rtt_overhead(None)
             - Datagram::SIZE_BOUND;
-        let limit = self
-            .conn
-            .peer_params
-            .max_datagram_frame_size?
-            .into_inner()
-            .saturating_sub(Datagram::SIZE_BOUND as u64);
+        let peer_limit = self.conn.peer_params.max_datagram_frame_size?.into_inner();
+        // RFC 9221 §3: a limit of 0 means the peer does not support DATAGRAM
+        // frames. A limit of 1 cannot hold the smallest frame `write` emits (an
+        // empty payload with its length: 2 bytes). Either way, send nothing.
+        if peer_limit < Datagram::MIN_LENGTH_PREFIXED_SIZE as u64 {
+            return None;
+        }
+        let limit = peer_limit.saturating_sub(Datagram::SIZE_BOUND as u64);
         Some(limit.min(max_size as u64) as usize)
     }
 
@@ -127,27 +129,36 @@ pub(super) struct DatagramState {
 }
 
 impl DatagramState {
+    /// Accept a received DATAGRAM frame whose encoded size is `frame_len` bytes
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
+        frame_len: usize,
         window: &Option<usize>,
     ) -> Result<DatagramReceivedResult, TransportError> {
+        // `window` is `datagram_receive_buffer_size`. We advertise it, capped at
+        // `u16::MAX`, as `max_datagram_frame_size` (see `TransportParameters::new`).
+        // RFC 9221 §3: no parameter, or a value of 0, means DATAGRAM frames are
+        // not supported, and a frame larger than the advertised value is a
+        // PROTOCOL_VIOLATION. The limit applies to the whole encoded frame
+        // (type, optional length, payload), not just the payload.
         let window = match window {
-            None => {
+            None | Some(0) => {
                 return Err(TransportError::PROTOCOL_VIOLATION(
                     "unexpected DATAGRAM frame",
                 ));
             }
             Some(x) => *x,
         };
-
-        // Charge the fixed per-datagram overhead too, so that every queued datagram uses
-        // receive buffer space.
-        let size_with_overhead = datagram.data.len().saturating_add(size_of::<Datagram>());
-
-        if size_with_overhead > window {
+        let max_frame_size = window.min(usize::from(u16::MAX));
+        // The fixed in-memory overhead is charged only when deciding which
+        // queued datagrams to evict, so it must not turn a legal frame into a
+        // protocol violation.
+        if frame_len > max_frame_size {
             return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
         }
+
+        let size_with_overhead = datagram.data.len().saturating_add(size_of::<Datagram>());
 
         let was_empty = self.incoming.is_empty();
         let mut dropped_count = 0;
@@ -171,7 +182,9 @@ impl DatagramState {
                     "dropping stale datagram (buffer full) - application not reading fast enough"
                 );
             } else {
-                // Buffer is empty but still can't fit - shouldn't happen with valid window
+                // The payload fits the advertised limit, but payload plus the
+                // in-memory overhead exceeds `window` and nothing older is
+                // queued. Keep the datagram so a legal frame is delivered.
                 break;
             }
         }
@@ -336,6 +349,17 @@ pub enum SendDatagramError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{Frame, Iter};
+
+    /// Receive `datagram` as the length-prefixed frame our own sender emits.
+    fn receive_len_prefixed(
+        state: &mut DatagramState,
+        datagram: Datagram,
+        window: &Option<usize>,
+    ) -> Result<DatagramReceivedResult, TransportError> {
+        let frame_len = datagram.size(true);
+        state.received(datagram, frame_len, window)
+    }
 
     #[test]
     fn test_datagram_received_no_drop() {
@@ -346,7 +370,7 @@ mod tests {
         let datagram = Datagram {
             data: Bytes::from(vec![0u8; 100]),
         };
-        let result = state.received(datagram, &window).unwrap();
+        let result = receive_len_prefixed(&mut state, datagram, &window).unwrap();
 
         assert!(result.was_empty);
         assert_eq!(result.dropped_count, 0);
@@ -363,7 +387,7 @@ mod tests {
         let datagram1 = Datagram {
             data: Bytes::from(vec![0u8; 800]),
         };
-        let result1 = state.received(datagram1, &window).unwrap();
+        let result1 = receive_len_prefixed(&mut state, datagram1, &window).unwrap();
         assert!(result1.was_empty);
         assert_eq!(result1.dropped_count, 0);
 
@@ -371,7 +395,7 @@ mod tests {
         let datagram2 = Datagram {
             data: Bytes::from(vec![1u8; 500]),
         };
-        let result2 = state.received(datagram2, &window).unwrap();
+        let result2 = receive_len_prefixed(&mut state, datagram2, &window).unwrap();
 
         // Should have dropped the first datagram to make room
         assert!(!result2.was_empty);
@@ -394,7 +418,7 @@ mod tests {
             let datagram = Datagram {
                 data: Bytes::from(vec![i as u8; 200]),
             };
-            state.received(datagram, &window).unwrap();
+            receive_len_prefixed(&mut state, datagram, &window).unwrap();
         }
 
         // Buffer should have 1000 bytes (5 x 200)
@@ -405,7 +429,7 @@ mod tests {
         let large_datagram = Datagram {
             data: Bytes::from(vec![99u8; 900]),
         };
-        let result = state.received(large_datagram, &window).unwrap();
+        let result = receive_len_prefixed(&mut state, large_datagram, &window).unwrap();
 
         // Should have dropped 5 datagrams (1000 bytes) to fit 900 bytes
         assert_eq!(result.dropped_count, 5);
@@ -422,9 +446,37 @@ mod tests {
         let datagram = Datagram {
             data: Bytes::from(vec![0u8; 100]),
         };
-        let result = state.received(datagram, &window);
+        let result = receive_len_prefixed(&mut state, datagram, &window);
 
         assert!(result.is_err());
+    }
+
+    /// `datagram_receive_buffer_size` is advertised as `max_datagram_frame_size`.
+    /// A payload of that limit minus the DATAGRAM frame bound (1024 - 9 = 1015)
+    /// is legal and must be queued. A payload past the advertised limit is a
+    /// protocol violation.
+    #[test]
+    fn legal_datagram_payload_within_advertised_limit_is_delivered() {
+        let mut state = DatagramState::default();
+        let window = Some(1024);
+        let max_legal = 1024 - Datagram::SIZE_BOUND;
+        assert_eq!(max_legal, 1015);
+
+        let data = Bytes::from(vec![0x5Au8; max_legal]);
+        let result = receive_len_prefixed(&mut state, Datagram { data: data.clone() }, &window)
+            .expect("legal payload must not close the connection");
+        assert!(result.was_empty);
+        assert_eq!(result.dropped_count, 0);
+        assert_eq!(state.recv(), Some(data));
+
+        let oversized = Datagram {
+            data: Bytes::from(vec![0u8; 1025]),
+        };
+        let err = receive_len_prefixed(&mut state, oversized, &window).unwrap_err();
+        assert_eq!(
+            err,
+            TransportError::PROTOCOL_VIOLATION("oversized datagram")
+        );
     }
 
     #[test]
@@ -436,8 +488,128 @@ mod tests {
         let datagram = Datagram {
             data: Bytes::from(vec![0u8; 200]),
         };
-        let result = state.received(datagram, &window);
+        let result = receive_len_prefixed(&mut state, datagram, &window);
 
         assert!(result.is_err());
+    }
+
+    /// Encode a DATAGRAM frame carrying `payload_len` bytes.
+    fn encode_datagram(payload_len: usize, length: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        Datagram {
+            data: Bytes::from(vec![0xA5u8; payload_len]),
+        }
+        .encode(length, &mut buf);
+        buf
+    }
+
+    /// Decode `bytes` as exactly one DATAGRAM frame, returning it with its
+    /// encoded length as the frame decoder reports it.
+    fn decode_datagram(bytes: Vec<u8>) -> (Datagram, usize) {
+        let mut frames = Iter::new(Bytes::from(bytes)).expect("non-empty payload");
+        let decoded = match frames.next() {
+            Some(Ok(Frame::Datagram(datagram, frame_len))) => (datagram, frame_len),
+            other => panic!("expected a DATAGRAM frame, got {other:?}"),
+        };
+        assert!(frames.next().is_none(), "expected exactly one frame");
+        decoded
+    }
+
+    /// RFC 9221 §3: `max_datagram_frame_size` bounds the whole encoded frame.
+    /// These payloads fit the 1024-byte limit, but with the frame type (and
+    /// length) the frame is 1025 bytes, so it is a protocol violation.
+    #[test]
+    fn payload_within_limit_but_frame_over_limit_is_rejected() {
+        let window = Some(1024);
+        for (payload_len, length) in [(1022, true), (1024, false)] {
+            let (datagram, frame_len) = decode_datagram(encode_datagram(payload_len, length));
+            assert_eq!(frame_len, 1025);
+            assert!(datagram.data.len() <= 1024);
+            let mut state = DatagramState::default();
+            let err = state
+                .received(datagram, frame_len, &window)
+                .expect_err("a frame over the advertised limit must be rejected");
+            assert_eq!(
+                err,
+                TransportError::PROTOCOL_VIOLATION("oversized datagram"),
+                "payload {payload_len}, length field {length}"
+            );
+            assert!(state.incoming.is_empty());
+        }
+    }
+
+    /// The limit counts the bytes actually on the wire. A peer may encode the
+    /// length varint in more bytes than needed; a 1021-byte payload with a
+    /// 4-byte length varint is a 1026-byte frame.
+    #[test]
+    fn non_minimal_length_varint_counts_towards_frame_size() {
+        let payload_len = 1021usize;
+        let mut bytes = vec![0x31];
+        bytes.extend_from_slice(&(0x8000_0000u32 | payload_len as u32).to_be_bytes());
+        bytes.extend_from_slice(&vec![0xA5u8; payload_len]);
+        let (datagram, frame_len) = decode_datagram(bytes);
+        assert_eq!(datagram.data.len(), payload_len);
+        assert_eq!(frame_len, 1026);
+        let mut state = DatagramState::default();
+        assert_eq!(
+            state
+                .received(datagram, frame_len, &Some(1024))
+                .unwrap_err(),
+            TransportError::PROTOCOL_VIOLATION("oversized datagram")
+        );
+    }
+
+    /// A frame whose encoded size is exactly the advertised limit is legal, in
+    /// both frame forms.
+    #[test]
+    fn frame_exactly_at_limit_is_accepted() {
+        let window = Some(1024);
+        for (payload_len, length) in [(1021, true), (1023, false)] {
+            let (datagram, frame_len) = decode_datagram(encode_datagram(payload_len, length));
+            assert_eq!(frame_len, 1024);
+            let mut state = DatagramState::default();
+            state
+                .received(datagram, frame_len, &window)
+                .expect("a frame at the advertised limit is legal");
+            assert_eq!(state.recv().map(|d| d.len()), Some(payload_len));
+        }
+    }
+
+    /// We advertise `datagram_receive_buffer_size` capped at `u16::MAX`, so a
+    /// larger receive buffer does not raise the frame limit above 65535.
+    #[test]
+    fn frame_limit_is_the_advertised_u16_cap() {
+        let window = Some(1 << 20);
+        let (datagram, frame_len) = decode_datagram(encode_datagram(65_534, false));
+        assert_eq!(frame_len, 65_535);
+        let mut state = DatagramState::default();
+        state
+            .received(datagram, frame_len, &window)
+            .expect("a frame at the advertised cap is legal");
+
+        let (datagram, frame_len) = decode_datagram(encode_datagram(65_535, false));
+        assert_eq!(frame_len, 65_536);
+        assert_eq!(
+            state.received(datagram, frame_len, &window).unwrap_err(),
+            TransportError::PROTOCOL_VIOLATION("oversized datagram")
+        );
+    }
+
+    /// RFC 9221 §3: an advertised `max_datagram_frame_size` of 0 means no
+    /// DATAGRAM support, so even an empty DATAGRAM frame is a protocol
+    /// violation.
+    #[test]
+    fn zero_limit_rejects_empty_datagram() {
+        for length in [true, false] {
+            let (datagram, frame_len) = decode_datagram(encode_datagram(0, length));
+            assert!(datagram.data.is_empty());
+            let mut state = DatagramState::default();
+            assert_eq!(
+                state.received(datagram, frame_len, &Some(0)).unwrap_err(),
+                TransportError::PROTOCOL_VIOLATION("unexpected DATAGRAM frame"),
+                "length field {length}"
+            );
+            assert!(state.incoming.is_empty());
+        }
     }
 }
