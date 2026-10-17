@@ -386,8 +386,8 @@ fn to_mapped_v6(v4: SocketAddrV4) -> SocketAddrV6 {
 /// The IPv6 socket is bound with `IPV6_V6ONLY=1` (pure IPv6, no dual-stack kernel
 /// behavior) because we manage the address-family separation ourselves.
 ///
-/// If `port` is 0, the OS assigns ports (they may differ between v4 and v6).
-/// If `port` is non-zero, both sockets attempt to bind to the same port.
+/// If `port` is 0, the OS assigns a port on IPv6 first and IPv4 reuses it.
+/// If `port` is non-zero, both sockets attempt to bind to that port.
 ///
 /// Gracefully degrades to single-stack if one address family is unavailable.
 #[cfg(feature = "network-discovery")]
@@ -494,19 +494,49 @@ fn create_v4_socket(port: u16) -> io::Result<std::net::UdpSocket> {
 }
 
 /// Fallback when `network-discovery` feature is not enabled.
+///
+/// Mirrors the feature-gated version's port propagation: when `port` is 0,
+/// bind IPv6 first, learn the OS-assigned port, then bind IPv4 to that same
+/// port so `DualStackSocket::local_addr()` (which prefers IPv6) advertises a
+/// port that both families listen on (#246).
 #[cfg(not(feature = "network-discovery"))]
 pub fn create_dual_stack_sockets(
     port: u16,
 ) -> io::Result<(Option<std::net::UdpSocket>, Option<std::net::UdpSocket>)> {
+    let mut actual_port = port;
+
     let v6_addr: SocketAddr = format!("[::]:{port}")
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}")))?;
-    let v4_addr: SocketAddr = format!("0.0.0.0:{port}")
+
+    let v6 = match std::net::UdpSocket::bind(v6_addr) {
+        Ok(socket) => {
+            if port == 0 {
+                // Learn the OS-assigned port so v4 can try the same port.
+                actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+            }
+            Some(socket)
+        }
+        Err(e) => {
+            debug!("IPv6 socket creation failed: {e}");
+            None
+        }
+    };
+
+    let v4_addr: SocketAddr = format!("0.0.0.0:{actual_port}")
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}")))?;
 
-    let v6 = std::net::UdpSocket::bind(v6_addr).ok();
-    let v4 = std::net::UdpSocket::bind(v4_addr).ok();
+    // Do not fall back to a different OS-assigned v4 port: `local_addr()` prefers
+    // the v6 address, so a mismatched v4 port leaves IPv4 dials to the advertised
+    // address undeliverable (#246). Prefer v6-only over a split-port dual bind.
+    let v4 = match std::net::UdpSocket::bind(v4_addr) {
+        Ok(socket) => Some(socket),
+        Err(e) => {
+            debug!("IPv4 socket creation failed: {e}");
+            None
+        }
+    };
 
     if v4.is_none() && v6.is_none() {
         return Err(io::Error::new(
@@ -729,7 +759,6 @@ mod tests {
         assert!(received, "v6 receiver should get the native v6 datagram");
     }
 
-    #[cfg(feature = "network-discovery")]
     #[test]
     fn test_create_dual_stack_sockets_port_zero() {
         let (v4, v6) = create_dual_stack_sockets(0).unwrap();
@@ -743,6 +772,28 @@ mod tests {
             assert!(s.local_addr().unwrap().is_ipv6());
             assert_ne!(s.local_addr().unwrap().port(), 0);
         }
+    }
+
+    /// Regression for #246: with `port == 0`, the v6 OS-assigned port must be
+    /// reused for the v4 bind so `local_addr()` (which prefers v6) names a port
+    /// that the v4 listener actually owns. Without that propagation, dialing
+    /// the advertised address over IPv4 never reaches the acceptor.
+    #[test]
+    fn create_dual_stack_sockets_port_zero_shares_port_across_families() {
+        let (v4, v6) = create_dual_stack_sockets(0).unwrap();
+        let (Some(v4), Some(v6)) = (v4, v6) else {
+            // Single-stack environments (one family unavailable) are fine —
+            // there is only one advertised port in that case.
+            return;
+        };
+        let v4_port = v4.local_addr().unwrap().port();
+        let v6_port = v6.local_addr().unwrap().port();
+        assert_ne!(v4_port, 0);
+        assert_ne!(v6_port, 0);
+        assert_eq!(
+            v4_port, v6_port,
+            "v4 and v6 must share the OS-assigned port so advertised local_addr() is reachable on both families"
+        );
     }
 
     #[tokio::test]
