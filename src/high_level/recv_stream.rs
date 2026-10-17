@@ -558,7 +558,9 @@ impl Future for ReadToEnd<'_> {
 /// bytes cannot bypass [`record_stored_byte_copy`]. Newly delivered bytes use
 /// [`StoredRun::extend_new`] / [`StoredRun::prepend_new`] (no stored charge);
 /// joining two runs uses [`StoredRun::append_run`] / [`StoredRun::prepend_run`]
-/// (always charges the side being moved).
+/// (always charges the side being moved). Heap requests during tests are also
+/// observed by [`crate::test_alloc`] so a silent `bytes ++ suffix` rebuild in
+/// [`StoredRun::prepend_new`] cannot dodge the copy-cost regression.
 mod stored_run {
     use std::collections::VecDeque;
 
@@ -613,6 +615,20 @@ mod stored_run {
             }
         }
 
+        /// Rebuild as `prefix ++ self`, charging and allocating `|self|`.
+        ///
+        /// Models the pre-fix `Vec` prepend for the descending allocation
+        /// control. Production [`Self::prepend_new`] must not call this.
+        #[cfg(test)]
+        pub(super) fn rebuild_with_prefix(&mut self, prefix: &[u8]) {
+            record_stored_byte_copy(self.bytes.len());
+            let need = prefix.len().saturating_add(self.bytes.len());
+            let mut rebuilt = VecDeque::with_capacity(need);
+            rebuilt.extend(prefix.iter().copied());
+            rebuilt.extend(self.bytes.iter().copied());
+            self.bytes = rebuilt;
+        }
+
         /// Append another stored run onto `self`. Charges `|other|`.
         pub(super) fn append_run(&mut self, other: &mut Self) {
             record_stored_byte_copy(other.bytes.len());
@@ -647,9 +663,10 @@ mod stored_run {
 
 /// Test-only counter of already-stored entry bytes bulk-copied during merge.
 ///
-/// Every bulk move of stored bytes goes through [`StoredRun`] merge helpers,
-/// which always call [`record_stored_byte_copy`]. In-place prepend/extend of
-/// *new* bytes does not charge — that is the amortised-O(new) path.
+/// Every bulk move of stored bytes goes through [`StoredRun`] merge helpers
+/// (`append_run` / `prepend_run` / `copy_into` / `rebuild_with_prefix`), which
+/// always call [`record_stored_byte_copy`]. In-place prepend/extend of *new*
+/// bytes does not charge — that is the amortised-O(new) path.
 #[cfg(test)]
 mod merge_copy_stats {
     use std::cell::Cell;
@@ -668,6 +685,19 @@ mod merge_copy_stats {
 
     pub(super) fn total() -> u64 {
         STORED_BYTES_COPIED.with(|c| c.get())
+    }
+}
+
+/// Test-only heap-request scope backed by [`crate::test_alloc`].
+///
+/// Catches a `prepend_new` rebuild that skips [`record_stored_byte_copy`]:
+/// at N=8 000 the bad path requests ~32 MB vs ~17 KB for in-place prepend.
+#[cfg(test)]
+mod merge_alloc_stats {
+    pub(super) fn scope<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        crate::test_alloc::begin();
+        let out = f();
+        (out, crate::test_alloc::end())
     }
 }
 
@@ -1449,10 +1479,9 @@ mod tests {
     /// Descending one-byte chunks must prepend in O(new bytes), not O(suffix).
     ///
     /// On 569014fe the legacy `Vec` prepend copies N*(N-1)/2 suffix bytes for
-    /// N one-byte chunks. [`StoredRun::prepend_new`] grows in place, so the
-    /// stored-byte counter (charged only inside merge primitives) stays ≤ 8N.
-    /// Rebuilding via `append_run` / `copy_into` would charge the suffix and
-    /// fail this bound.
+    /// N one-byte chunks. [`StoredRun::prepend_new`] grows in place (0 stored
+    /// copies; heap ≤ `128*N`). A silent `bytes ++ suffix` rebuild that skips
+    /// [`record_stored_byte_copy`] still fails the allocation bound.
     #[test]
     fn read_to_end_prepend_copy_cost_is_linear_for_descending() {
         const N: usize = 8_000;
@@ -1463,33 +1492,55 @@ mod tests {
             "sanity: the 569014fe prepend cost model must be quadratic"
         );
 
-        merge_copy_stats::reset();
-        let mut read = BTreeMap::new();
-        let mut payload = vec![0u8; N];
-        for i in (0..N).rev() {
-            let byte = ((i * 17) % 251) as u8;
-            payload[i] = byte;
-            push_read_chunk(&mut read, &[byte], i as u64).expect("descending push");
+        // Known-bad control: rebuild_with_prefix must blow both bounds.
+        {
+            merge_copy_stats::reset();
+            let ((), bad_alloc) = merge_alloc_stats::scope(|| {
+                let mut run = StoredRun::from_slice(&[]);
+                for i in (0..N).rev() {
+                    let byte = ((i * 17) % 251) as u8;
+                    run.rebuild_with_prefix(&[byte]);
+                }
+            });
+            let bad_copied = merge_copy_stats::total();
+            assert!(
+                bad_copied >= legacy_copies,
+                "rebuild control must charge ≥ legacy {legacy_copies}, got {bad_copied}"
+            );
+            assert!(
+                bad_alloc > 128 * N as u64,
+                "rebuild control must exceed 128*N alloc bound, got {bad_alloc}"
+            );
         }
+
+        merge_copy_stats::reset();
+        let ((read, payload), requested) = merge_alloc_stats::scope(|| {
+            let mut read = BTreeMap::new();
+            let mut payload = vec![0u8; N];
+            for i in (0..N).rev() {
+                let byte = ((i * 17) % 251) as u8;
+                payload[i] = byte;
+                push_read_chunk(&mut read, &[byte], i as u64).expect("descending push");
+            }
+            (read, payload)
+        });
         assert_eq!(read.len(), 1);
         let copied = merge_copy_stats::total();
-        let bound = 8 * N as u64;
+        let copy_bound = 8 * N as u64;
+        let alloc_bound = 128 * N as u64;
         assert!(
-            copied <= bound,
-            "descending prepend copied {copied} stored bytes; O(N) bound is {bound} \
+            copied <= copy_bound,
+            "descending prepend copied {copied} stored bytes; O(N) bound is {copy_bound} \
              (569014fe would copy {legacy_copies})"
         );
-        assert!(
-            copied < legacy_copies,
-            "fixed path stored copies {copied} must beat legacy {legacy_copies}"
-        );
-        // Structural: only in-place prepend_new keeps a single run without
-        // merge charges. A rebuild that copied the suffix through StoredRun
-        // helpers would have exceeded `bound` above.
         assert_eq!(
-            merge_copy_stats::total(),
-            0,
+            copied, 0,
             "pure descending prepend must not bulk-copy already-stored bytes"
+        );
+        assert!(
+            requested <= alloc_bound,
+            "descending prepend requested {requested} heap bytes; bound is {alloc_bound} \
+             (rebuild control exceeds this)"
         );
         let buffer = assemble_entries(&read, 0, N as u64).expect("descending must assemble");
         assert_eq!(buffer, payload);
