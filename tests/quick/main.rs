@@ -13,6 +13,7 @@ mod bootstrap_cache_self_exclusion;
 mod connect_topologies;
 mod connection_tests;
 mod crypto_tests;
+mod datagram_receive_limit;
 mod frame_tests;
 mod pure_pq_rpk_tests;
 mod send_stream_drop_tests;

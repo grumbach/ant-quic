@@ -6,11 +6,14 @@
 // Full details available at https://saorsalabs.com/licenses
 
 use std::{
+    collections::BTreeMap,
     future::{Future, poll_fn},
     io,
     pin::Pin,
     task::{Context, Poll, ready},
 };
+
+use stored_run::StoredRun;
 
 use crate::{Chunk, Chunks, ClosedStream, ConnectionError, ReadableError, StreamId};
 use bytes::Bytes;
@@ -22,13 +25,14 @@ use crate::VarInt;
 
 /// Bound on the number of disjoint entries `read_to_end` accumulates
 ///
-/// `read_to_end` appends each delivered chunk to the previous entry when it
-/// continues it, so a contiguous stream — however it is framed — is a single
-/// entry whose bytes are bounded by the caller's `size_limit`. A new entry is
-/// needed only across a gap. This cap is the independent ceiling on the entry
-/// count; it matches the stream assembler's bound on disjoint received ranges,
-/// so ordinary reordered or lossy traffic stays well under it while the
-/// per-read overhead stays bounded regardless of how the data is framed.
+/// `read_to_end` keeps delivered chunks ordered by offset and merges a chunk
+/// into every neighbour it touches, so a contiguous stream — however it is
+/// framed or reordered — is a single entry whose bytes are bounded by the
+/// caller's `size_limit`. A new entry is needed only across a gap that is
+/// still open. This cap is the ceiling on the entry count after that merge;
+/// it matches the stream assembler's bound on disjoint received ranges, so
+/// ordinary reordered or lossy traffic stays well under it while the per-read
+/// overhead stays bounded regardless of how the data is framed.
 const MAX_READ_TO_END_ENTRIES: usize = 4096;
 
 /// A stream that can only be used to receive data
@@ -286,7 +290,7 @@ impl RecvStream {
         ReadToEnd {
             stream: self,
             size_limit,
-            read: Vec::new(),
+            read: BTreeMap::new(),
             start: u64::MAX,
             end: 0,
         }
@@ -468,10 +472,34 @@ impl<T> From<(Option<T>, Option<crate::ReadError>)> for ReadStatus<T> {
 /// See: FINDING-recv-boundary-aliasing.md
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
-    read: Vec<(Vec<u8>, u64)>,
+    /// Contiguous runs keyed by start offset. [`StoredRun`] keeps both append
+    /// and prepend of newly delivered bytes amortised O(new bytes), and its
+    /// merge helpers always charge bulk copies of already-stored bytes so
+    /// reverse gap-filling cannot force O(n²) work.
+    read: BTreeMap<u64, StoredRun>,
     start: u64,
     end: u64,
     size_limit: usize,
+}
+
+/// Whether accepting a chunk at `chunk_offset` of length `chunk_len` would make
+/// the observed `[start, end)` span exceed `size_limit`.
+///
+/// Uses the global end (`end.max(chunk_end)`), not only the arriving chunk's
+/// end: a high offset accepted first must still bound a later low-offset chunk.
+fn read_to_end_span_too_long(
+    start: u64,
+    end: u64,
+    chunk_offset: u64,
+    chunk_len: usize,
+    size_limit: usize,
+) -> bool {
+    let span_start = start.min(chunk_offset);
+    let Some(chunk_end) = chunk_offset.checked_add(chunk_len as u64) else {
+        return true;
+    };
+    let span_end = end.max(chunk_end);
+    span_end.saturating_sub(span_start) > size_limit as u64
 }
 
 impl Future for ReadToEnd<'_> {
@@ -480,11 +508,17 @@ impl Future for ReadToEnd<'_> {
         loop {
             match ready!(self.stream.poll_read_chunk(cx, usize::MAX, false))? {
                 Some(chunk) => {
-                    self.start = self.start.min(chunk.offset);
-                    let end = chunk.bytes.len() as u64 + chunk.offset;
-                    if (end - self.start) > self.size_limit as u64 {
+                    if read_to_end_span_too_long(
+                        self.start,
+                        self.end,
+                        chunk.offset,
+                        chunk.bytes.len(),
+                        self.size_limit,
+                    ) {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
+                    self.start = self.start.min(chunk.offset);
+                    let end = chunk.bytes.len() as u64 + chunk.offset;
                     self.end = self.end.max(end);
                     // Copy bytes into owned storage IMMEDIATELY, dropping the
                     // Bytes reference before the next poll cycle. This prevents
@@ -500,7 +534,11 @@ impl Future for ReadToEnd<'_> {
                         return Poll::Ready(Ok(Vec::new()));
                     }
                     let (start, end) = (self.start, self.end);
-                    return match assemble_unordered_chunks(&mut self.read, start, end) {
+                    let mut ordered: Vec<(Vec<u8>, u64)> = std::mem::take(&mut self.read)
+                        .into_iter()
+                        .map(|(offset, data)| (data.into_vec(), offset))
+                        .collect();
+                    return match assemble_unordered_chunks(&mut ordered, start, end) {
                         Some(buffer) => Poll::Ready(Ok(buffer)),
                         // End-of-stream was signaled but ranges in [start, end)
                         // were consumed elsewhere (e.g. by a dropped earlier
@@ -514,33 +552,443 @@ impl Future for ReadToEnd<'_> {
     }
 }
 
-/// Append a delivered chunk to the accumulating entry list.
+/// Contiguous byte run with merge primitives that always charge stored copies.
+///
+/// The inner deque is private to this module so bulk movement of already-stored
+/// bytes cannot bypass [`record_stored_byte_copy`]. Newly delivered bytes use
+/// [`StoredRun::extend_new`] / [`StoredRun::prepend_new`] (no stored charge);
+/// joining two runs uses [`StoredRun::append_run`] / [`StoredRun::prepend_run`]
+/// (always charges the side being moved). Heap requests during tests are also
+/// observed by [`crate::test_alloc`] so a silent `bytes ++ suffix` rebuild in
+/// [`StoredRun::prepend_new`] cannot dodge the copy-cost regression.
+mod stored_run {
+    use std::collections::VecDeque;
+
+    use super::record_stored_byte_copy;
+
+    #[derive(Clone, Debug, Default)]
+    pub(super) struct StoredRun {
+        bytes: VecDeque<u8>,
+    }
+
+    impl StoredRun {
+        pub(super) fn from_slice(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.iter().copied().collect(),
+            }
+        }
+
+        pub(super) fn from_vec(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: VecDeque::from(bytes),
+            }
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        pub(super) fn get(&self, index: usize) -> Option<u8> {
+            self.bytes.get(index).copied()
+        }
+
+        pub(super) fn into_vec(self) -> Vec<u8> {
+            self.bytes.into_iter().collect()
+        }
+
+        #[cfg(test)]
+        pub(super) fn to_vec(&self) -> Vec<u8> {
+            self.bytes.iter().copied().collect()
+        }
+
+        /// Append newly delivered bytes (not already stored). No copy charge.
+        pub(super) fn extend_new(&mut self, bytes: &[u8]) {
+            self.bytes.extend(bytes.iter().copied());
+        }
+
+        /// Prepend newly delivered bytes in place. Amortised O(`bytes.len()`);
+        /// the already-stored suffix is not recopied and is not charged.
+        pub(super) fn prepend_new(&mut self, bytes: &[u8]) {
+            self.bytes.reserve(bytes.len());
+            for &b in bytes.iter().rev() {
+                self.bytes.push_front(b);
+            }
+        }
+
+        /// Rebuild as `prefix ++ self`, charging and allocating `|self|`.
+        ///
+        /// Models the pre-fix `Vec` prepend for the descending allocation
+        /// control. Production [`Self::prepend_new`] must not call this.
+        #[cfg(test)]
+        pub(super) fn rebuild_with_prefix(&mut self, prefix: &[u8]) {
+            record_stored_byte_copy(self.bytes.len());
+            let need = prefix.len().saturating_add(self.bytes.len());
+            let mut rebuilt = VecDeque::with_capacity(need);
+            rebuilt.extend(prefix.iter().copied());
+            rebuilt.extend(self.bytes.iter().copied());
+            self.bytes = rebuilt;
+        }
+
+        /// Append another stored run onto `self`. Charges `|other|`.
+        pub(super) fn append_run(&mut self, other: &mut Self) {
+            record_stored_byte_copy(other.bytes.len());
+            self.bytes.append(&mut other.bytes);
+        }
+
+        /// Prepend another stored run onto `self`. Charges `|prefix|`.
+        pub(super) fn prepend_run(&mut self, prefix: &Self) {
+            record_stored_byte_copy(prefix.bytes.len());
+            self.bytes.reserve(prefix.bytes.len());
+            for &b in prefix.bytes.iter().rev() {
+                self.bytes.push_front(b);
+            }
+        }
+
+        /// Copy this run into a flat buffer. Charges `|self|`.
+        pub(super) fn copy_into(&self, dst: &mut [u8], base: usize) -> Result<(), ()> {
+            let end = base.saturating_add(self.bytes.len());
+            if end > dst.len() || base > dst.len() {
+                return Err(());
+            }
+            record_stored_byte_copy(self.bytes.len());
+            let (left, right) = self.bytes.as_slices();
+            dst[base..base + left.len()].copy_from_slice(left);
+            if !right.is_empty() {
+                dst[base + left.len()..end].copy_from_slice(right);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Test-only counter of already-stored entry bytes bulk-copied during merge.
+///
+/// Every bulk move of stored bytes goes through [`StoredRun`] merge helpers
+/// (`append_run` / `prepend_run` / `copy_into` / `rebuild_with_prefix`), which
+/// always call [`record_stored_byte_copy`]. In-place prepend/extend of *new*
+/// bytes does not charge — that is the amortised-O(new) path.
+#[cfg(test)]
+mod merge_copy_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STORED_BYTES_COPIED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        STORED_BYTES_COPIED.with(|c| c.set(0));
+    }
+
+    pub(super) fn record(len: usize) {
+        STORED_BYTES_COPIED.with(|c| c.set(c.get().saturating_add(len as u64)));
+    }
+
+    pub(super) fn total() -> u64 {
+        STORED_BYTES_COPIED.with(|c| c.get())
+    }
+}
+
+/// Test-only heap-request scope backed by [`crate::test_alloc`].
+///
+/// Catches a `prepend_new` rebuild that skips [`record_stored_byte_copy`]:
+/// at N=8 000 the bad path requests ~32 MB vs ~17 KB for in-place prepend.
+#[cfg(test)]
+mod merge_alloc_stats {
+    pub(super) fn scope<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        crate::test_alloc::begin();
+        let out = f();
+        (out, crate::test_alloc::end())
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn record_stored_byte_copy(len: usize) {
+    merge_copy_stats::record(len);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn record_stored_byte_copy(_len: usize) {}
+
+/// Insert a delivered chunk, merging it into every neighbour it touches.
 ///
 /// Bytes are copied into owned storage immediately (see [`ReadToEnd`]), dropping
-/// the `Bytes` reference before the next poll cycle. When the chunk continues
-/// the last entry (its offset equals that entry's end) its bytes are appended
-/// to that entry instead of starting a new one, so a contiguous stream stays a
-/// single entry regardless of framing and the per-read overhead is bounded by
-/// the caller's `size_limit` plus the entry count. A new entry is needed only
-/// across a gap; the entry count is capped by [`MAX_READ_TO_END_ENTRIES`], and
-/// exceeding it fails the read with [`ReadToEndError::TooLong`], the same way
-/// the offset-span limit does.
+/// the `Bytes` reference before the next poll cycle. Entries stay ordered by
+/// offset. A chunk that continues an entry, precedes one, or closes the gap
+/// between two is absorbed, so a contiguous stream stays a single entry
+/// whichever order the chunks arrive in. The entry count is capped by
+/// [`MAX_READ_TO_END_ENTRIES`] after that merge. A chunk that still needs its
+/// own entry past the cap fails the read with [`ReadToEndError::TooLong`], the
+/// same way the offset-span limit does.
+///
+/// Overlapping bytes must match. A mismatch is the same integrity failure
+/// [`assemble_unordered_chunks`] reports, and fails the read with
+/// [`ReadToEndError::MissingData`].
 fn push_read_chunk(
-    read: &mut Vec<(Vec<u8>, u64)>,
+    read: &mut BTreeMap<u64, StoredRun>,
     bytes: &[u8],
     offset: u64,
 ) -> Result<(), ReadToEndError> {
-    if let Some((buf, start)) = read.last_mut() {
-        if start.checked_add(buf.len() as u64) == Some(offset) {
-            buf.extend_from_slice(bytes);
-            return Ok(());
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(new_end) = offset.checked_add(bytes.len() as u64) else {
+        return Err(ReadToEndError::TooLong);
+    };
+
+    if extend_exact_predecessor(read, bytes, offset, new_end) {
+        return Ok(());
+    }
+    if prepend_exact_successor(read, bytes, offset, new_end) {
+        return Ok(());
+    }
+    merge_overlapping_or_insert(read, bytes, offset, new_end)
+}
+
+/// Append `bytes` when they start exactly where an existing entry ends.
+///
+/// Returns `false` when the chunk overlaps that entry or a later one, so the
+/// caller can merge with an integrity check instead of overwriting bytes.
+fn extend_exact_predecessor(
+    read: &mut BTreeMap<u64, StoredRun>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> bool {
+    let Some((&prev_off, prev)) = read.range(..=offset).next_back() else {
+        return false;
+    };
+    let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+        return false;
+    };
+    if prev_end != offset {
+        return false;
+    }
+    // A later entry that starts inside this chunk overlaps it.
+    if read.range(offset..new_end).next().is_some() {
+        return false;
+    }
+    let Some(prev) = read.get_mut(&prev_off) else {
+        return false;
+    };
+    prev.extend_new(bytes);
+    absorb_following(read, prev_off);
+    true
+}
+
+/// Place `bytes` immediately before the entry that starts at `new_end`.
+///
+/// Returns `false` when any stored entry overlaps the new chunk.
+///
+/// Cost is O(`bytes.len()`): each new byte is `push_front`ed onto the existing
+/// run. The already-stored suffix is not recopied.
+fn prepend_exact_successor(
+    read: &mut BTreeMap<u64, StoredRun>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> bool {
+    if let Some((&prev_off, prev)) = read.range(..=offset).next_back() {
+        let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+            return false;
+        };
+        if prev_end > offset {
+            return false;
         }
     }
-    if read.len() >= MAX_READ_TO_END_ENTRIES {
+    if read.range(offset..new_end).next().is_some() {
+        return false;
+    }
+    let Some(mut next) = read.remove(&new_end) else {
+        return false;
+    };
+    // Amortised O(bytes.len()) via StoredRun::prepend_new. Rebuilding with
+    // `bytes ++ suffix` would have to go through append_run / copy_into and
+    // would charge `|suffix|` — the copy-cost tests fail on that volume.
+    next.prepend_new(bytes);
+    read.insert(offset, next);
+    let start = absorb_preceding(read, offset);
+    absorb_following(read, start);
+    true
+}
+
+/// Fold the entry that ends at `start` into a neighbour. Returns the key of the
+/// combined entry.
+///
+/// Merges the smaller run into the larger so each join costs O(min(|left|,
+/// |right|)), not O(|right|) unconditionally.
+fn absorb_preceding(read: &mut BTreeMap<u64, StoredRun>, start: u64) -> u64 {
+    let Some((&prev_off, prev)) = read.range(..start).next_back() else {
+        return start;
+    };
+    let Some(prev_end) = prev_off.checked_add(prev.len() as u64) else {
+        return start;
+    };
+    if prev_end != start {
+        return start;
+    }
+    let Some(mut current) = read.remove(&start) else {
+        return start;
+    };
+    let prev_len = read.get(&prev_off).map_or(0, StoredRun::len);
+    if prev_len >= current.len() {
+        let Some(prev) = read.get_mut(&prev_off) else {
+            read.insert(start, current);
+            return start;
+        };
+        prev.append_run(&mut current);
+        prev_off
+    } else {
+        let Some(prev) = read.remove(&prev_off) else {
+            read.insert(start, current);
+            return start;
+        };
+        current.prepend_run(&prev);
+        read.insert(prev_off, current);
+        prev_off
+    }
+}
+
+/// Join every entry that now starts where `start` ends.
+///
+/// Always merges the smaller run into the larger (append when the left is at
+/// least as big; otherwise prepend the left onto the right and keep key
+/// `start`). Reverse pairwise gap-filling therefore copies O(N) bytes total
+/// instead of N*(N-2)/4.
+fn absorb_following(read: &mut BTreeMap<u64, StoredRun>, start: u64) {
+    loop {
+        let Some(buf) = read.get(&start) else {
+            return;
+        };
+        let Some(end) = start.checked_add(buf.len() as u64) else {
+            return;
+        };
+        let Some(mut next) = read.remove(&end) else {
+            return;
+        };
+        let left_len = read.get(&start).map_or(0, StoredRun::len);
+        if left_len >= next.len() {
+            let Some(buf) = read.get_mut(&start) else {
+                read.insert(end, next);
+                return;
+            };
+            buf.append_run(&mut next);
+        } else {
+            let Some(left) = read.remove(&start) else {
+                read.insert(end, next);
+                return;
+            };
+            next.prepend_run(&left);
+            read.insert(start, next);
+        }
+    }
+}
+
+/// Merge `bytes` into every entry they overlap, or insert them as a new entry.
+///
+/// The cap is applied after the merge: a chunk absorbed by a neighbour does
+/// not consume a new slot.
+fn merge_overlapping_or_insert(
+    read: &mut BTreeMap<u64, StoredRun>,
+    bytes: &[u8],
+    offset: u64,
+    new_end: u64,
+) -> Result<(), ReadToEndError> {
+    let mut merge_from = offset;
+    if let Some((&prev_off, prev)) = read.range(..=offset).next_back() {
+        if let Some(prev_end) = prev_off.checked_add(prev.len() as u64)
+            && prev_end > offset
+        {
+            merge_from = prev_off;
+        }
+    }
+
+    let keys: Vec<u64> = read
+        .range(merge_from..=new_end)
+        .map(|(&key, _)| key)
+        .collect();
+    if keys.is_empty() {
+        if read.len() >= MAX_READ_TO_END_ENTRIES {
+            return Err(ReadToEndError::TooLong);
+        }
+        read.insert(offset, StoredRun::from_slice(bytes));
+        return Ok(());
+    }
+
+    let first = keys[0];
+    let last = keys[keys.len() - 1];
+    let last_len = read.get(&last).map_or(0, StoredRun::len);
+    let Some(last_end) = last.checked_add(last_len as u64) else {
+        return Err(ReadToEndError::TooLong);
+    };
+    let merged_start = first.min(offset);
+    let merged_end = last_end.max(new_end);
+    let Ok(merged_len) = usize::try_from(merged_end - merged_start) else {
+        return Err(ReadToEndError::TooLong);
+    };
+    let mut merged = vec![0u8; merged_len];
+    for key in &keys {
+        let Some(buf) = read.get(key) else {
+            continue;
+        };
+        let base = usize::try_from(*key - merged_start).unwrap_or(merged_len);
+        if buf.copy_into(&mut merged, base).is_err() {
+            return Err(ReadToEndError::TooLong);
+        }
+    }
+
+    let base = usize::try_from(offset - merged_start).unwrap_or(merged_len);
+    for (i, &byte) in bytes.iter().enumerate() {
+        let idx = base.saturating_add(i);
+        let abs = offset + i as u64;
+        if let Some(existing) = stored_byte(read, &keys, abs) {
+            if existing != byte {
+                let first_diff = bytes.iter().enumerate().position(|(j, b)| {
+                    stored_byte(read, &keys, offset + j as u64).is_some_and(|prev| prev != *b)
+                });
+                tracing::error!(
+                    target: "ant_quic::data_integrity",
+                    stream_offset = offset,
+                    overlap_len = bytes.len(),
+                    first_diff_within_overlap = first_diff,
+                    "DATA INTEGRITY VIOLATION: overlapping stream chunks have \
+                     different byte content at the same offset — the transport \
+                     delivered corrupt data. Dropping message to prevent silent \
+                     corruption of signed payloads."
+                );
+                return Err(ReadToEndError::MissingData);
+            }
+        } else if idx >= merged.len() {
+            return Err(ReadToEndError::TooLong);
+        } else {
+            merged[idx] = byte;
+        }
+    }
+
+    for key in &keys {
+        read.remove(key);
+    }
+    read.insert(merged_start, StoredRun::from_vec(merged));
+    if read.len() > MAX_READ_TO_END_ENTRIES {
         return Err(ReadToEndError::TooLong);
     }
-    read.push((bytes.to_vec(), offset));
     Ok(())
+}
+
+fn stored_byte(read: &BTreeMap<u64, StoredRun>, keys: &[u64], abs: u64) -> Option<u8> {
+    for key in keys {
+        let Some(buf) = read.get(key) else {
+            continue;
+        };
+        let Some(end) = key.checked_add(buf.len() as u64) else {
+            continue;
+        };
+        if abs >= *key && abs < end {
+            return buf.get((abs - key) as usize);
+        }
+    }
+    None
 }
 
 /// Assemble unordered chunks into a contiguous buffer
@@ -897,7 +1345,7 @@ mod tests {
     /// no coalescing and no cap, while `recvd` stays a single range.
     #[test]
     fn read_to_end_coalesces_adjacent_chunks() {
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         for i in 0..1024u64 {
             push_read_chunk(&mut read, &[(i % 251) as u8], i).expect("contiguous push");
         }
@@ -906,15 +1354,16 @@ mod tests {
             1,
             "contiguous chunks must coalesce into one entry, not grow per byte"
         );
-        assert_eq!(read[0].1, 0);
-        assert_eq!(read[0].0.len(), 1024);
+        let (&start, buf) = read.iter().next().expect("one coalesced entry");
+        assert_eq!(start, 0);
+        assert_eq!(buf.len(), 1024);
     }
 
     /// Non-adjacent chunks cannot coalesce; the entry count is capped and the
     /// read is rejected with `TooLong` rather than growing without bound.
     #[test]
     fn read_to_end_caps_entry_count_across_gaps() {
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         let mut rejected_at = None;
         for i in 0..(MAX_READ_TO_END_ENTRIES as u64 + 16) {
             // One byte at every even offset: a one-byte gap keeps each chunk
@@ -933,18 +1382,302 @@ mod tests {
         assert!(read.len() <= MAX_READ_TO_END_ENTRIES);
     }
 
+    /// Chunks delivered as offsets 1,0,3,2,... are one contiguous stream. Each
+    /// gap-filling byte has to merge with the neighbours on either side, so
+    /// the 4096-entry cap is not spent on a reordered run that still fits in
+    /// `size_limit`. `read_to_end` then assembles the original payload.
+    #[test]
+    fn read_to_end_accepts_out_of_order_gap_fill_past_entry_cap() {
+        let count = MAX_READ_TO_END_ENTRIES + 2;
+        let size_limit = 16 * 1024 * 1024;
+        assert!(count > MAX_READ_TO_END_ENTRIES);
+        assert!(count <= size_limit);
+
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; count];
+        let mut start = u64::MAX;
+        let mut end = 0u64;
+        for pair in 0..(count / 2) {
+            for offset in [pair * 2 + 1, pair * 2] {
+                let byte = ((offset * 17) % 251) as u8;
+                payload[offset] = byte;
+                let offset = offset as u64;
+                start = start.min(offset);
+                let chunk_end = offset + 1;
+                assert!(
+                    chunk_end - start <= size_limit as u64,
+                    "span exceeded size_limit"
+                );
+                end = end.max(chunk_end);
+                push_read_chunk(&mut read, &[byte], offset)
+                    .expect("gap-filling chunk under the entry cap");
+            }
+        }
+        assert_eq!(start, 0);
+        assert_eq!(end, count as u64);
+        assert_eq!(
+            read.len(),
+            1,
+            "contiguous out-of-order chunks must merge into one entry"
+        );
+        let buffer =
+            assemble_entries(&read, start, end).expect("read_to_end assembles a contiguous stream");
+        assert_eq!(buffer, payload);
+    }
+
     /// Coalescing must preserve the assembled bytes: a stream delivered as many
     /// one-byte chunks assembles to the same payload as the original.
     #[test]
     fn read_to_end_coalesced_entries_assemble_correctly() {
         let payload: Vec<u8> = (0..2048u32).map(|i| (i % 250 + 1) as u8).collect();
-        let mut read: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut read = BTreeMap::new();
         for (i, b) in payload.iter().enumerate() {
             push_read_chunk(&mut read, &[*b], i as u64).expect("contiguous push");
         }
         assert_eq!(read.len(), 1);
-        let buffer = assemble_unordered_chunks(&mut read, 0, payload.len() as u64)
+        let buffer = assemble_entries(&read, 0, payload.len() as u64)
             .expect("coalesced single entry must assemble");
         assert_eq!(buffer, payload);
+    }
+
+    /// Cost model for the pre-fix prepend: `bytes.to_vec()` then
+    /// `extend_from_slice(&suffix)` recopies the whole following entry.
+    fn legacy_vec_prepend_suffix_copies(n: usize) -> u64 {
+        let mut suffix = Vec::new();
+        let mut copied = 0u64;
+        for i in (0..n).rev() {
+            let byte = ((i * 17) % 251) as u8;
+            // Charge the `extend_from_slice(&next)` of the old prepend path.
+            copied = copied.saturating_add(suffix.len() as u64);
+            let mut merged = Vec::with_capacity(1 + suffix.len());
+            merged.push(byte);
+            merged.extend_from_slice(&suffix);
+            suffix = merged;
+        }
+        copied
+    }
+
+    /// Cost model for always-append-right `absorb_following` under reverse
+    /// pairwise arrival (`N-2,N-1,N-4,N-3,…,0,1`): exactly `N*(N-2)/4` for even N.
+    fn legacy_always_append_right_pairwise_reverse_copies(n: usize) -> u64 {
+        assert!(n % 2 == 0 && n >= 2);
+        let mut suffix_len = 0u64;
+        let mut copied = 0u64;
+        for _ in (0..(n / 2)).rev() {
+            if suffix_len == 0 {
+                // First pair from the right only builds the suffix.
+                suffix_len = 2;
+                continue;
+            }
+            // Tiny left run (2 bytes) appends the whole growing suffix.
+            copied = copied.saturating_add(suffix_len);
+            suffix_len += 2;
+        }
+        copied
+    }
+
+    /// Descending one-byte chunks must prepend in O(new bytes), not O(suffix).
+    ///
+    /// On 569014fe the legacy `Vec` prepend copies N*(N-1)/2 suffix bytes for
+    /// N one-byte chunks. [`StoredRun::prepend_new`] grows in place (0 stored
+    /// copies; heap ≤ `128*N`). A silent `bytes ++ suffix` rebuild that skips
+    /// [`record_stored_byte_copy`] still fails the allocation bound.
+    #[test]
+    fn read_to_end_prepend_copy_cost_is_linear_for_descending() {
+        const N: usize = 8_000;
+        let legacy_copies = legacy_vec_prepend_suffix_copies(N);
+        let quadratic = (N as u64) * (N as u64 - 1) / 2;
+        assert_eq!(
+            legacy_copies, quadratic,
+            "sanity: the 569014fe prepend cost model must be quadratic"
+        );
+
+        // Known-bad control: rebuild_with_prefix must blow both bounds.
+        {
+            merge_copy_stats::reset();
+            let ((), bad_alloc) = merge_alloc_stats::scope(|| {
+                let mut run = StoredRun::from_slice(&[]);
+                for i in (0..N).rev() {
+                    let byte = ((i * 17) % 251) as u8;
+                    run.rebuild_with_prefix(&[byte]);
+                }
+            });
+            let bad_copied = merge_copy_stats::total();
+            assert!(
+                bad_copied >= legacy_copies,
+                "rebuild control must charge ≥ legacy {legacy_copies}, got {bad_copied}"
+            );
+            assert!(
+                bad_alloc > 128 * N as u64,
+                "rebuild control must exceed 128*N alloc bound, got {bad_alloc}"
+            );
+        }
+
+        merge_copy_stats::reset();
+        let ((read, payload), requested) = merge_alloc_stats::scope(|| {
+            let mut read = BTreeMap::new();
+            let mut payload = vec![0u8; N];
+            for i in (0..N).rev() {
+                let byte = ((i * 17) % 251) as u8;
+                payload[i] = byte;
+                push_read_chunk(&mut read, &[byte], i as u64).expect("descending push");
+            }
+            (read, payload)
+        });
+        assert_eq!(read.len(), 1);
+        let copied = merge_copy_stats::total();
+        let copy_bound = 8 * N as u64;
+        let alloc_bound = 128 * N as u64;
+        assert!(
+            copied <= copy_bound,
+            "descending prepend copied {copied} stored bytes; O(N) bound is {copy_bound} \
+             (569014fe would copy {legacy_copies})"
+        );
+        assert_eq!(
+            copied, 0,
+            "pure descending prepend must not bulk-copy already-stored bytes"
+        );
+        assert!(
+            requested <= alloc_bound,
+            "descending prepend requested {requested} heap bytes; bound is {alloc_bound} \
+             (rebuild control exceeds this)"
+        );
+        let buffer = assemble_entries(&read, 0, N as u64).expect("descending must assemble");
+        assert_eq!(buffer, payload);
+    }
+
+    /// Reverse pairwise gap-fill (`N-2,N-1,…,0,1`) must stay O(N), not
+    /// `N*(N-2)/4` from always-append-right `absorb_following`.
+    #[test]
+    fn read_to_end_merge_copy_cost_is_linear_for_reverse_pairwise_gaps() {
+        const N: usize = 8_000;
+        let legacy = legacy_always_append_right_pairwise_reverse_copies(N);
+        let quadratic = (N as u64) * (N as u64 - 2) / 4;
+        assert_eq!(
+            legacy, quadratic,
+            "sanity: always-append-right reverse pairwise is N*(N-2)/4"
+        );
+
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; N];
+        let mut max_entries = 0usize;
+        for pair in (0..(N / 2)).rev() {
+            for offset in [pair * 2, pair * 2 + 1] {
+                let byte = ((offset * 17) % 251) as u8;
+                payload[offset] = byte;
+                push_read_chunk(&mut read, &[byte], offset as u64).expect("reverse pairwise push");
+                max_entries = max_entries.max(read.len());
+            }
+        }
+        assert_eq!(read.len(), 1);
+        // Codex: this arrival order never needs more than two entries.
+        assert!(
+            max_entries <= 2,
+            "reverse pairwise should stay within two entries, saw {max_entries}"
+        );
+        let copied = merge_copy_stats::total();
+        let bound = 8 * N as u64;
+        assert!(
+            copied <= bound,
+            "reverse pairwise copied {copied} stored bytes; O(N) bound is {bound} \
+             (always-append-right would copy {legacy})"
+        );
+        assert!(
+            copied < legacy,
+            "smaller-into-larger copies {copied} must beat always-append-right {legacy}"
+        );
+        // The old 8*N descending bound fails on the pre-fix absorb path.
+        assert!(
+            legacy > bound,
+            "regression guard: legacy {legacy} must exceed bound {bound}"
+        );
+        assert_eq!(
+            assemble_entries(&read, 0, N as u64).expect("reverse pairwise assembles"),
+            payload
+        );
+    }
+
+    /// Gap-closing and shuffled arrival must keep bulk copies O(N log N).
+    #[test]
+    fn read_to_end_merge_copy_cost_is_linear_for_gap_fill_and_random() {
+        const N: usize = 4_096;
+        // Union-by-size merge: O(N log N). Loose constant that still fails the
+        // always-append-right reverse-pairwise volume (N*(N-2)/4).
+        let bound = (N as u64) * 16 * 12; // ~16 N log2(N) with log2(4096)=12
+        let legacy_reverse = legacy_always_append_right_pairwise_reverse_copies(N);
+        assert!(
+            legacy_reverse > bound,
+            "bound must fail always-append-right reverse pairwise \
+             (legacy {legacy_reverse} vs bound {bound})"
+        );
+
+        // Pairwise gap-fill: 1,0,3,2,...
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; N];
+        for pair in 0..(N / 2) {
+            for offset in [pair * 2 + 1, pair * 2] {
+                let byte = ((offset * 17) % 251) as u8;
+                payload[offset] = byte;
+                push_read_chunk(&mut read, &[byte], offset as u64).expect("gap-fill push");
+            }
+        }
+        assert_eq!(read.len(), 1);
+        let gap_copied = merge_copy_stats::total();
+        assert!(
+            gap_copied <= bound,
+            "gap-fill merge copied {gap_copied} stored bytes; bound is {bound}"
+        );
+        assert_eq!(
+            assemble_entries(&read, 0, N as u64).expect("gap-fill assembles"),
+            payload
+        );
+
+        // Deterministic shuffle (LCG) over the same offsets.
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut order: Vec<usize> = (0..N).collect();
+        let mut state = 0xC0FFEE_u64;
+        for i in (1..N).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (state as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        for &offset in &order {
+            let byte = payload[offset];
+            push_read_chunk(&mut read, &[byte], offset as u64).expect("random-order push");
+        }
+        assert_eq!(read.len(), 1);
+        let random_copied = merge_copy_stats::total();
+        assert!(
+            random_copied <= bound,
+            "random-order merge copied {random_copied} stored bytes; bound is {bound}"
+        );
+        assert_eq!(
+            assemble_entries(&read, 0, N as u64).expect("random-order assembles"),
+            payload
+        );
+    }
+
+    /// Span limit must use the global end, not only the arriving chunk's end.
+    #[test]
+    fn read_to_end_span_uses_global_end() {
+        // First chunk [150, 160) alone is within a 100-byte limit.
+        assert!(!read_to_end_span_too_long(u64::MAX, 0, 150, 10, 100));
+        // After accepting it (start=150, end=160), a later [0, 10) makes the
+        // observed span 160 > 100.
+        assert!(read_to_end_span_too_long(150, 160, 0, 10, 100));
+        // Contiguous growth that stays inside the limit is still accepted.
+        assert!(!read_to_end_span_too_long(0, 50, 50, 50, 100));
+        assert!(read_to_end_span_too_long(0, 50, 50, 51, 100));
+    }
+
+    fn assemble_entries(read: &BTreeMap<u64, StoredRun>, start: u64, end: u64) -> Option<Vec<u8>> {
+        let mut chunks: Vec<(Vec<u8>, u64)> = read
+            .iter()
+            .map(|(&offset, data)| (data.to_vec(), offset))
+            .collect();
+        assemble_unordered_chunks(&mut chunks, start, end)
     }
 }

@@ -161,8 +161,23 @@ impl Assembler {
     /// This makes sure we're not unnecessarily holding on to many larger allocations.
     /// We merge contiguous chunks in the process of doing so.
     fn defragment(&mut self) {
+        self.defragment_inner(false);
+    }
+
+    /// Merge every contiguous run, including chunks larger than the retention cutoff.
+    ///
+    /// Used when [`defragment`](Self::defragment) still leaves more than [`MAX_CHUNKS`]
+    /// entries. Chunks above the cutoff stay separate after the first pass, so a
+    /// contiguous stream of large frames separated by tiny ones can remain over the
+    /// cap. This pass joins those runs. A stream is rejected only when gaps still
+    /// leave more than [`MAX_CHUNKS`] entries afterwards.
+    fn defragment_merging_all_contiguous(&mut self) {
+        self.defragment_inner(true);
+    }
+
+    fn defragment_inner(&mut self, merge_all_contiguous: bool) {
         // Chunks smaller than `min_chunk_size` are merged regardless of fragmentation, so the
-        // result stays within `MAX_CHUNKS` when it can.
+        // result stays within `MAX_CHUNKS` when it can. The second pass ignores that cutoff.
         let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
         let new = BinaryHeap::with_capacity(self.data.len());
         let old = mem::replace(&mut self.data, new);
@@ -175,7 +190,7 @@ impl Assembler {
             let size = chunk.bytes.len();
             offset = chunk.offset + size as u64;
             self.buffered += size;
-            if !chunk.defragmented || size < min_chunk_size {
+            if merge_all_contiguous || !chunk.defragmented || size < min_chunk_size {
                 fragmented_buffered += size;
             }
         }
@@ -187,7 +202,7 @@ impl Assembler {
             if chunk.bytes.is_empty() {
                 continue;
             }
-            if chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
+            if !merge_all_contiguous && chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
                 self.data.push(chunk);
                 continue;
             }
@@ -288,7 +303,11 @@ impl Assembler {
         // Also bound the number of chunks, independent of over-allocation.
         if over_allocation > threshold || self.data.len() > COMPACT_THRESHOLD {
             self.defragment();
+            if self.data.len() > MAX_CHUNKS {
+                self.defragment_merging_all_contiguous();
+            }
             // ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?
+            // Reject only when both passes still leave more than `MAX_CHUNKS` chunks.
             if self.data.len() > MAX_CHUNKS {
                 return Err(TooManyChunks);
             }
@@ -1200,6 +1219,57 @@ mod test {
             x.bytes_read(),
             x.end
         );
+    }
+
+    /// 683 repetitions of a 1200/1/1-byte pattern, with offset 0 withheld.
+    ///
+    /// The bytes are contiguous and about 821 KB, inside the default stream
+    /// window. Compaction's retention cutoff is `buffered / MAX_CHUNKS`
+    /// (~802 bytes), so the 1200-byte chunks stay unmerged and the buffer
+    /// would hold more than `MAX_CHUNKS` entries. The stream must still be
+    /// accepted, and readable once the delayed prefix arrives.
+    #[test]
+    fn contiguous_1200_1_1_with_delayed_prefix_is_not_rejected() {
+        const REPS: usize = 683;
+        const BIG: usize = 1200;
+        let mut x = Assembler::new();
+        let mut expected = Vec::with_capacity(1 + REPS * (BIG + 2));
+        expected.push(0x00);
+        let mut offset = 1u64;
+        for rep in 0..REPS {
+            let big: Vec<u8> = (0..BIG).map(|i| ((rep + i) % 251) as u8).collect();
+            let a = ((rep * 3) % 251) as u8;
+            let b = ((rep * 3 + 1) % 251) as u8;
+            expected.extend_from_slice(&big);
+            expected.push(a);
+            expected.push(b);
+            x.insert(offset, Bytes::from(big), BIG)
+                .expect("1200-byte contiguous chunk must be accepted");
+            offset += BIG as u64;
+            x.insert(offset, Bytes::from(vec![a]), 1)
+                .expect("first 1-byte chunk must be accepted");
+            offset += 1;
+            x.insert(offset, Bytes::from(vec![b]), 1)
+                .expect("second 1-byte chunk must be accepted");
+            offset += 1;
+        }
+        let payload = REPS * (BIG + 2);
+        assert!(
+            payload < 1_250_000,
+            "pattern is {payload} bytes, inside the default 1.25 MB stream window"
+        );
+        assert!(
+            x.data.len() <= MAX_CHUNKS,
+            "contiguous data left {} chunks after compaction",
+            x.data.len()
+        );
+        x.insert(0, Bytes::from_static(&[0x00]), 1)
+            .expect("delayed offset 0 must be accepted");
+        let mut got = Vec::new();
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            got.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(got, expected);
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
