@@ -6,7 +6,7 @@
 // Full details available at https://saorsalabs.com/licenses
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::{Future, poll_fn},
     io,
     pin::Pin,
@@ -470,10 +470,33 @@ impl<T> From<(Option<T>, Option<crate::ReadError>)> for ReadStatus<T> {
 /// See: FINDING-recv-boundary-aliasing.md
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
-    read: BTreeMap<u64, Vec<u8>>,
+    /// Contiguous runs keyed by start offset. `VecDeque` keeps both append and
+    /// prepend of newly delivered bytes amortised O(new bytes), so a peer that
+    /// frames STREAM data in descending offset order cannot force O(n²) copies.
+    read: BTreeMap<u64, VecDeque<u8>>,
     start: u64,
     end: u64,
     size_limit: usize,
+}
+
+/// Whether accepting a chunk at `chunk_offset` of length `chunk_len` would make
+/// the observed `[start, end)` span exceed `size_limit`.
+///
+/// Uses the global end (`end.max(chunk_end)`), not only the arriving chunk's
+/// end: a high offset accepted first must still bound a later low-offset chunk.
+fn read_to_end_span_too_long(
+    start: u64,
+    end: u64,
+    chunk_offset: u64,
+    chunk_len: usize,
+    size_limit: usize,
+) -> bool {
+    let span_start = start.min(chunk_offset);
+    let Some(chunk_end) = chunk_offset.checked_add(chunk_len as u64) else {
+        return true;
+    };
+    let span_end = end.max(chunk_end);
+    span_end.saturating_sub(span_start) > size_limit as u64
 }
 
 impl Future for ReadToEnd<'_> {
@@ -482,11 +505,17 @@ impl Future for ReadToEnd<'_> {
         loop {
             match ready!(self.stream.poll_read_chunk(cx, usize::MAX, false))? {
                 Some(chunk) => {
-                    self.start = self.start.min(chunk.offset);
-                    let end = chunk.bytes.len() as u64 + chunk.offset;
-                    if (end - self.start) > self.size_limit as u64 {
+                    if read_to_end_span_too_long(
+                        self.start,
+                        self.end,
+                        chunk.offset,
+                        chunk.bytes.len(),
+                        self.size_limit,
+                    ) {
                         return Poll::Ready(Err(ReadToEndError::TooLong));
                     }
+                    self.start = self.start.min(chunk.offset);
+                    let end = chunk.bytes.len() as u64 + chunk.offset;
                     self.end = self.end.max(end);
                     // Copy bytes into owned storage IMMEDIATELY, dropping the
                     // Bytes reference before the next poll cycle. This prevents
@@ -504,7 +533,7 @@ impl Future for ReadToEnd<'_> {
                     let (start, end) = (self.start, self.end);
                     let mut ordered: Vec<(Vec<u8>, u64)> = std::mem::take(&mut self.read)
                         .into_iter()
-                        .map(|(offset, data)| (data, offset))
+                        .map(|(offset, data)| (Vec::from(data), offset))
                         .collect();
                     return match assemble_unordered_chunks(&mut ordered, start, end) {
                         Some(buffer) => Poll::Ready(Ok(buffer)),
@@ -535,7 +564,7 @@ impl Future for ReadToEnd<'_> {
 /// [`assemble_unordered_chunks`] reports, and fails the read with
 /// [`ReadToEndError::MissingData`].
 fn push_read_chunk(
-    read: &mut BTreeMap<u64, Vec<u8>>,
+    read: &mut BTreeMap<u64, VecDeque<u8>>,
     bytes: &[u8],
     offset: u64,
 ) -> Result<(), ReadToEndError> {
@@ -560,7 +589,7 @@ fn push_read_chunk(
 /// Returns `false` when the chunk overlaps that entry or a later one, so the
 /// caller can merge with an integrity check instead of overwriting bytes.
 fn extend_exact_predecessor(
-    read: &mut BTreeMap<u64, Vec<u8>>,
+    read: &mut BTreeMap<u64, VecDeque<u8>>,
     bytes: &[u8],
     offset: u64,
     new_end: u64,
@@ -581,7 +610,7 @@ fn extend_exact_predecessor(
     let Some(prev) = read.get_mut(&prev_off) else {
         return false;
     };
-    prev.extend_from_slice(bytes);
+    prev.extend(bytes.iter().copied());
     absorb_following(read, prev_off);
     true
 }
@@ -589,8 +618,11 @@ fn extend_exact_predecessor(
 /// Place `bytes` immediately before the entry that starts at `new_end`.
 ///
 /// Returns `false` when any stored entry overlaps the new chunk.
+///
+/// Cost is O(`bytes.len()`): each new byte is `push_front`ed onto the existing
+/// deque. The already-stored suffix is not recopied.
 fn prepend_exact_successor(
-    read: &mut BTreeMap<u64, Vec<u8>>,
+    read: &mut BTreeMap<u64, VecDeque<u8>>,
     bytes: &[u8],
     offset: u64,
     new_end: u64,
@@ -606,12 +638,19 @@ fn prepend_exact_successor(
     if read.range(offset..new_end).next().is_some() {
         return false;
     }
-    let Some(next) = read.remove(&new_end) else {
+    let Some(mut next) = read.remove(&new_end) else {
         return false;
     };
-    let mut merged = bytes.to_vec();
-    merged.extend_from_slice(&next);
-    read.insert(offset, merged);
+    // Amortised O(bytes.len()): grow at the front. Do not allocate a fresh
+    // buffer and `extend_from_slice` the suffix — that is O(|suffix|) per
+    // call and O(n²) for descending one-byte chunks. A `Vec` prepend that
+    // recopies `next` must call `record_stored_byte_copy(next.len())` here
+    // so the copy-cost regression tests keep failing on that path.
+    next.reserve(bytes.len());
+    for &b in bytes.iter().rev() {
+        next.push_front(b);
+    }
+    read.insert(offset, next);
     let start = absorb_preceding(read, offset);
     absorb_following(read, start);
     true
@@ -619,7 +658,7 @@ fn prepend_exact_successor(
 
 /// Fold the entry that ends at `start` into that entry. Returns the key of the
 /// combined entry.
-fn absorb_preceding(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) -> u64 {
+fn absorb_preceding(read: &mut BTreeMap<u64, VecDeque<u8>>, start: u64) -> u64 {
     let Some((&prev_off, prev)) = read.range(..start).next_back() else {
         return start;
     };
@@ -629,19 +668,20 @@ fn absorb_preceding(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) -> u64 {
     if prev_end != start {
         return start;
     }
-    let Some(current) = read.remove(&start) else {
+    let Some(mut current) = read.remove(&start) else {
         return start;
     };
     let Some(prev) = read.get_mut(&prev_off) else {
         read.insert(start, current);
         return start;
     };
-    prev.extend_from_slice(&current);
+    record_stored_byte_copy(current.len());
+    prev.append(&mut current);
     prev_off
 }
 
 /// Append every entry that now starts where `start` ends.
-fn absorb_following(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) {
+fn absorb_following(read: &mut BTreeMap<u64, VecDeque<u8>>, start: u64) {
     loop {
         let Some(buf) = read.get(&start) else {
             return;
@@ -649,14 +689,15 @@ fn absorb_following(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) {
         let Some(end) = start.checked_add(buf.len() as u64) else {
             return;
         };
-        let Some(next) = read.remove(&end) else {
+        let Some(mut next) = read.remove(&end) else {
             return;
         };
         let Some(buf) = read.get_mut(&start) else {
             read.insert(end, next);
             return;
         };
-        buf.extend_from_slice(&next);
+        record_stored_byte_copy(next.len());
+        buf.append(&mut next);
     }
 }
 
@@ -665,7 +706,7 @@ fn absorb_following(read: &mut BTreeMap<u64, Vec<u8>>, start: u64) {
 /// The cap is applied after the merge: a chunk absorbed by a neighbour does
 /// not consume a new slot.
 fn merge_overlapping_or_insert(
-    read: &mut BTreeMap<u64, Vec<u8>>,
+    read: &mut BTreeMap<u64, VecDeque<u8>>,
     bytes: &[u8],
     offset: u64,
     new_end: u64,
@@ -687,13 +728,13 @@ fn merge_overlapping_or_insert(
         if read.len() >= MAX_READ_TO_END_ENTRIES {
             return Err(ReadToEndError::TooLong);
         }
-        read.insert(offset, bytes.to_vec());
+        read.insert(offset, bytes.iter().copied().collect());
         return Ok(());
     }
 
     let first = keys[0];
     let last = keys[keys.len() - 1];
-    let last_len = read.get(&last).map_or(0, Vec::len);
+    let last_len = read.get(&last).map_or(0, VecDeque::len);
     let Some(last_end) = last.checked_add(last_len as u64) else {
         return Err(ReadToEndError::TooLong);
     };
@@ -712,7 +753,12 @@ fn merge_overlapping_or_insert(
         if end > merged.len() || base > merged.len() {
             return Err(ReadToEndError::TooLong);
         }
-        merged[base..end].copy_from_slice(buf);
+        record_stored_byte_copy(buf.len());
+        let (left, right) = buf.as_slices();
+        merged[base..base + left.len()].copy_from_slice(left);
+        if !right.is_empty() {
+            merged[base + left.len()..end].copy_from_slice(right);
+        }
     }
 
     let base = usize::try_from(offset - merged_start).unwrap_or(merged_len);
@@ -746,14 +792,14 @@ fn merge_overlapping_or_insert(
     for key in &keys {
         read.remove(key);
     }
-    read.insert(merged_start, merged);
+    read.insert(merged_start, VecDeque::from(merged));
     if read.len() > MAX_READ_TO_END_ENTRIES {
         return Err(ReadToEndError::TooLong);
     }
     Ok(())
 }
 
-fn stored_byte(read: &BTreeMap<u64, Vec<u8>>, keys: &[u64], abs: u64) -> Option<u8> {
+fn stored_byte(read: &BTreeMap<u64, VecDeque<u8>>, keys: &[u64], abs: u64) -> Option<u8> {
     for key in keys {
         let Some(buf) = read.get(key) else {
             continue;
@@ -767,6 +813,42 @@ fn stored_byte(read: &BTreeMap<u64, Vec<u8>>, keys: &[u64], abs: u64) -> Option<
     }
     None
 }
+
+/// Test-only counter of already-stored entry bytes bulk-copied during merge.
+///
+/// `prepend_exact_successor` must not increment this for the suffix it grows
+/// onto: that was the O(n²) path on 569014fe (`bytes.to_vec()` +
+/// `extend_from_slice(&next)`). Absorb/overlap rebuilds still charge here.
+#[cfg(test)]
+mod merge_copy_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STORED_BYTES_COPIED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        STORED_BYTES_COPIED.with(|c| c.set(0));
+    }
+
+    pub(super) fn record(len: usize) {
+        STORED_BYTES_COPIED.with(|c| c.set(c.get().saturating_add(len as u64)));
+    }
+
+    pub(super) fn total() -> u64 {
+        STORED_BYTES_COPIED.with(|c| c.get())
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn record_stored_byte_copy(len: usize) {
+    merge_copy_stats::record(len);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn record_stored_byte_copy(_len: usize) {}
 
 /// Assemble unordered chunks into a contiguous buffer
 ///
@@ -1217,10 +1299,143 @@ mod tests {
         assert_eq!(buffer, payload);
     }
 
-    fn assemble_entries(read: &BTreeMap<u64, Vec<u8>>, start: u64, end: u64) -> Option<Vec<u8>> {
+    /// Cost model for the pre-fix prepend: `bytes.to_vec()` then
+    /// `extend_from_slice(&suffix)` recopies the whole following entry.
+    fn legacy_vec_prepend_suffix_copies(n: usize) -> u64 {
+        let mut suffix = Vec::new();
+        let mut copied = 0u64;
+        for i in (0..n).rev() {
+            let byte = ((i * 17) % 251) as u8;
+            // Charge the `extend_from_slice(&next)` of the old prepend path.
+            copied = copied.saturating_add(suffix.len() as u64);
+            let mut merged = Vec::with_capacity(1 + suffix.len());
+            merged.push(byte);
+            merged.extend_from_slice(&suffix);
+            suffix = merged;
+        }
+        copied
+    }
+
+    /// Descending one-byte chunks must prepend in O(new bytes), not O(suffix).
+    ///
+    /// On 569014fe the legacy `Vec` prepend copies N*(N-1)/2 suffix bytes for
+    /// N one-byte chunks. The `VecDeque` path does not charge
+    /// [`record_stored_byte_copy`] for that suffix (see comment in
+    /// `prepend_exact_successor`), so the counter stays far below the
+    /// quadratic volume.
+    #[test]
+    fn read_to_end_prepend_copy_cost_is_linear_for_descending() {
+        const N: usize = 8_000;
+        let legacy_copies = legacy_vec_prepend_suffix_copies(N);
+        let quadratic = (N as u64) * (N as u64 - 1) / 2;
+        assert_eq!(
+            legacy_copies, quadratic,
+            "sanity: the 569014fe prepend cost model must be quadratic"
+        );
+
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; N];
+        for i in (0..N).rev() {
+            let byte = ((i * 17) % 251) as u8;
+            payload[i] = byte;
+            push_read_chunk(&mut read, &[byte], i as u64).expect("descending push");
+        }
+        assert_eq!(read.len(), 1);
+        let copied = merge_copy_stats::total();
+        let bound = 8 * N as u64;
+        assert!(
+            copied <= bound,
+            "descending prepend copied {copied} stored bytes; O(N) bound is {bound} \
+             (569014fe would copy {legacy_copies})"
+        );
+        assert!(
+            copied < legacy_copies,
+            "fixed path stored copies {copied} must beat legacy {legacy_copies}"
+        );
+        let buffer = assemble_entries(&read, 0, N as u64).expect("descending must assemble");
+        assert_eq!(buffer, payload);
+    }
+
+    /// Gap-closing and shuffled arrival must keep bulk copies of already-stored
+    /// entry bytes well below the legacy descending-suffix volume.
+    #[test]
+    fn read_to_end_merge_copy_cost_is_linear_for_gap_fill_and_random() {
+        const N: usize = 4_096;
+        let legacy_descending = legacy_vec_prepend_suffix_copies(N);
+        // Sub-quadratic ceiling: still fails if prepend recopies like 569014fe.
+        let bound = legacy_descending / 4;
+        assert!(bound > 8 * N as u64);
+
+        // Pairwise gap-fill: 1,0,3,2,...
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut payload = vec![0u8; N];
+        for pair in 0..(N / 2) {
+            for offset in [pair * 2 + 1, pair * 2] {
+                let byte = ((offset * 17) % 251) as u8;
+                payload[offset] = byte;
+                push_read_chunk(&mut read, &[byte], offset as u64).expect("gap-fill push");
+            }
+        }
+        assert_eq!(read.len(), 1);
+        let gap_copied = merge_copy_stats::total();
+        assert!(
+            gap_copied <= bound,
+            "gap-fill merge copied {gap_copied} stored bytes; bound is {bound}"
+        );
+        assert_eq!(
+            assemble_entries(&read, 0, N as u64).expect("gap-fill assembles"),
+            payload
+        );
+
+        // Deterministic shuffle (LCG) over the same offsets.
+        merge_copy_stats::reset();
+        let mut read = BTreeMap::new();
+        let mut order: Vec<usize> = (0..N).collect();
+        let mut state = 0xC0FFEE_u64;
+        for i in (1..N).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (state as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        for &offset in &order {
+            let byte = payload[offset];
+            push_read_chunk(&mut read, &[byte], offset as u64).expect("random-order push");
+        }
+        assert_eq!(read.len(), 1);
+        let random_copied = merge_copy_stats::total();
+        assert!(
+            random_copied <= bound,
+            "random-order merge copied {random_copied} stored bytes; bound is {bound}"
+        );
+        assert_eq!(
+            assemble_entries(&read, 0, N as u64).expect("random-order assembles"),
+            payload
+        );
+    }
+
+    /// Span limit must use the global end, not only the arriving chunk's end.
+    #[test]
+    fn read_to_end_span_uses_global_end() {
+        // First chunk [150, 160) alone is within a 100-byte limit.
+        assert!(!read_to_end_span_too_long(u64::MAX, 0, 150, 10, 100));
+        // After accepting it (start=150, end=160), a later [0, 10) makes the
+        // observed span 160 > 100.
+        assert!(read_to_end_span_too_long(150, 160, 0, 10, 100));
+        // Contiguous growth that stays inside the limit is still accepted.
+        assert!(!read_to_end_span_too_long(0, 50, 50, 50, 100));
+        assert!(read_to_end_span_too_long(0, 50, 50, 51, 100));
+    }
+
+    fn assemble_entries(
+        read: &BTreeMap<u64, VecDeque<u8>>,
+        start: u64,
+        end: u64,
+    ) -> Option<Vec<u8>> {
         let mut chunks: Vec<(Vec<u8>, u64)> = read
             .iter()
-            .map(|(&offset, data)| (data.clone(), offset))
+            .map(|(&offset, data)| (data.iter().copied().collect(), offset))
             .collect();
         assemble_unordered_chunks(&mut chunks, start, end)
     }
