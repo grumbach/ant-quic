@@ -11094,13 +11094,15 @@ impl NatTraversalEndpoint {
             }
         }
 
-        // #286: abort and join the accept workers BEFORE the bounded drain,
-        // so no worker can register a handshake that completes after the
-        // lifecycle sweep above (the flag is checked at registration, but the
-        // join also guarantees the worker is gone before the socket is
-        // released). Aborted mid-handshake dials are dropped by the endpoint
-        // driver, which closes them. The join is bounded by the same drain
-        // budget — no unbounded await.
+        // #286: abort and join the accept and dial workers BEFORE the
+        // bounded drain, so the connections they hold are usually dropped
+        // before it starts. What keeps a late handshake out of the maps is
+        // the in-lock shutdown re-check at registration, not this join: a
+        // worker that registers after the sweep above is refused. The join
+        // is bounded by the drain budget and a timeout is ignored, so it
+        // does not guarantee that every worker has finished before the
+        // socket is released. Aborted mid-handshake dials are dropped by the
+        // endpoint driver, which closes them.
         {
             let handles = {
                 let mut workers = self.accept_worker_handles.lock();
@@ -11124,7 +11126,8 @@ impl NatTraversalEndpoint {
 
         // #305: drop the session and relay handles that the sweeps above do
         // not reach, before the bounded drain so their closes are still sent.
-        // The dial workers that store session handles were joined above.
+        // The dial workers that store session handles were aborted above; the
+        // bounded join does not prove they have all finished.
         let relay_endpoint = self.release_traversal_holders_for_shutdown();
 
         // #309: close every connection still open on the endpoint. The sweeps
