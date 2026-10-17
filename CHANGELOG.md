@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Out-of-order `read_to_end` stays within the caller's size limit.** Delivered
+  chunks are kept in offset order and merged into every neighbour they touch,
+  so a reordered contiguous stream is one entry. The 4096-entry cap is applied
+  after that merge.
+- **A datagram at the advertised maximum no longer closes the connection.**
+  The protocol check compares the payload with the advertised
+  `max_datagram_frame_size`. Per-datagram overhead is charged only when
+  choosing which queued datagrams to evict. The advertised limit is unchanged.
+- **Contiguous stream data is no longer rejected as too many chunks.** When
+  compaction still leaves more than 1024 chunks, a second pass merges every
+  contiguous run, including chunks above the retention cutoff. A stream is
+  rejected only when it still exceeds the cap after that pass.
 
 ## [0.27.60] - 2026-10-13
 
