@@ -722,6 +722,14 @@ pub(crate) mod reader_test_hooks {
         pub(crate) pause_first_attempt_loop: AtomicBool,
         /// Attempt to park just before its duplicate check (0 = none).
         pub(crate) park_before_dedup_attempt: AtomicUsize,
+        /// #284: park EVERY attempt just before its duplicate check, so
+        /// concurrent starts race for the owner slot once released.
+        pub(crate) park_all_before_dedup: AtomicBool,
+        /// #284: attempts parked by `park_all_before_dedup` so far.
+        pub(crate) parked_before_dedup: AtomicUsize,
+        /// #284: bit `attempt - 1` is set once that attempt's reader task
+        /// reaches its loop head (it is about to poll accept).
+        pub(crate) polled_attempts: AtomicUsize,
         /// Attempt to park after it was found to be a duplicate (0 = none).
         pub(crate) park_after_duplicate_attempt: AtomicUsize,
         /// Attempt whose reader task panics at its loop head (0 = none).
@@ -842,6 +850,11 @@ pub(crate) mod reader_test_hooks {
         let Some(hooks) = hooks else {
             return;
         };
+        if (1..=usize::BITS as usize).contains(&attempt) {
+            hooks
+                .polled_attempts
+                .fetch_or(1 << (attempt - 1), Ordering::SeqCst);
+        }
         if attempt != 0 && hooks.panic_attempt.load(Ordering::SeqCst) == attempt {
             hooks.panicked.store(true, Ordering::SeqCst);
             // Test-only: the #313 dead-reader regression needs a real panic in the
@@ -886,9 +899,13 @@ pub(crate) mod reader_test_hooks {
     pub(crate) async fn park_before_dedup(hooks: Option<&Arc<ReaderHooks>>, attempt: usize) {
         if let Some(hooks) = hooks
             && attempt != 0
-            && hooks.park_before_dedup_attempt.load(Ordering::SeqCst) == attempt
         {
-            hooks.wait_released().await;
+            if hooks.park_all_before_dedup.load(Ordering::SeqCst) {
+                hooks.parked_before_dedup.fetch_add(1, Ordering::SeqCst);
+                hooks.wait_released().await;
+            } else if hooks.park_before_dedup_attempt.load(Ordering::SeqCst) == attempt {
+                hooks.wait_released().await;
+            }
         }
     }
 
@@ -21041,6 +21058,85 @@ mod tests {
                  had its reader"
             );
             assert!(recv_within(&a, b_peer, payload, RECV_WINDOW).await);
+
+            a.shutdown().await;
+            b.shutdown().await;
+        }
+
+        /// #284: two reader starts racing for a connection that has no reader
+        /// yet. Both are held just before the owner check and released
+        /// together; exactly one reader task may ever run (poll accept), and
+        /// exactly one owner record may be registered. Before the owner was
+        /// reserved ahead of `tokio::spawn`, both tasks were spawned and the
+        /// duplicate could accept a stream before its abort landed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn racing_reader_starts_spawn_a_single_accept_consumer() {
+            let a = shim_node().await;
+            let b = shim_node().await;
+            let b_addr = shim_addr(&b);
+            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+            let _accept_a = shim_accept(&a);
+            let _accept_b = shim_accept(&b);
+
+            for round in 0..5 {
+                let x = raw_dial(&a, b_addr).await;
+                wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
+                assert!(!a.live_reader_for_test(&b_peer, x.stable_id()).await);
+
+                let hooks = reader_test_hooks::arm(a.reader_hooks_key(), x.stable_id());
+                hooks
+                    .park_all_before_dedup
+                    .store(true, AtomicOrdering::SeqCst);
+                let starts: Vec<_> = (0..2)
+                    .map(|_| {
+                        let a = Arc::clone(&a);
+                        let x = x.clone();
+                        tokio::spawn(async move { a.spawn_reader_task(b_peer, x).await })
+                    })
+                    .collect();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while hooks.parked_before_dedup.load(AtomicOrdering::SeqCst) < 2 {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "round {round}: both reader starts reach the owner check"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                hooks.release();
+                for start in starts {
+                    start.await.expect("reader start task");
+                }
+
+                let payload = format!("284 round {round}: B to A after racing starts");
+                b.send(&a_peer, payload.as_bytes())
+                    .await
+                    .expect("B's send succeeds");
+                assert!(
+                    recv_within(&a, b_peer, payload.as_bytes(), RECV_WINDOW).await,
+                    "round {round}: A receives B's message"
+                );
+                let polled = hooks.polled_attempts.load(AtomicOrdering::SeqCst);
+                let owners = a
+                    .reader_handles
+                    .read()
+                    .await
+                    .values()
+                    .flatten()
+                    .filter(|handle| handle.conn_stable_id == x.stable_id())
+                    .count();
+                reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
+
+                assert_eq!(
+                    polled.count_ones(),
+                    1,
+                    "round {round}: racing reader starts ran {} accept loops (mask {polled:#b})",
+                    polled.count_ones()
+                );
+                assert_eq!(
+                    owners, 1,
+                    "round {round}: one owner record for the connection"
+                );
+            }
 
             a.shutdown().await;
             b.shutdown().await;
