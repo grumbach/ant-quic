@@ -21267,6 +21267,15 @@ mod tests {
         /// nothing else. No outer peer record, no lifecycle event, no
         /// lifecycle entry beyond the registrar's own (#313 R1 tracks the
         /// winner), and the winner map still routes to the same connection.
+        ///
+        /// Fixture scheduling note: B's CoordinationAccepted dial to A can be
+        /// followed by an A→B inbound (punch/dial back) during the settle
+        /// sleep. B's accept path then registers the outer peer and may
+        /// supersede C_B — the same class of fixture race as n1_opposite
+        /// (concurrent path mutates state before the observation completes).
+        /// Hold B's inbounds until after the C4 asserts so adoption is the
+        /// only path under test. Reproduces on base master with a forced
+        /// `raw_dial(&a, b_addr)` while `_accept_b` runs.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn raw_winner_adoption_is_reader_only() {
             let a = shim_node().await;
@@ -21277,6 +21286,9 @@ mod tests {
             let _accept_a = shim_accept(&a);
             let _accept_b = shim_accept(&b);
             let _accept_z = shim_accept(&z);
+            // Park A→B inbounds before registration so accept cannot install
+            // an outer peer (or supersede C_B) during the settle window.
+            let _inbound_hold = b.inner.arm_inbound_hold_for_test();
             let mut b_events = b.subscribe_all_peer_events();
 
             let unrelated = raw_dial(&b, shim_addr(&z)).await;
@@ -21296,19 +21308,22 @@ mod tests {
             wait_for_reader(&b, &a_peer, c_b.stable_id(), "B's adopted reader on C_B").await;
             tokio::time::sleep(Duration::from_millis(500)).await;
 
+            let lifecycle = b.inner.lifecycle_entries_for_test(&a_peer);
+            let outer = b.connected_peers.read().await.get(&a_peer).cloned();
             assert!(
-                !b.connected_peers.read().await.contains_key(&a_peer),
-                "a reader adoption must not record an outer peer"
+                outer.is_none(),
+                "a reader adoption must not record an outer peer; \
+                 c_b={} lifecycle={lifecycle:?} outer={outer:?}",
+                c_b.stable_id(),
             );
             assert_eq!(
-                b.inner
-                    .lifecycle_entries_for_test(&a_peer)
+                lifecycle
                     .iter()
                     .map(|(stable_id, _, _)| *stable_id)
                     .collect::<Vec<_>>(),
                 vec![c_b.stable_id()],
                 "R1: the lifecycle holds only the registrar's entry for C_B; the adoption \
-                 adds none"
+                 adds none; lifecycle={lifecycle:?} outer={outer:?}"
             );
             let routed = winner(&b, &a_peer).await.expect("B still routes to A");
             assert_eq!(routed.stable_id(), c_b.stable_id(), "routing unchanged");
