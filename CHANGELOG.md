@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compaction still leaves more than 1024 chunks, a second pass merges every
   contiguous run, including chunks above the retention cutoff. A stream is
   rejected only when it still exceeds the cap after that pass.
+- **DATAGRAM frames are checked as encoded frames (RFC 9221 §3).** The
+  receive check uses the `max_datagram_frame_size` we advertise (the receive
+  buffer size, capped at 65535) and compares it with the whole frame: type,
+  length and payload, rather than the payload alone. A limit of 0 rejects
+  every DATAGRAM frame. We no longer send a DATAGRAM to a peer whose limit is
+  0 or 1.
 
 ### Security
 
