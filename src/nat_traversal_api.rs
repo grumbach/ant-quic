@@ -1579,6 +1579,128 @@ pub struct ConstrainedEventWithAddr {
     pub remote_addr: crate::transport::TransportAddr,
 }
 
+/// Backstop cap on events waiting for [`NatTraversalEndpoint::poll`] (#255).
+///
+/// Reached only by a standalone endpoint whose user never drives `poll()`;
+/// beyond it the oldest event is dropped and counted.
+const POLL_EVENT_QUEUE_CAP: usize = 256;
+
+/// An event waiting for [`NatTraversalEndpoint::poll`].
+struct QueuedPollEvent {
+    event: NatTraversalEvent,
+    /// The event callback already received this event when it was produced,
+    /// so draining it must not call the callback again.
+    callback_delivered: bool,
+}
+
+#[derive(Default)]
+struct PollEventQueueState {
+    events: std::collections::VecDeque<QueuedPollEvent>,
+    /// Set by an owner (`P2pEndpoint`) that drives `poll()` only while it
+    /// waits on a traversal; events are then queued only during such waits.
+    owner_polls_while_waiting: bool,
+    waiters: usize,
+    dropped: u64,
+}
+
+/// Events produced off the `poll()` path (accept, connection monitors,
+/// observed-address reports) for [`NatTraversalEndpoint::poll`] to return.
+///
+/// #255: this was an unbounded channel that only `poll()` drained, so an
+/// owner that never polled kept every Closed generation's events forever.
+#[derive(Clone)]
+struct PollEventQueue(Arc<ParkingMutex<PollEventQueueState>>);
+
+impl PollEventQueue {
+    fn new() -> Self {
+        Self(Arc::new(ParkingMutex::new(PollEventQueueState::default())))
+    }
+
+    /// Queue an event the callback has not seen; `poll()` delivers it.
+    fn send(&self, event: NatTraversalEvent) {
+        self.push(QueuedPollEvent {
+            event,
+            callback_delivered: false,
+        });
+    }
+
+    /// Queue an event the callback already received, for `poll()` only.
+    fn send_delivered(&self, event: NatTraversalEvent) {
+        self.push(QueuedPollEvent {
+            event,
+            callback_delivered: true,
+        });
+    }
+
+    fn push(&self, queued: QueuedPollEvent) {
+        let mut state = self.0.lock();
+        if state.owner_polls_while_waiting && state.waiters == 0 {
+            return;
+        }
+        if state.events.len() >= POLL_EVENT_QUEUE_CAP {
+            state.events.pop_front();
+            state.dropped += 1;
+            if state.dropped.is_power_of_two() {
+                tracing::warn!(
+                    target: "ant_quic::silent_drop",
+                    kind = "poll_event_queue_full",
+                    dropped = state.dropped,
+                    "NAT traversal events not drained by poll(); dropping oldest"
+                );
+            }
+        }
+        state.events.push_back(queued);
+    }
+
+    fn drain(&self) -> std::collections::VecDeque<QueuedPollEvent> {
+        std::mem::take(&mut self.0.lock().events)
+    }
+
+    fn set_owner_polls_while_waiting(&self) {
+        self.0.lock().owner_polls_while_waiting = true;
+    }
+
+    fn begin_wait(&self) -> PollWaitGuard {
+        self.0.lock().waiters += 1;
+        PollWaitGuard(self.clone())
+    }
+
+    /// When the last wait of a polls-while-waiting owner ends, undrained
+    /// events are discarded so they cannot replay as stale events later.
+    fn end_wait(&self) {
+        let mut state = self.0.lock();
+        state.waiters = state.waiters.saturating_sub(1);
+        if state.waiters == 0 && state.owner_polls_while_waiting {
+            state.events.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn pop(&self) -> Option<QueuedPollEvent> {
+        self.0.lock().events.pop_front()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().events.len()
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.0.lock().dropped
+    }
+}
+
+/// Keeps [`PollEventQueue`] accepting events while an owner waits on
+/// `poll()`; see [`PollEventQueue::end_wait`].
+pub(crate) struct PollWaitGuard(PollEventQueue);
+
+impl Drop for PollWaitGuard {
+    fn drop(&mut self) {
+        self.0.end_wait();
+    }
+}
+
 /// High-level NAT traversal endpoint for Autonomi P2P networks
 pub struct NatTraversalEndpoint {
     /// Underlying QUIC endpoint
@@ -1601,11 +1723,8 @@ pub struct NatTraversalEndpoint {
     event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
     /// Shutdown flag for async operations
     shutdown: Arc<AtomicBool>,
-    /// Channel for internal communication
-    event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
-    /// Receiver for internal event notifications
-    /// Uses parking_lot::Mutex for faster, non-poisoning access
-    event_rx: ParkingMutex<mpsc::UnboundedReceiver<NatTraversalEvent>>,
+    /// Events from background tasks waiting for `poll()` (#255: bounded)
+    event_tx: Option<PollEventQueue>,
     /// Sender for observed-address updates surfaced by per-connection watchers.
     observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
     /// Notify the discovery/orchestration driver that discovery state changed.
@@ -2985,8 +3104,9 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
-        let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
+        let (inner_endpoint, local_addr, relay_server_config) =
             Self::create_inner_endpoint(&config, token_store, registry_ref, None).await?;
+        let event_tx = PollEventQueue::new();
 
         // Update discovery manager with the actual bound address and any additional addresses
         {
@@ -3072,7 +3192,6 @@ impl NatTraversalEndpoint {
             event_callback,
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
-            event_rx: ParkingMutex::new(event_rx),
             observed_address_tx,
             discovery_state_notify: Arc::new(tokio::sync::Notify::new()),
             traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
@@ -3501,24 +3620,21 @@ impl NatTraversalEndpoint {
             .as_ref()
             .map(|arc| arc.as_ref())
             .unwrap_or(&empty_registry);
-        let (inner_endpoint, event_tx, event_rx, local_addr, relay_server_config) =
-            if let Some(abs_socket) = abstract_socket {
-                let (ep, tx, rx, addr) = Self::create_inner_endpoint_with_abstract_socket(
-                    &config,
-                    token_store.clone(),
-                    abs_socket,
-                )
-                .await?;
-                (ep, tx, rx, addr, None)
-            } else {
-                Self::create_inner_endpoint(
-                    &config,
-                    token_store.clone(),
-                    registry_ref,
-                    quinn_socket,
-                )
+        let (inner_endpoint, local_addr, relay_server_config) = if let Some(abs_socket) =
+            abstract_socket
+        {
+            let (ep, addr) = Self::create_inner_endpoint_with_abstract_socket(
+                &config,
+                token_store.clone(),
+                abs_socket,
+            )
+            .await?;
+            (ep, addr, None)
+        } else {
+            Self::create_inner_endpoint(&config, token_store.clone(), registry_ref, quinn_socket)
                 .await?
-            };
+        };
+        let event_tx = PollEventQueue::new();
 
         // Update discovery manager with the actual bound address and any additional addresses
         {
@@ -3604,7 +3720,6 @@ impl NatTraversalEndpoint {
             event_callback,
             shutdown: Arc::new(AtomicBool::new(false)),
             event_tx: Some(event_tx.clone()),
-            event_rx: ParkingMutex::new(event_rx),
             observed_address_tx,
             discovery_state_notify: Arc::new(tokio::sync::Notify::new()),
             traversal_event_notify: Arc::new(tokio::sync::Notify::new()),
@@ -4086,21 +4201,11 @@ impl NatTraversalEndpoint {
                                     },
                                 );
                                 if let Some(ref tx) = relay_event_tx {
-                                    if let Err(e) =
-                                        tx.send(NatTraversalEvent::ConnectionEstablished {
-                                            peer_id,
-                                            remote_address: remote,
-                                            side: Side::Server,
-                                        })
-                                    {
-                                        tracing::warn!(
-                                            target: "ant_quic::silent_drop",
-                                            kind = "event_tx_relay_accept_established",
-                                            peer_id = ?peer_id,
-                                            error = %e,
-                                            "silent drop"
-                                        );
-                                    }
+                                    tx.send(NatTraversalEvent::ConnectionEstablished {
+                                        peer_id,
+                                        remote_address: remote,
+                                        side: Side::Server,
+                                    });
                                     traversal_event_notify.notify_waiters();
                                 }
                                 incoming_notify.notify_waiters();
@@ -4432,6 +4537,26 @@ impl NatTraversalEndpoint {
     /// This is primarily used for testing to inject events.
     pub fn constrained_event_tx(&self) -> &mpsc::UnboundedSender<ConstrainedEventWithAddr> {
         &self.constrained_event_tx
+    }
+
+    /// For an owner that drives [`Self::poll`] only while it waits on a
+    /// traversal (`P2pEndpoint`): from now on, background events are queued
+    /// for `poll()` only while a [`Self::poll_wait_guard`] is held (#255).
+    pub(crate) fn poll_only_while_waiting(&self) {
+        if let Some(queue) = self.event_tx.as_ref() {
+            queue.set_owner_polls_while_waiting();
+        }
+    }
+
+    /// Mark a wait that drains [`Self::poll`]; see
+    /// [`Self::poll_only_while_waiting`].
+    pub(crate) fn poll_wait_guard(&self) -> Option<PollWaitGuard> {
+        self.event_tx.as_ref().map(PollEventQueue::begin_wait)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_poll_event_count(&self) -> usize {
+        self.event_tx.as_ref().map_or(0, PollEventQueue::len)
     }
 
     /// Emit an event to both the events vector and the callback (if present)
@@ -6269,16 +6394,7 @@ impl NatTraversalEndpoint {
         token_store: Option<Arc<dyn crate::TokenStore>>,
         transport_registry: &crate::transport::TransportRegistry,
         quinn_socket: Option<std::net::UdpSocket>,
-    ) -> Result<
-        (
-            InnerEndpoint,
-            mpsc::UnboundedSender<NatTraversalEvent>,
-            mpsc::UnboundedReceiver<NatTraversalEvent>,
-            SocketAddr,
-            Option<crate::ServerConfig>,
-        ),
-        NatTraversalError,
-    > {
+    ) -> Result<(InnerEndpoint, SocketAddr, Option<crate::ServerConfig>), NatTraversalError> {
         use std::sync::Arc;
 
         // v0.13.0+: All nodes are symmetric P2P nodes - always create server config
@@ -6469,16 +6585,7 @@ impl NatTraversalEndpoint {
 
         info!("Endpoint bound to actual address: {}", local_addr);
 
-        // Create event channel
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        Ok((
-            endpoint,
-            event_tx,
-            event_rx,
-            local_addr,
-            server_config_for_relay,
-        ))
+        Ok((endpoint, local_addr, server_config_for_relay))
     }
 
     /// Create the inner QUIC endpoint using a pre-built abstract socket.
@@ -6489,15 +6596,7 @@ impl NatTraversalEndpoint {
         config: &NatTraversalConfig,
         token_store: Option<Arc<dyn crate::TokenStore>>,
         abstract_socket: Arc<dyn crate::high_level::runtime::AsyncUdpSocket>,
-    ) -> Result<
-        (
-            InnerEndpoint,
-            mpsc::UnboundedSender<NatTraversalEvent>,
-            mpsc::UnboundedReceiver<NatTraversalEvent>,
-            SocketAddr,
-        ),
-        NatTraversalError,
-    > {
+    ) -> Result<(InnerEndpoint, SocketAddr), NatTraversalError> {
         use std::sync::Arc;
 
         // Build crypto configs (identical to create_inner_endpoint)
@@ -6590,8 +6689,7 @@ impl NatTraversalEndpoint {
 
         info!("Endpoint bound to actual address: {}", local_addr);
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        Ok((endpoint, event_tx, event_rx, local_addr))
+        Ok((endpoint, local_addr))
     }
 
     /// Start listening for incoming connections (async version)
@@ -6657,7 +6755,7 @@ impl NatTraversalEndpoint {
     async fn accept_connections(
         endpoint: InnerEndpoint,
         shutdown: Arc<AtomicBool>,
-        event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
+        event_tx: PollEventQueue,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         connection_lifecycle: Arc<ParkingRwLock<HashMap<PeerId, Vec<TrackedConnection>>>>,
         next_connection_generation: Arc<AtomicU64>,
@@ -6763,12 +6861,11 @@ impl NatTraversalEndpoint {
 
                                 let should_emit = emitted_events.insert(peer_id);
                                 if should_emit {
-                                    let _ =
-                                        event_tx.send(NatTraversalEvent::ConnectionEstablished {
-                                            peer_id,
-                                            remote_address: connection.remote_address(),
-                                            side: Side::Server,
-                                        });
+                                    event_tx.send(NatTraversalEvent::ConnectionEstablished {
+                                        peer_id,
+                                        remote_address: connection.remote_address(),
+                                        side: Side::Server,
+                                    });
                                     traversal_event_notify.notify_waiters();
                                 }
 
@@ -6938,7 +7035,7 @@ impl NatTraversalEndpoint {
         mut observed_address_rx: mpsc::UnboundedReceiver<ObservedAddressReport>,
         shutdown: Arc<AtomicBool>,
         shutdown_notify: Arc<tokio::sync::Notify>,
-        event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
+        event_tx: PollEventQueue,
         connections: Arc<dashmap::DashMap<PeerId, InnerConnection>>,
         relay_server: Option<Arc<MasqueRelayServer>>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
@@ -7035,7 +7132,7 @@ impl NatTraversalEndpoint {
     async fn handle_connection(
         peer_id: PeerId,
         connection: InnerConnection,
-        event_tx: mpsc::UnboundedSender<NatTraversalEvent>,
+        event_tx: PollEventQueue,
         traversal_event_notify: Arc<tokio::sync::Notify>,
     ) {
         let remote_address = connection.remote_address();
@@ -7056,36 +7153,34 @@ impl NatTraversalEndpoint {
             .close_reason()
             .map(|reason| format!("Connection closed: {reason}"))
             .unwrap_or_else(|| "Connection closed".to_string());
-        if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason }) {
-            tracing::warn!(
-                target: "ant_quic::silent_drop",
-                kind = "event_tx_connection_lost",
-                peer_id = ?peer_id,
-                error = %e,
-                "silent drop"
-            );
-        }
+        event_tx.send(NatTraversalEvent::ConnectionLost { peer_id, reason });
         traversal_event_notify.notify_waiters();
     }
 
     fn emit_runtime_event_parts(
-        event_tx: &mpsc::UnboundedSender<NatTraversalEvent>,
+        event_tx: &PollEventQueue,
         event_callback: Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         traversal_event_notify: &Arc<tokio::sync::Notify>,
         event: NatTraversalEvent,
     ) {
-        if let Err(e) = event_tx.send(event.clone()) {
-            tracing::warn!(
-                target: "ant_quic::silent_drop",
-                kind = "event_tx_emit_event",
-                error = %e,
-                "silent drop"
-            );
-        }
-        if let Some(callback) = event_callback {
-            callback(event);
-        }
+        Self::emit_and_queue_event(event_tx, event_callback, event);
         traversal_event_notify.notify_waiters();
+    }
+
+    /// Hand `event` to the callback now and queue it for `poll()` without a
+    /// second callback delivery when `poll()` drains it (#255).
+    fn emit_and_queue_event(
+        event_tx: &PollEventQueue,
+        event_callback: Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
+        event: NatTraversalEvent,
+    ) {
+        match event_callback {
+            Some(callback) => {
+                event_tx.send_delivered(event.clone());
+                callback(event);
+            }
+            None => event_tx.send(event),
+        }
     }
 
     fn reconcile_relay_server_public_addresses_from_connections(
@@ -7110,7 +7205,7 @@ impl NatTraversalEndpoint {
         discovery_manager: &ParkingMutex<CandidateDiscoveryManager>,
         discovery_state_notify: &Arc<tokio::sync::Notify>,
         observed_address_reports: &mut HashSet<(PeerId, SocketAddr)>,
-        event_tx: &mpsc::UnboundedSender<NatTraversalEvent>,
+        event_tx: &PollEventQueue,
         connections: &dashmap::DashMap<PeerId, InnerConnection>,
         relay_server: Option<&Arc<MasqueRelayServer>>,
         event_callback: Option<&Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
@@ -7244,19 +7339,11 @@ impl NatTraversalEndpoint {
 
         // Send event notification (we initiated = Client side)
         if let Some(ref event_tx) = self.event_tx {
-            if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionEstablished {
+            event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 peer_id,
                 remote_address: remote_addr,
                 side: Side::Client,
-            }) {
-                tracing::warn!(
-                    target: "ant_quic::silent_drop",
-                    kind = "event_tx_connection_established_client",
-                    peer_id = ?peer_id,
-                    error = %e,
-                    "silent drop"
-                );
-            }
+            });
             self.incoming_notify.notify_one();
             self.traversal_event_notify.notify_waiters();
         }
@@ -10283,19 +10370,11 @@ impl NatTraversalEndpoint {
         let should_emit = self.emitted_established_events.insert(peer_id);
 
         if should_emit {
-            if let Err(e) = event_tx.send(NatTraversalEvent::ConnectionEstablished {
+            event_tx.send(NatTraversalEvent::ConnectionEstablished {
                 peer_id,
                 remote_address,
                 side,
-            }) {
-                tracing::warn!(
-                    target: "ant_quic::silent_drop",
-                    kind = "event_tx_connection_established_inner",
-                    peer_id = ?peer_id,
-                    error = %e,
-                    "silent drop"
-                );
-            }
+            });
             self.incoming_notify.notify_one();
             self.traversal_event_notify.notify_waiters();
         }
@@ -12124,12 +12203,11 @@ impl NatTraversalEndpoint {
                                     );
 
                                     // Send connection established event (we initiated hole punch = Client side)
-                                    let _ =
-                                        event_tx.send(NatTraversalEvent::ConnectionEstablished {
-                                            peer_id: peer_id_clone,
-                                            remote_address: address,
-                                            side: Side::Client,
-                                        });
+                                    event_tx.send(NatTraversalEvent::ConnectionEstablished {
+                                        peer_id: peer_id_clone,
+                                        remote_address: address,
+                                        side: Side::Client,
+                                    });
                                     incoming_notify.notify_one();
                                     traversal_event_notify.notify_waiters();
                                     Self::spawn_observed_address_watch_task_parts(
@@ -12174,9 +12252,17 @@ impl NatTraversalEndpoint {
     /// Drain any pending events from async tasks
     #[inline]
     fn drain_pending_events(&self, events: &mut Vec<NatTraversalEvent>) {
-        let mut event_rx = self.event_rx.lock();
-        while let Ok(event) = event_rx.try_recv() {
-            self.emit_event(events, event);
+        let Some(queue) = self.event_tx.as_ref() else {
+            return;
+        };
+        for queued in queue.drain() {
+            if queued.callback_delivered {
+                // #255: the callback saw it when it was produced.
+                self.traversal_event_notify.notify_waiters();
+                events.push(queued.event);
+            } else {
+                self.emit_event(events, queued.event);
+            }
         }
     }
 
@@ -13795,7 +13881,7 @@ impl NatTraversalEndpoint {
         observed_address_tx: mpsc::UnboundedSender<ObservedAddressReport>,
         traversal_event_notify: Arc<tokio::sync::Notify>,
         incoming_notify: Arc<tokio::sync::Notify>,
-        event_tx: Option<mpsc::UnboundedSender<NatTraversalEvent>>,
+        event_tx: Option<PollEventQueue>,
         event_callback: Option<Arc<dyn Fn(NatTraversalEvent) + Send + Sync>>,
         // #286 round 2: gate the raw winner-map insert on the shutdown flag,
         // re-checked under the lifecycle write lock (linearized against the
@@ -13923,18 +14009,7 @@ impl NatTraversalEndpoint {
                 remote_address: candidate_address,
                 side: Side::Client,
             };
-            if let Err(e) = event_tx.send(event.clone()) {
-                tracing::warn!(
-                    target: "ant_quic::silent_drop",
-                    kind = "event_tx_emit_event_after_relay",
-                    peer_id = ?peer_id,
-                    error = %e,
-                    "silent drop"
-                );
-            }
-            if let Some(callback) = event_callback {
-                callback(event);
-            }
+            Self::emit_and_queue_event(&event_tx, event_callback.as_ref(), event);
             incoming_notify.notify_waiters();
             traversal_event_notify.notify_waiters();
         }
@@ -16236,9 +16311,188 @@ mod tests {
         endpoint.shutdown().await.expect("Shutdown should succeed");
     }
 
+    fn lost_event(n: u8) -> NatTraversalEvent {
+        NatTraversalEvent::ConnectionLost {
+            peer_id: PeerId([n; 32]),
+            reason: format!("closed {n}"),
+        }
+    }
+
+    /// #255 backstop: a standalone endpoint whose user never drives `poll()`
+    /// keeps at most `POLL_EVENT_QUEUE_CAP` events, dropping (and counting)
+    /// the oldest.
+    #[test]
+    fn poll_event_queue_caps_backlog_and_drops_oldest() {
+        let queue = PollEventQueue::new();
+        for n in 0..POLL_EVENT_QUEUE_CAP + 5 {
+            queue.send(lost_event(n as u8));
+        }
+        assert_eq!(queue.len(), POLL_EVENT_QUEUE_CAP);
+        assert_eq!(queue.dropped(), 5);
+        let oldest = queue.pop().expect("queued event");
+        assert!(matches!(
+            oldest.event,
+            NatTraversalEvent::ConnectionLost { peer_id, .. } if peer_id == PeerId([5; 32])
+        ));
+    }
+
+    /// #255: an owner that polls only while waiting gets no events queued
+    /// outside its waits, and a finished wait leaves nothing behind.
+    #[test]
+    fn owner_polled_queue_accepts_events_only_during_waits() {
+        let queue = PollEventQueue::new();
+        queue.set_owner_polls_while_waiting();
+
+        queue.send(lost_event(1));
+        queue.send_delivered(lost_event(2));
+        assert_eq!(queue.len(), 0, "nobody waits on poll(): nothing queues");
+
+        let outer = queue.begin_wait();
+        let inner = queue.begin_wait();
+        queue.send(lost_event(3));
+        drop(inner);
+        assert_eq!(queue.len(), 1, "a wait is still open: event stays queued");
+        drop(outer);
+        assert_eq!(queue.len(), 0, "last wait ended: undrained events dropped");
+
+        queue.send(lost_event(4));
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.dropped(), 0, "rejection is not a cap drop");
+    }
+
+    /// #255: an event handed to the callback when produced must not reach
+    /// the callback a second time when `poll()` drains it, while `poll()`
+    /// still returns it.
+    #[tokio::test]
+    async fn runtime_event_reaches_callback_once_and_poll_once() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_callback = Arc::clone(&captured);
+        let endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                ..Default::default()
+            },
+            Some(Box::new(move |event| {
+                captured_for_callback.lock().unwrap().push(event);
+            })),
+            None,
+        )
+        .await
+        .expect("endpoint");
+        let is_target = |event: &NatTraversalEvent| {
+            matches!(
+                event,
+                NatTraversalEvent::CoordinationRejected { peer_id, .. }
+                    if *peer_id == PeerId([0x5A; 32])
+            )
+        };
+
+        NatTraversalEndpoint::emit_runtime_event_parts(
+            endpoint.event_tx.as_ref().expect("event queue"),
+            endpoint.event_callback.as_ref(),
+            &endpoint.traversal_event_notify,
+            NatTraversalEvent::CoordinationRejected {
+                peer_id: PeerId([0x5A; 32]),
+                coordinator: "127.0.0.1:9009".parse().unwrap(),
+                reason: RejectionReason::RateLimited,
+            },
+        );
+        let polled = endpoint.poll(std::time::Instant::now()).expect("poll");
+
+        assert_eq!(polled.iter().filter(|e| is_target(e)).count(), 1);
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| is_target(e))
+                .count(),
+            1,
+            "callback must see the event exactly once"
+        );
+        endpoint.shutdown().await.expect("shutdown");
+    }
+
+    /// #255: a standalone endpoint that drives `poll()` still receives the
+    /// send-only connection events (accept's ConnectionEstablished and the
+    /// connection monitor's ConnectionLost), through `poll()` and once
+    /// through the callback.
+    #[tokio::test]
+    async fn standalone_poll_still_returns_connection_events() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_callback = Arc::clone(&captured);
+        let config = || NatTraversalConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let server = NatTraversalEndpoint::new(
+            config(),
+            Some(Box::new(move |event| {
+                captured_for_callback.lock().unwrap().push(event);
+            })),
+            None,
+        )
+        .await
+        .expect("server endpoint");
+        let client = NatTraversalEndpoint::new(config(), None, None)
+            .await
+            .expect("client endpoint");
+        let server_addr = server
+            .get_endpoint()
+            .expect("server endpoint present")
+            .local_addr()
+            .expect("server bound");
+        let conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            client
+                .get_endpoint()
+                .expect("client endpoint present")
+                .connect(server_addr, "peer")
+                .expect("initiate connection"),
+        )
+        .await
+        .expect("handshake must not hang")
+        .expect("handshake must succeed");
+        let (client_id, _) =
+            tokio::time::timeout(Duration::from_secs(10), server.accept_connection())
+                .await
+                .expect("accept must not hang")
+                .expect("accept");
+        conn.close(0u32.into(), b"done");
+
+        let is_established = |e: &NatTraversalEvent| matches!(e, NatTraversalEvent::ConnectionEstablished { peer_id, .. } if *peer_id == client_id);
+        let is_lost = |e: &NatTraversalEvent| matches!(e, NatTraversalEvent::ConnectionLost { peer_id, .. } if *peer_id == client_id);
+        let mut polled = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let notified = server.traversal_event_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                polled.extend(server.poll(std::time::Instant::now()).expect("poll"));
+                if polled.iter().any(is_lost) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("ConnectionLost must reach poll()");
+
+        assert_eq!(polled.iter().filter(|e| is_established(e)).count(), 1);
+        let callback_events = captured.lock().unwrap().clone();
+        assert_eq!(
+            callback_events.iter().filter(|e| is_established(e)).count(),
+            1,
+            "callback sees the queued ConnectionEstablished once, via poll()"
+        );
+        assert!(callback_events.iter().any(is_lost));
+        server.shutdown().await.expect("server shutdown");
+        client.shutdown().await.expect("client shutdown");
+    }
+
     #[tokio::test]
     async fn test_coordinator_rejected_runtime_event_uses_normal_event_path() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let event_tx = PollEventQueue::new();
         let captured_events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_events_for_callback = Arc::clone(&captured_events);
         let traversal_event_notify = Arc::new(tokio::sync::Notify::new());
@@ -16257,11 +16511,13 @@ mod tests {
             },
         );
 
-        let runtime_event = event_rx
-            .try_recv()
-            .expect("runtime event should be enqueued");
+        let queued = event_tx.pop().expect("runtime event should be enqueued");
+        assert!(
+            queued.callback_delivered,
+            "#255: poll() must not hand a callback-delivered event to the callback again"
+        );
         assert!(matches!(
-            runtime_event,
+            queued.event,
             NatTraversalEvent::CoordinationRejected {
                 peer_id,
                 coordinator,
@@ -16412,7 +16668,7 @@ mod tests {
         let traversal_event_notify = Arc::new(tokio::sync::Notify::new());
         let relay_setup_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut observed_address_reports = HashSet::new();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let event_tx = PollEventQueue::new();
         let connections = dashmap::DashMap::new();
         let report = ObservedAddressReport {
             reporter_peer_id: PeerId([0x45; 32]),
@@ -16444,7 +16700,7 @@ mod tests {
             .await
             .expect("traversal notify should fire");
 
-        let event = event_rx.try_recv().expect("external address event");
+        let event = event_tx.pop().expect("external address event").event;
         assert!(matches!(
             event,
             NatTraversalEvent::ExternalAddressDiscovered { address, .. }
@@ -16476,7 +16732,7 @@ mod tests {
         )
         .await;
         assert!(
-            event_rx.try_recv().is_err(),
+            event_tx.pop().is_none(),
             "duplicate reports must be suppressed"
         );
     }

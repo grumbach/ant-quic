@@ -4058,6 +4058,9 @@ impl P2pEndpoint {
         };
 
         inner.set_local_peer_id(peer_id);
+        // #255: this endpoint drains `inner.poll()` only inside traversal
+        // waits, so events produced outside them must not queue for it.
+        inner.poll_only_while_waiting();
 
         // Get the transport registry that was set on the endpoint
         let transport_registry = inner
@@ -5382,6 +5385,9 @@ impl P2pEndpoint {
             );
         }
 
+        // #255: queue background events for the `poll()` loop below.
+        let _poll_wait = self.inner.poll_wait_guard();
+
         // Initiate NAT traversal
         if let Err(e) = self.inner.initiate_nat_traversal(peer_id, coord_addr) {
             self.coordinator_health.record_failure(coord_addr);
@@ -6128,6 +6134,9 @@ impl P2pEndpoint {
                     }
                     .min(now + strategy.holepunch_timeout());
 
+                    // #255: cover events between the session start and the
+                    // `poll()` loop in `await_hole_punch_outcome`.
+                    let _poll_wait = self.inner.poll_wait_guard();
                     match self
                         .start_hole_punch_session(coordinator, target_peer_id)
                         .await
@@ -6411,6 +6420,7 @@ impl P2pEndpoint {
         peer_id: PeerId,
         overall_deadline: tokio::time::Instant,
     ) -> Result<PeerConnection, HolePunchAwaitError> {
+        let _poll_wait = self.inner.poll_wait_guard();
         loop {
             if self.shutdown.is_cancelled() {
                 let _ = clear_live_request(self.inner.local_peer_id(), peer_id);
@@ -12921,6 +12931,65 @@ mod tests {
             "janitor path must close the orphan connection"
         );
         assert!(a.inner.lifecycle_empty_for_test(&peer_id), "entry removed");
+    }
+
+    /// #255 regression: each Closed connection generation left its
+    /// ConnectionEstablished/ConnectionLost events queued for `inner.poll()`,
+    /// which this endpoint drives only inside hole-punch waits, so a node that
+    /// never hole-punched kept them forever. Measure the queued events per
+    /// Closed generation on both sides: it must be zero.
+    #[cfg(all(test, feature = "network-discovery"))]
+    #[tokio::test]
+    async fn closed_generations_retain_no_queued_poll_events() {
+        const GENERATIONS: usize = 8;
+        let a = shim_node().await;
+        let b = shim_node().await;
+        let b_addr = shim_addr(&b);
+        let _accept_b = shim_accept(&b);
+        let _accept_a = shim_accept(&a);
+        let a_id = a.peer_id();
+        let b_id = b.peer_id();
+
+        for generation in 0..GENERATIONS {
+            tokio::time::timeout(Duration::from_secs(10), a.connect_addr(b_addr))
+                .await
+                .expect("connect timeout")
+                .expect("connect");
+            let a_conn = a
+                .inner
+                .get_connection(&b_id)
+                .expect("a's connection")
+                .expect("a has a connection to b");
+            let b_conn = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let notify = b.inner.traversal_event_notify();
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if let Ok(Some(conn)) = b.inner.get_connection(&a_id) {
+                        return conn;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("b registers the accepted connection");
+            a.disconnect(&b_id).await.expect("disconnect");
+            for conn in [&a_conn, &b_conn] {
+                tokio::time::timeout(Duration::from_secs(10), conn.closed())
+                    .await
+                    .unwrap_or_else(|_| panic!("generation {generation} closes"));
+            }
+        }
+
+        let retained = a.inner.queued_poll_event_count() + b.inner.queued_poll_event_count();
+        assert_eq!(
+            retained,
+            0,
+            "{retained} events queued for poll() after {GENERATIONS} Closed generations \
+             ({} per generation)",
+            retained as f64 / GENERATIONS as f64
+        );
     }
 
     #[cfg(all(test, feature = "network-discovery"))]
