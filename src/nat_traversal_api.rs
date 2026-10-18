@@ -18713,6 +18713,134 @@ mod tests {
             shutdown_all(&[&endpoint, &first_target, &second_target]).await;
         }
 
+        /// #310: a coordinator replaces the admitted hole-punch winner while
+        /// another successful candidate is parked before registration. The
+        /// late candidate must lose to the coordinator, and the displaced
+        /// winner must stay open in lifecycle custody for stream draining.
+        #[tokio::test]
+        async fn coordinator_between_hole_punch_winners_orphans_nothing() {
+            let shared = identity();
+            let first_target = endpoint_with(Some(&shared)).await;
+            let second_target = endpoint_with(Some(&shared)).await;
+            let coordination_target = endpoint_with(Some(&shared)).await;
+            let endpoint = endpoint_with(None).await;
+            let peer = shared.peer_id;
+            let gate = endpoint.arm_winner_insert_gate_for_test();
+
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&first_target))
+                .expect("first candidate dial starts");
+            let (first_id, first) =
+                tokio::time::timeout(Duration::from_secs(10), gate.wait_until_parked())
+                    .await
+                    .expect("the first candidate completes its handshake and parks");
+            let first = first
+                .upgrade()
+                .expect("the parked candidate is still owned");
+            endpoint
+                .attempt_connection_to_candidate(peer, &winner_test_candidate(&second_target))
+                .expect("second candidate dial starts");
+            let second = wait_for_winner(&endpoint, peer, "the second winner", |_| true).await;
+            assert_ne!(second.stable_id(), first_id);
+            let second_generation = endpoint
+                .connection_snapshot_by_stable_id(&peer, second.stable_id())
+                .expect("the second winner is tracked")
+                .generation;
+            let remote = remote_view(&second_target).await;
+            let mut stream = second.open_uni().await.expect("open the winner's stream");
+            stream
+                .write_all(b"before ")
+                .await
+                .expect("start the stream");
+
+            let _unrelated = dial_accepted_coordination_for_test(
+                &endpoint,
+                endpoint
+                    .shutdown_socket_address_for_test()
+                    .expect("endpoint address"),
+                coordination_target
+                    .shutdown_socket_address_for_test()
+                    .expect("coordination target address"),
+                peer,
+            )
+            .await;
+            let coordinator =
+                wait_for_winner(&endpoint, peer, "the coordinator winner", |winner| {
+                    winner.stable_id() != second.stable_id()
+                })
+                .await;
+            let coordinator_snapshot = endpoint
+                .connection_snapshot_by_stable_id(&peer, coordinator.stable_id())
+                .expect("the coordinator winner must be lifecycle-tracked");
+            assert!(is_live(Some(coordinator_snapshot.state)));
+
+            gate.release();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), first.closed())
+                    .await
+                    .expect("the late hole-punch candidate is closed as a duplicate"),
+                crate::ConnectionError::LocallyClosed
+            );
+
+            assert_eq!(winner_id(&endpoint, &peer), Some(coordinator.stable_id()));
+            assert!(
+                endpoint
+                    .connection_snapshot_by_stable_id(&peer, first_id)
+                    .is_none(),
+                "the rejected candidate must not enter the lifecycle"
+            );
+            assert_eq!(
+                endpoint.current_connection_generation(&peer),
+                Some(coordinator_snapshot.generation)
+            );
+            let displaced = endpoint
+                .connection_snapshot_by_stable_id(&peer, second.stable_id())
+                .expect("the displaced hole-punch winner must not be orphaned");
+            assert_eq!(displaced.generation, second_generation);
+            assert!(matches!(
+                displaced.state,
+                ConnectionLifecycleState::Superseded { replaced_by_generation }
+                    if replaced_by_generation == coordinator_snapshot.generation
+            ));
+            assert!(
+                second.close_reason().is_none(),
+                "the displaced winner can drain"
+            );
+            assert!(
+                coordinator.close_reason().is_none(),
+                "the coordinator stays open"
+            );
+
+            stream
+                .write_all(b"and after replacement")
+                .await
+                .expect("the displaced winner's stream keeps writing");
+            stream
+                .finish()
+                .expect("finish the displaced winner's stream");
+            let received = tokio::time::timeout(Duration::from_secs(5), async {
+                remote
+                    .accept_uni()
+                    .await
+                    .expect("the remote accepts the displaced winner's stream")
+                    .read_to_end(1024)
+                    .await
+            })
+            .await
+            .expect("the displaced winner's stream completes")
+            .expect("the remote reads the displaced winner's stream");
+            assert_eq!(received, b"before and after replacement");
+
+            drop((gate, first, second, coordinator, stream, remote));
+            shutdown_all(&[
+                &endpoint,
+                &first_target,
+                &second_target,
+                &coordination_target,
+            ])
+            .await;
+        }
+
         /// RED on master (rewrite of #310 round 2 against R1). The
         /// coordinator insert displaces a hole-punch winner H that the
         /// application still uses. R1 keeps master's policy (the
