@@ -2385,9 +2385,11 @@ impl CandidateAddress {
             return Err(CandidateValidationError::InvalidPort(0));
         }
 
-        // Well-known port validation (allow for testing)
+        // Use the same privileged-port allowlist as config and ADD_ADDRESS validation.
+        // Library unit tests allow other privileged ports for their fixtures.
         #[cfg(not(test))]
-        if addr.port() < 1024 {
+        if addr.port() < 1024 && !crate::config::validation::is_allowed_privileged_port(addr.port())
+        {
             return Err(CandidateValidationError::PrivilegedPort(addr.port()));
         }
 
