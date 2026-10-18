@@ -38,6 +38,14 @@ where
         Ok(socket) => return Ok(BoundSocket::Dual(socket)),
         Err(error) => error,
     };
+    // Shared-port dual-stack exhaustion (#246) surfaces as AddrInUse on port 0.
+    // Do not fall back to a single IPv6 socket: without network-discovery,
+    // platforms such as Windows bind plain IPv6 (IPV6_V6ONLY=1 by default), so
+    // endpoint creation would succeed while IPv4 stayed unreachable. Explicit
+    // non-zero ports keep the single-socket ladder unchanged (pending David).
+    if port == 0 && dual_error.kind() == io::ErrorKind::AddrInUse {
+        return Err(dual_error);
+    }
     let v6_default = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     let addr = requested.unwrap_or(v6_default);
     match single(addr).await {
@@ -246,5 +254,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Port-0 dual-stack shared-port exhaustion must surface through the endpoint
+    /// binding path — never a silent single-socket success (Codex RC3 / #246).
+    #[test]
+    fn port_zero_dual_addr_in_use_propagates_without_single_fallback() {
+        for requested in [
+            None,
+            Some("0.0.0.0:0".parse().unwrap()),
+            Some("[::]:0".parse().unwrap()),
+        ] {
+            let attempts = RefCell::new(Vec::new());
+            let error = completed(bind(
+                requested,
+                |port| {
+                    attempts.borrow_mut().push(Attempt::Dual(port));
+                    ready(Err::<(), _>(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "failed to bind dual-stack sockets on a shared OS-assigned port \
+                         after 16 attempts: address in use",
+                    )))
+                },
+                |addr| {
+                    attempts.borrow_mut().push(Attempt::Single(addr));
+                    ready(Ok(()))
+                },
+            ))
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
+            assert!(
+                error.to_string().contains("shared OS-assigned port"),
+                "exhaustion detail must propagate: {error}"
+            );
+            assert_eq!(*attempts.borrow(), vec![Attempt::Dual(0)]);
+        }
+    }
+
+    /// Explicit non-zero wildcard still uses the single-socket ladder on dual failure.
+    #[test]
+    fn non_zero_port_dual_addr_in_use_still_falls_back_to_single() {
+        let requested = "[::]:43123".parse().unwrap();
+        let attempts = RefCell::new(Vec::new());
+        let result = completed(bind(
+            Some(requested),
+            |port| {
+                attempts.borrow_mut().push(Attempt::Dual(port));
+                ready(Err::<(), _>(io::Error::from(io::ErrorKind::AddrInUse)))
+            },
+            |addr| {
+                attempts.borrow_mut().push(Attempt::Single(addr));
+                ready(Ok(addr))
+            },
+        ))
+        .unwrap();
+        assert_eq!(result, BoundSocket::Single(requested));
+        assert_eq!(
+            *attempts.borrow(),
+            vec![Attempt::Dual(43123), Attempt::Single(requested)]
+        );
+    }
+
+    /// Non-conflict dual failures on port 0 still attempt the single-socket ladder.
+    #[test]
+    fn port_zero_dual_addr_not_available_still_falls_back_to_single() {
+        let attempts = RefCell::new(Vec::new());
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let result = completed(bind(
+            None,
+            |port| {
+                attempts.borrow_mut().push(Attempt::Dual(port));
+                ready(Err::<(), _>(io::Error::from(
+                    io::ErrorKind::AddrNotAvailable,
+                )))
+            },
+            |addr| {
+                attempts.borrow_mut().push(Attempt::Single(addr));
+                ready(Ok(addr))
+            },
+        ))
+        .unwrap();
+        assert_eq!(result, BoundSocket::Single(v6));
+        assert_eq!(
+            *attempts.borrow(),
+            vec![Attempt::Dual(0), Attempt::Single(v6)]
+        );
     }
 }
