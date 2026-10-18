@@ -18229,6 +18229,106 @@ mod tests {
         b.shutdown().await;
     }
 
+    /// #277: exercise the accepting side after the fresh handshake completes,
+    /// with the previous transport dead but its lifecycle entry still Live.
+    /// The inbound gate fixes the registration order without a restart delay.
+    /// Unlike the direct-finalize regression, this checks the accept queue,
+    /// both public peer lists and application traffic in both directions.
+    #[cfg(feature = "network-discovery")]
+    #[tokio::test]
+    async fn inbound_reconnect_replaces_dead_live_entry_and_delivers() {
+        let a = shim_node().await;
+        let b = shim_node().await;
+        let (a_id, b_id) = (a.peer_id(), b.peer_id());
+
+        // The old connection was initiated in the opposite direction, so
+        // the stale entry competes in the simultaneous-open tiebreaker.
+        // Leave it without a P2P reader: reader cleanup must not remove the
+        // deliberately stale entry before the accept loop sees it.
+        let old = tokio::time::timeout(
+            Duration::from_secs(10),
+            b.attempt_direct_handshake(shim_addr(&a)),
+        )
+        .await
+        .expect("old handshake timeout")
+        .expect("old handshake");
+        let (old_peer, _) =
+            tokio::time::timeout(Duration::from_secs(10), a.inner.accept_connection())
+                .await
+                .expect("old inbound timeout")
+                .expect("old inbound registered");
+        assert_eq!(old_peer, b_id);
+        // Clear A's old generation so the negative control isolates B's
+        // inbound registration, not A's already-covered finalize path.
+        a.inner.remove_connection(&b_id).unwrap();
+        old.close(crate::VarInt::from_u32(0), b"#277-old-connection");
+        assert!(!old.is_alive());
+
+        let hold = b.inner.arm_inbound_hold_for_test();
+        tokio::time::timeout(Duration::from_secs(10), a.connect_addr(shim_addr(&b)))
+            .await
+            .expect("fresh connect timeout")
+            .expect("fresh handshake completes before inbound registration");
+        let held = tokio::time::timeout(Duration::from_secs(10), hold.wait_for_held(1))
+            .await
+            .expect("fresh inbound reaches registration gate");
+        let fresh_stable_id = held[0].0;
+
+        // Force the stale entry to outrank the new cross-family candidate.
+        // Seed both maps only after the new handshake, reproducing delayed
+        // close bookkeeping regardless of how quickly loopback closes.
+        b.inner.seed_winner_for_test(
+            a_id,
+            crate::nat_traversal_api::tracked_connection_with_sort_keys_for_test(
+                old.clone(),
+                7,
+                0,
+                [0; 32],
+                [0xFF; 32],
+                TraversalMethod::Direct,
+            ),
+        );
+        hold.release(fresh_stable_id);
+        let accepted = tokio::time::timeout(Duration::from_secs(10), b.accept())
+            .await
+            .expect("fresh inbound must reach accept despite the stale Live entry")
+            .expect("fresh inbound accepted");
+        assert_eq!(accepted.peer_id, a_id);
+        assert_eq!(accepted.side, Side::Server);
+        let winner = b.inner.get_connection(&a_id).unwrap().unwrap();
+        assert_eq!(winner.stable_id(), fresh_stable_id);
+        assert!(winner.is_alive());
+        assert!(matches!(
+            b.inner
+                .connection_snapshot_by_stable_id(&a_id, old.stable_id())
+                .expect("old lifecycle entry retained")
+                .state,
+            crate::connection_lifecycle::ConnectionLifecycleState::Closed { .. }
+        ));
+
+        for (sender, receiver, sender_id, receiver_id) in
+            [(&a, &b, a_id, b_id), (&b, &a, b_id, a_id)]
+        {
+            let peers = sender.connected_peers().await;
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer_id, receiver_id);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (mut send, _) = sender.open_bi(&receiver_id).await.unwrap();
+                send.write_all(b"#277-fresh-inbound").await.unwrap();
+                send.finish().unwrap();
+                let (from, _, mut recv) = receiver.accept_bi().await.unwrap();
+                assert_eq!(from, sender_id);
+                assert_eq!(recv.read_to_end(1024).await.unwrap(), b"#277-fresh-inbound");
+            })
+            .await
+            .expect("application traffic must use the fresh connection");
+        }
+
+        drop(hold);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
     /// #277 round 2 (leak): the endpoint must be freed after `shutdown()` +
     /// drop. The original promotion hook captured `self.clone()` into a
     /// closure stored inside the endpoint's own inner Arc — a strong cycle
