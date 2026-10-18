@@ -9669,11 +9669,28 @@ impl NatTraversalEndpoint {
             return None;
         };
 
+        // Already the Live winner: a lazy read (`get_connection` /
+        // `is_peer_connected`) missed the winner map just before a
+        // registrar's insert and took this lock after it. Nothing is
+        // promoted and the registrar did the bookkeeping, so send no #277
+        // signal: it would record an outer peer for a winner registered
+        // without one (a #313 raw winner adopted reader-only).
+        let candidate = &entries[replacement_index];
+        let (replacement_stable_id, replacement_generation) =
+            (candidate.stable_id(), candidate.generation);
+        if matches!(candidate.state, ConnectionLifecycleState::Live)
+            && self
+                .connections
+                .get(peer_id)
+                .is_some_and(|current| current.stable_id() == replacement_stable_id)
+        {
+            let connection = candidate.connection.clone();
+            drop(lifecycle);
+            self.finalize_orphan_closures(peer_id, orphan_closures);
+            return Some(connection);
+        }
+
         // #313 R1: never orphan an untracked value this insert displaces.
-        let (replacement_stable_id, replacement_generation) = (
-            entries[replacement_index].stable_id(),
-            entries[replacement_index].generation,
-        );
         Self::adopt_displaced_untracked_locked(
             self.local_peer_id,
             peer_id,
@@ -17925,6 +17942,50 @@ mod tests {
         );
         let replacement = client.repromote_surviving_connection(&peer_id, None);
         assert!(replacement.is_some());
+    }
+
+    /// `get_connection` misses the winner map, a registrar then inserts the
+    /// winner under the lifecycle lock, and the read's repromotion resumes
+    /// on that lock. The winner is already in place, so it must return it
+    /// without a #277 promotion signal: the p2p consumer would otherwise
+    /// record an outer peer for a #313 raw winner adopted reader-only (the
+    /// `raw_winner_adoption_is_reader_only` flake). A winner missing from
+    /// the map is still repaired and signalled.
+    #[tokio::test]
+    async fn repromotion_signals_only_a_winner_it_restores() {
+        let (_server, client, conn) = loopback_quic_connection().await;
+        let peer_id = PeerId([0xBF; 32]);
+        let (promoted_tx, mut promoted_rx) = mpsc::unbounded_channel();
+        client.set_connection_promoted_sender(promoted_tx);
+        assert!(matches!(
+            client
+                .add_connection_with_outcome(peer_id, conn.clone())
+                .expect("register winner"),
+            ConnectionRegistrationOutcome::Live { .. }
+        ));
+
+        let current = client.repromote_surviving_connection(&peer_id, None);
+        assert_eq!(
+            current.map(|connection| connection.stable_id()),
+            Some(conn.stable_id()),
+            "the read gets the winner the registrar installed"
+        );
+        assert_eq!(
+            promoted_rx.try_recv().err(),
+            Some(mpsc::error::TryRecvError::Empty),
+            "an in-place winner is not a promotion"
+        );
+
+        // Control: the Live winner is missing from the winner map.
+        client.connections.remove(&peer_id);
+        let restored = client.repromote_surviving_connection(&peer_id, None);
+        assert_eq!(
+            restored.map(|connection| connection.stable_id()),
+            Some(conn.stable_id())
+        );
+        let promoted = promoted_rx.try_recv().expect("a restored winner signals");
+        assert_eq!(promoted.peer_id, peer_id);
+        assert_eq!(promoted.connection.stable_id(), conn.stable_id());
     }
 
     /// #368: the orphan sweep reports open, aged, readerless generations
