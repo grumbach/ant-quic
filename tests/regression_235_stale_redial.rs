@@ -54,6 +54,16 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
             .expect("b lookup before close")
             .expect("b must hold a live connection before dialer close");
         let stale_stable_id = stale_on_b.stable_id();
+        let stale_proto = stale_on_b.proto_handle();
+        // Hold THIS proto entry through the handshake: without a pin the
+        // normal 3×PTO drain timer can reap it mid-connect, and
+        // `stable_id()` alone still names the held Arc after reaping.
+        let _stale_pin = b.pin_quic_drain_for_test(&stale_on_b);
+        assert!(
+            b.quic_proto_contains_connection(&stale_on_b),
+            "round {round}: stale proto handle={stale_proto:?} \
+             (stable_id={stale_stable_id}) must be indexed before close"
+        );
 
         // Keep the holder busy on the stale connection (B→A traffic while A is
         // already tearing down), matching the production symptom.
@@ -82,19 +92,29 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
         })
         .await;
 
-        // `quic_open_connections` counts the proto slab, including draining
-        // entries. Lifecycle `get_quic_connection` can already be None while
-        // the stale QUIC connection is still indexed — the #235 failure mode.
+        // Identity membership (not aggregate count): the specific stale proto
+        // handle must still occupy a slab slot. Lifecycle `get_quic_connection`
+        // can already be None while that entry remains indexed — the #235 mode.
         assert_eq!(
             stale_on_b.stable_id(),
             stale_stable_id,
             "round {round}: stale handle identity must be stable before redial"
         );
+        assert_eq!(
+            stale_on_b.proto_handle(),
+            stale_proto,
+            "round {round}: stale proto handle must be stable before redial"
+        );
+        assert!(
+            b.quic_proto_contains_connection(&stale_on_b),
+            "round {round}: stale proto handle={stale_proto:?} \
+             (stable_id={stale_stable_id}) must remain indexed when redial starts"
+        );
         let open_on_b = b.quic_open_connections();
         assert!(
             open_on_b >= 1,
             "round {round}: B must still hold/drain the previous QUIC connection \
-             (stable_id={stale_stable_id}) when redial starts \
+             (stable_id={stale_stable_id}, proto={stale_proto:?}) when redial starts \
              (quic_open_connections={open_on_b})"
         );
 
@@ -107,21 +127,31 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
             "round {round}: redial must reach the same peer"
         );
 
-        // Handshake completed while the specific stale entry was still present:
-        // if it had drained mid-timeout, a retransmitted Initial could succeed
-        // even when earlier Initials were misrouted. Require stale+fresh overlap
-        // in the proto slab at the moment connect returns.
+        // Handshake completed while the specific stale entry was still indexed
+        // by identity (pin holds it; assert checks membership, not Arc address).
         assert_eq!(
             stale_on_b.stable_id(),
             stale_stable_id,
             "round {round}: stale handle must still identify the pre-redial entry \
              through handshake completion"
         );
+        assert_eq!(
+            stale_on_b.proto_handle(),
+            stale_proto,
+            "round {round}: stale proto handle must remain the pre-redial entry \
+             through handshake completion"
+        );
+        assert!(
+            b.quic_proto_contains_connection(&stale_on_b),
+            "round {round}: stale proto handle={stale_proto:?} \
+             (stable_id={stale_stable_id}) must still be indexed alongside the \
+             replacement when handshake completes"
+        );
         let open_at_handshake = b.quic_open_connections();
         assert!(
             open_at_handshake >= 2,
-            "round {round}: stale stable_id={stale_stable_id} must still be indexed \
-             alongside the replacement when handshake completes \
+            "round {round}: stale stable_id={stale_stable_id} proto={stale_proto:?} \
+             must still be indexed alongside the replacement when handshake completes \
              (quic_open_connections={open_at_handshake})"
         );
 
@@ -140,6 +170,21 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
             stale_stable_id,
             "round {round}: redial must install a new connection on the holder, not reuse the stale handle"
         );
+        assert_ne!(
+            fresh_on_b.proto_handle(),
+            stale_proto,
+            "round {round}: redial must install a new proto handle on the holder"
+        );
+        assert!(
+            b.quic_proto_contains_connection(&stale_on_b),
+            "round {round}: stale proto handle={stale_proto:?} must remain indexed \
+             after replacement is installed"
+        );
+        assert!(
+            b.quic_proto_contains_connection(&fresh_on_b),
+            "round {round}: fresh proto handle={:?} must be indexed",
+            fresh_on_b.proto_handle()
+        );
 
         a.send(&b_id, PAYLOAD)
             .await
@@ -150,6 +195,9 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
 
         hold_task.abort();
         let _ = hold_task.await;
+        // Drop pin at end of round so deferred reaps can complete before the
+        // next iteration's connection accounting.
+        drop(_stale_pin);
     }
 
     a.shutdown().await;

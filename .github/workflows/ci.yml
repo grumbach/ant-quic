@@ -74,14 +74,17 @@ jobs:
       - name: Build
         run: cargo build --lib --bins --examples
 
-      - name: Run library tests
-        run: cargo test --lib --all-features -- --test-threads=2
+      # Targeted regressions run BEFORE `--lib` so a known flake in the large
+      # library suite (e.g. raw_winner_adoption_is_reader_only, fixed in #350)
+      # cannot skip them. Required job: Test Suite.
+      - name: Run #235 stale-holder redial regression
+        run: cargo test --test regression_235_stale_redial --all-features -- --test-threads=1 --nocapture
 
       - name: Run receive-generation queued reconnect tests
         run: cargo test --test node_recv_generation --all-features -- --test-threads=1
 
-      - name: Run #235 stale-holder redial regression
-        run: cargo test --test regression_235_stale_redial --all-features -- --test-threads=1
+      - name: Run library tests
+        run: cargo test --lib --all-features -- --test-threads=2
 
       - name: Run integration tests
         run: |

@@ -9261,6 +9261,47 @@ impl P2pEndpoint {
             .map_or(0, |ep| ep.open_connections())
     }
 
+    /// #235: true while the proto slab still indexes this connection handle
+    /// (including draining / drain-pinned). Identity check — not an aggregate
+    /// count. `#[doc(hidden)]` instrumentation.
+    #[doc(hidden)]
+    pub fn quic_proto_contains_connection(&self, conn: &crate::high_level::Connection) -> bool {
+        self.inner
+            .get_endpoint()
+            .is_some_and(|ep| ep.quic_proto_contains(conn.proto_handle()))
+    }
+
+    /// #235 test seam: keep `conn`'s proto entry indexed through `Drained`
+    /// until the returned guard drops. Production never pins.
+    #[doc(hidden)]
+    pub fn pin_quic_drain_for_test(&self, conn: &crate::high_level::Connection) -> QuicDrainPin {
+        let handle = conn.proto_handle();
+        let endpoint = self.inner.get_endpoint().cloned();
+        if let Some(ref ep) = endpoint {
+            ep.pin_quic_drain(handle);
+        }
+        QuicDrainPin { endpoint, handle }
+    }
+}
+
+/// RAII guard from [`P2pEndpoint::pin_quic_drain_for_test`]: keeps one proto
+/// connection indexed across `Drained` until drop. Test-only surface.
+#[doc(hidden)]
+pub struct QuicDrainPin {
+    endpoint: Option<crate::high_level::Endpoint>,
+    handle: crate::ConnectionHandle,
+}
+
+impl Drop for QuicDrainPin {
+    fn drop(&mut self) {
+        if let Some(ep) = self.endpoint.take() {
+            ep.unpin_quic_drain(self.handle);
+        }
+    }
+}
+
+// Continue P2pEndpoint inherent impl (reader-handle instrumentation follows).
+impl P2pEndpoint {
     /// Number of per-peer reader-task handles currently tracked
     /// (`reader_handles` map entries, summed over peers).
     #[doc(hidden)]

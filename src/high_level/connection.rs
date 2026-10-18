@@ -1041,6 +1041,16 @@ impl Connection {
         self.0.stable_id()
     }
 
+    /// Proto-level [`ConnectionHandle`] for this connection (slab key).
+    ///
+    /// Distinct from [`Self::stable_id`]: the handle indexes the endpoint's
+    /// connection table; `stable_id` is the high-level allocation address and
+    /// remains valid even after the proto entry has been reaped.
+    #[doc(hidden)]
+    pub fn proto_handle(&self) -> ConnectionHandle {
+        self.0.state.lock("proto_handle").handle
+    }
+
     /// Returns true if this connection negotiated post-quantum settings.
     ///
     /// This reflects either explicit PQC algorithms advertised via transport

@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustls;
 use slab::Slab;
 use thiserror::Error;
@@ -349,6 +349,11 @@ pub struct Endpoint {
     /// used to amortise `shrink_to_fit` so a mass reap releases index memory
     /// without per-removal churn (x0x#278).
     index_compacted_at_capacity: usize,
+    /// #235 test seam: proto handles whose `Drained` reap is deferred while
+    /// pinned. Empty unless a test explicitly pins; production never inserts.
+    drain_pins: FxHashSet<ConnectionHandle>,
+    /// Handles that observed `Drained` while pinned; reaped on unpin.
+    deferred_drains: FxHashSet<ConnectionHandle>,
 }
 
 impl Endpoint {
@@ -389,6 +394,8 @@ impl Endpoint {
             pending_relay_events: Vec::new(),
             pending_peer_address_updates: Vec::new(),
             index_compacted_at_capacity: 0,
+            drain_pins: FxHashSet::default(),
+            deferred_drains: FxHashSet::default(),
         }
     }
 
@@ -759,21 +766,15 @@ impl Endpoint {
                 // For now, this event is acknowledged but not acted upon at the endpoint level.
             }
             Drained => {
-                if let Some(conn) = self.connections.try_remove(ch.0) {
-                    self.index.remove(&conn);
-                    // Clean up peer connection mapping if this connection has a peer ID
-                    if let Some(peer_id) = conn.peer_id {
-                        self.peer_connections.remove(&peer_id);
-                        trace!("Cleaned up peer connection mapping for {:?}", peer_id);
-                    }
+                if self.drain_pins.contains(&ch) {
+                    // #235 test seam: keep the specific entry indexed through a
+                    // controlled window (e.g. overlapping handshake). Unpin
+                    // completes the reap. Production never inserts into
+                    // `drain_pins`, so this branch is unreachable there.
+                    self.deferred_drains.insert(ch);
                 } else {
-                    // This indicates a bug in downstream code, which could cause spurious
-                    // connection loss instead of this error if the CID was (re)allocated prior to
-                    // the illegal call.
-                    error!(id = ch.0, "unknown connection drained");
+                    self.reap_drained_connection(ch);
                 }
-                // Amortised index compaction after a reap (x0x#278).
-                self.maybe_shrink_index();
             }
         }
         None
@@ -1658,6 +1659,47 @@ impl Endpoint {
     /// Number of connections that are currently open
     pub fn open_connections(&self) -> usize {
         self.connections.len()
+    }
+
+    /// True while `ch` still occupies a slot in the proto connection slab
+    /// (including draining / drain-pinned entries).
+    #[doc(hidden)]
+    pub fn contains_connection(&self, ch: ConnectionHandle) -> bool {
+        self.connections.contains(ch.0)
+    }
+
+    /// #235 test seam: defer proto reap of `ch` on `Drained` until
+    /// [`Self::unpin_drain`]. No-op for production (pins are never inserted).
+    #[doc(hidden)]
+    pub fn pin_drain(&mut self, ch: ConnectionHandle) {
+        self.drain_pins.insert(ch);
+    }
+
+    /// #235 test seam: release a drain pin; if `Drained` already fired, reap now.
+    #[doc(hidden)]
+    pub fn unpin_drain(&mut self, ch: ConnectionHandle) {
+        self.drain_pins.remove(&ch);
+        if self.deferred_drains.remove(&ch) {
+            self.reap_drained_connection(ch);
+        }
+    }
+
+    fn reap_drained_connection(&mut self, ch: ConnectionHandle) {
+        if let Some(conn) = self.connections.try_remove(ch.0) {
+            self.index.remove(&conn);
+            // Clean up peer connection mapping if this connection has a peer ID
+            if let Some(peer_id) = conn.peer_id {
+                self.peer_connections.remove(&peer_id);
+                trace!("Cleaned up peer connection mapping for {:?}", peer_id);
+            }
+        } else {
+            // This indicates a bug in downstream code, which could cause spurious
+            // connection loss instead of this error if the CID was (re)allocated prior to
+            // the illegal call.
+            error!(id = ch.0, "unknown connection drained");
+        }
+        // Amortised index compaction after a reap (x0x#278).
+        self.maybe_shrink_index();
     }
 
     /// Amortised compaction of the connection-index maps. Invoked after a
