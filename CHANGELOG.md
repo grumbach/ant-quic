@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Peer lifecycle streams agree on event order.** Each lifecycle event is now
+  sent to the all-peer and per-peer streams under one lock, so concurrent
+  emitters can no longer interleave the two sends and leave the streams showing
+  one peer's events in different orders (#322).
 - **Out-of-order `read_to_end` stays within the caller's size limit.** Delivered
   chunks are kept in offset order and merged into every neighbour they touch,
   so a reordered contiguous stream is one entry. The 4096-entry cap is applied
