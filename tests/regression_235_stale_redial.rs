@@ -65,8 +65,9 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
              (stable_id={stale_stable_id}) must be indexed before close"
         );
 
-        // Keep the holder busy on the stale connection (B→A traffic while A is
-        // already tearing down), matching the production symptom.
+        // Best-effort B→A traffic on the stale connection while A tears down
+        // (matches the production symptom). Not asserted: open/write can fail
+        // immediately after disconnect; the drain pin proves stale overlap.
         let holder = stale_on_b.clone();
         let hold_task = tokio::spawn(async move {
             for _ in 0..64 {
@@ -155,9 +156,16 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
              (quic_open_connections={open_at_handshake})"
         );
 
+        // Wait until lifecycle exposes a *different* connection on B, not merely
+        // Some. Close/registration can lag so get_quic_connection still returns
+        // the stale handle; exiting early then makes assert_ne! a false failure.
+        // Drain pin (_stale_pin) stays held through this wait and the asserts.
         wait_until(CONNECT_TIMEOUT, || {
             a.get_quic_connection(&b_id).ok().flatten().is_some()
-                && b.get_quic_connection(&a_id).ok().flatten().is_some()
+                && b.get_quic_connection(&a_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|c| c.stable_id() != stale_stable_id)
         })
         .await;
 

@@ -77,7 +77,7 @@ jobs:
       # Targeted regressions run BEFORE `--lib` so a known flake in the large
       # library suite (e.g. raw_winner_adoption_is_reader_only, fixed in #350)
       # cannot skip them. Required job: Test Suite.
-      - name: Run #235 stale-holder redial regression
+      - name: "Run #235 stale-holder redial regression"
         run: cargo test --test regression_235_stale_redial --all-features -- --test-threads=1 --nocapture
 
       - name: Run receive-generation queued reconnect tests
