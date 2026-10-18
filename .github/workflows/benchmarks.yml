@@ -145,6 +145,40 @@ jobs:
               --out "$out"
           }
 
+          # Re-measure only provisional regression ids (Criterion name filter).
+          run_gating_filtered() {
+            local label="$1"
+            local ids_file="$2"
+            local side_home="$GATE_ROOT/$label"
+            local out="$GATE_ROOT/sides/${label}.json"
+            mkdir -p "$side_home" "$GATE_ROOT/sides"
+            local suites=()
+            while IFS=$'\t' read -r suite filt; do
+              [ -n "$suite" ] || continue
+              local suite_home="$side_home/$suite"
+              mkdir -p "$suite_home"
+              export CRITERION_HOME="$suite_home"
+              if ! cargo bench --bench "$suite" -- "$filt" --save-baseline "$label" ${{ env.BENCH_CRITERION_ARGS }}; then
+                echo "filtered gating bench '$suite' filter='$filt' failed at $(git rev-parse HEAD)"
+                return 1
+              fi
+              case " ${suites[*]} " in
+                *" $suite "*) ;;
+                *) suites+=("$suite") ;;
+              esac
+            done < <(python3 "$GATE_PY" filters --regressions "$ids_file")
+            if [ "${#suites[@]}" -eq 0 ]; then
+              echo "no suites to confirm" >&2
+              return 1
+            fi
+            local collect_args=(collect --criterion-root "$side_home" --label "$label" --out "$out")
+            local s
+            for s in "${suites[@]}"; do
+              collect_args+=(--suite "$s")
+            done
+            python3 "$GATE_PY" "${collect_args[@]}"
+          }
+
           MODE="${{ steps.refs.outputs.mode }}"
           HEAD="${{ steps.refs.outputs.head }}"
           MERGE_BASE="${{ steps.refs.outputs.merge_base }}"
@@ -183,6 +217,7 @@ jobs:
               --control "$GATE_ROOT/sides/control.json" \
               --current "$GATE_ROOT/sides/current.json" \
               --report "$GATE_ROOT/comparison-report.md" \
+              --regressions-out "$GATE_ROOT/sides/provisional-regressions.txt" \
               --merge-base "$MERGE_BASE" \
               --head "$HEAD" \
               --runner "${RUNNER_NAME:-$RUNNER_OS}"
@@ -193,8 +228,57 @@ jobs:
             # Check helper status before copying the report: compare may exit 2
             # without writing comparison-report.md (set -e would skip write_unavailable).
             if [ "$rc" -eq 1 ]; then
-              cp "$GATE_ROOT/comparison-report.md" comparison-report.md
-              echo "regression_found=true" >> "$GITHUB_OUTPUT"
+              # Provisional fail: re-measure flagged ids ABAB so runner drift
+              # after baseline+control does not fail unchanged code (RC2 / #291).
+              echo "::group::ABAB interleaved confirmation of provisional regressions"
+              if [ ! -s "$GATE_ROOT/sides/provisional-regressions.txt" ]; then
+                write_unavailable "Compare exited 1 but wrote no provisional regression ids."
+                exit 0
+              fi
+              confirm_ok=true
+              for pair in 1 2; do
+                git checkout --force "$MERGE_BASE"
+                if ! run_gating_filtered "confirm_a${pair}" "$GATE_ROOT/sides/provisional-regressions.txt"; then
+                  confirm_ok=false
+                  break
+                fi
+                git checkout --force "$HEAD"
+                if ! run_gating_filtered "confirm_b${pair}" "$GATE_ROOT/sides/provisional-regressions.txt"; then
+                  confirm_ok=false
+                  break
+                fi
+              done
+              echo "::endgroup::"
+              if [ "$confirm_ok" != true ]; then
+                write_unavailable "Interleaved confirmation benches failed; not failing the PR."
+                exit 0
+              fi
+              set +e
+              python3 "$GATE_PY" confirm \
+                --baseline "$GATE_ROOT/sides/baseline.json" \
+                --control "$GATE_ROOT/sides/control.json" \
+                --current "$GATE_ROOT/sides/current.json" \
+                --pair1-baseline "$GATE_ROOT/sides/confirm_a1.json" \
+                --pair1-current "$GATE_ROOT/sides/confirm_b1.json" \
+                --pair2-baseline "$GATE_ROOT/sides/confirm_a2.json" \
+                --pair2-current "$GATE_ROOT/sides/confirm_b2.json" \
+                --report "$GATE_ROOT/comparison-report.md" \
+                --regressions-out "$GATE_ROOT/sides/confirmed-regressions.txt" \
+                --merge-base "$MERGE_BASE" \
+                --head "$HEAD" \
+                --runner "${RUNNER_NAME:-$RUNNER_OS}"
+              rc=$?
+              set -e
+              if [ "$rc" -eq 1 ]; then
+                cp "$GATE_ROOT/comparison-report.md" comparison-report.md
+                echo "regression_found=true" >> "$GITHUB_OUTPUT"
+              elif [ "$rc" -ne 0 ]; then
+                write_unavailable "Gate confirm helper failed with status $rc."
+                exit 0
+              else
+                cp "$GATE_ROOT/comparison-report.md" comparison-report.md
+                echo "regression_found=false" >> "$GITHUB_OUTPUT"
+              fi
             elif [ "$rc" -ne 0 ]; then
               write_unavailable "Gate helper failed with status $rc."
               exit 0
@@ -243,7 +327,7 @@ jobs:
             } else {
               comment += 'Benchmark gate did not produce a comparison report.\n';
             }
-            comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, allowlisted ant-quic bench ids only, CI overlap required. Mock/non-observing benches never fail the job._\n';
+            comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, allowlisted ant-quic bench ids only, CI overlap required, ABAB interleaved confirmation before fail. Mock/non-observing benches never fail the job._\n';
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,

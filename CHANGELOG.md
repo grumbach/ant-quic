@@ -12,13 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Run Benchmarks PR gate no longer fails on false regressions (#291).**
   Comparison is same-host against the PR merge-base with a same-commit control,
   gates only individual benchmark ids that execute ant-quic code (VarInt,
-  TransportError, PQC memory pool — not `bytes/*`, `duration/*`, or
-  `patterns/*`), and requires non-overlapping Criterion confidence intervals
-  beyond measured control noise. Mock suites (`connection_management`,
-  `nat_traversal_performance`) stay in the tree for local use but are
-  excluded from the gate. Benchmark artifacts upload only the Criterion root
-  so history archiving finds `sides/current.json`. Cross-runner head-of-master
-  artifact baselines are no longer used to fail PRs.
+  TransportError, observing PQC pool acquires — not `bytes/*`, `duration/*`,
+  `patterns/*`, or `direct_ml_kem_public_key` which only allocates a std
+  `Box`), and requires non-overlapping Criterion confidence intervals beyond
+  measured control noise. Provisional regressions are re-measured ABAB
+  (interleaved baseline/current) before the job fails, so runner drift after
+  baseline+control does not fail unchanged code. Mock suites
+  (`connection_management`, `nat_traversal_performance`) stay in the tree for
+  local use but are excluded from the gate. Benchmark artifacts upload only
+  the Criterion root so history archiving finds `sides/current.json`.
+  Cross-runner head-of-master artifact baselines are no longer used to fail
+  PRs.
 - **Peer lifecycle streams agree on event order.** Each lifecycle event is now
   sent to the all-peer and per-peer streams under one lock, so concurrent
   emitters can no longer interleave the two sends and leave the streams showing

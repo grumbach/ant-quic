@@ -91,6 +91,16 @@ class NonObservingIdsInsideCollectedSuites(unittest.TestCase):
         self.assertEqual(rows[0].status, "REGRESSION")
         self.assertTrue(gate.gate_should_fail(rows))
 
+    def test_direct_ml_kem_public_key_never_gates(self):
+        # Timed body is only Box::new([0u8; SIZE]); no ant-quic call (RC2).
+        bench_id = gate.qualify("pqc_memory_pool_bench", "direct_ml_kem_public_key")
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        self.assertNotIn(bench_id, gate.GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(rows[0].gated)
+        self.assertFalse(gate.gate_should_fail(rows))
+
 
 class MergeBaseAndControlRequired(unittest.TestCase):
     """Defects 2–3: refuse to gate without same-commit control; report labels."""
@@ -381,6 +391,115 @@ class OldGateWouldFailNewGatePasses(unittest.TestCase):
             {mock_id: est(baseline_mean)},
         )
         self.assertFalse(gate.gate_should_fail(rows))
+
+
+class InterleavedConfirmation(unittest.TestCase):
+    """RC2: provisional regressions from runner drift must not fail unchanged code."""
+
+    def test_unchanged_code_provisional_regression_cleared_by_abab(self):
+        # Replays SHA 8336f413 job failure shape: pool +24.3% vs 0.0% control noise
+        # while Rust/benches/deps and the executable were unchanged — drift after
+        # baseline+control both ran before current.
+        bench_id = gate.qualify("pqc_memory_pool_bench", "pool_ml_kem_public_key")
+        baseline = est(100, lower=95, upper=105)
+        control = est(100, lower=95, upper=105)  # 0% control noise
+        drifted_current = est(124.3, lower=120, upper=130)
+        provisional = gate.compare_sides(
+            {bench_id: baseline},
+            {bench_id: drifted_current},
+            {bench_id: control},
+        )
+        self.assertEqual(provisional[0].status, "REGRESSION")
+        self.assertTrue(gate.gate_should_fail(provisional))
+
+        # ABAB interleaved pairs see the same executable on both sides → stable.
+        stable = est(101, lower=96, upper=106)
+        confirmed = gate.apply_interleaved_confirmation(
+            provisional,
+            {bench_id: control},
+            [
+                ({bench_id: stable}, {bench_id: est(102, lower=97, upper=107)}),
+                ({bench_id: est(100.5, lower=95.5, upper=105.5)}, {bench_id: est(101.2, lower=96, upper=106)}),
+            ],
+        )
+        self.assertEqual(confirmed[0].status, "NOISE")
+        self.assertIn("interleaved confirmation", confirmed[0].reason)
+        self.assertFalse(gate.gate_should_fail(confirmed))
+
+    def test_persistent_regression_survives_abab_confirmation(self):
+        bench_id = gate.qualify("pqc_memory_pool_bench", "pool_ml_kem_public_key")
+        baseline = est(100, lower=95, upper=105)
+        control = est(101, lower=96, upper=106)
+        current = est(200, lower=190, upper=210)
+        provisional = gate.compare_sides(
+            {bench_id: baseline},
+            {bench_id: current},
+            {bench_id: control},
+        )
+        self.assertTrue(gate.gate_should_fail(provisional))
+        confirmed = gate.apply_interleaved_confirmation(
+            provisional,
+            {bench_id: control},
+            [
+                ({bench_id: baseline}, {bench_id: current}),
+                ({bench_id: est(99, lower=94, upper=104)}, {bench_id: est(198, lower=188, upper=208)}),
+            ],
+        )
+        self.assertEqual(confirmed[0].status, "REGRESSION")
+        self.assertIn("confirmed by 2 interleaved", confirmed[0].reason)
+        self.assertTrue(gate.gate_should_fail(confirmed))
+
+    def test_confirm_cli_clears_unchanged_code_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bench_id = "pqc_memory_pool_bench::pool_ml_kem_public_key"
+            payload = {
+                "baseline.json": {
+                    bench_id: {"mean": 100, "lower": 95, "upper": 105}
+                },
+                "control.json": {
+                    bench_id: {"mean": 100, "lower": 95, "upper": 105}
+                },
+                "current.json": {
+                    bench_id: {"mean": 124.3, "lower": 120, "upper": 130}
+                },
+                "a1.json": {bench_id: {"mean": 100, "lower": 95, "upper": 105}},
+                "b1.json": {bench_id: {"mean": 101, "lower": 96, "upper": 106}},
+                "a2.json": {bench_id: {"mean": 100.5, "lower": 95.5, "upper": 105.5}},
+                "b2.json": {bench_id: {"mean": 100.8, "lower": 95.8, "upper": 105.8}},
+            }
+            for name, body in payload.items():
+                (root / name).write_text(json.dumps(body))
+            report = root / "report.md"
+            rc = gate.main(
+                [
+                    "confirm",
+                    "--baseline",
+                    str(root / "baseline.json"),
+                    "--control",
+                    str(root / "control.json"),
+                    "--current",
+                    str(root / "current.json"),
+                    "--pair1-baseline",
+                    str(root / "a1.json"),
+                    "--pair1-current",
+                    str(root / "b1.json"),
+                    "--pair2-baseline",
+                    str(root / "a2.json"),
+                    "--pair2-current",
+                    str(root / "b2.json"),
+                    "--report",
+                    str(report),
+                    "--merge-base",
+                    "m1",
+                    "--head",
+                    "h1",
+                    "--runner",
+                    "test",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertIn("interleaved", report.read_text())
 
 
 if __name__ == "__main__":

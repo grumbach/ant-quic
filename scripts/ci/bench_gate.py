@@ -6,12 +6,15 @@ Defects this gate must not reproduce:
 2. Compare against head-of-master artifacts instead of the PR merge-base.
 3. Compare across runners/jobs without a same-commit control.
 4. Threshold a raw mean delta while ignoring Criterion confidence intervals.
+5. Fail on runner-state drift when baseline+control both ran before current
+   (RC2: provisional regressions need ABAB interleaved confirmation).
 
 The gate fails a PR only when a *gating* bench (one that executes ant-quic code)
 is slower than the merge-base on the *same runner*, the 95% CIs do not overlap,
-and the relative delta exceeds the measured same-commit control noise for that
-bench (with a small floor). Mock suites may still be collected for information;
-they never set the exit status.
+the relative delta exceeds the measured same-commit control noise for that
+bench (with a small floor), *and* an interleaved confirmation still regresses.
+Mock suites may still be collected for information; they never set the exit
+status.
 """
 
 from __future__ import annotations
@@ -36,6 +39,14 @@ COLLECTED_SUITES: Tuple[str, ...] = (
 # quic_benchmarks also contains bytes/*, duration/*, and patterns/* which
 # measure the bytes crate / std / language idioms and do not execute ant-quic
 # (CI evidence: bytes/create_large +6% with 0.2% control noise on a no-Rust PR).
+#
+# RC2 audit (timed body must call ant-quic code):
+# - varint/*: VarInt::from_u32 / Ord — YES (ant_quic::VarInt)
+# - transport_error/*: TransportError { ... } — YES (ant_quic::TransportError)
+# - pool_ml_kem_public_key: PqcMemoryPool::acquire_ml_kem_public_key — YES
+# - pool_ml_kem_secret_key: PqcMemoryPool::acquire_ml_kem_secret_key — YES
+# - concurrent_pool_access: PqcMemoryPool::acquire_ml_kem_ciphertext — YES
+# - direct_ml_kem_public_key: Box::new([0u8; SIZE]) only — NO → NON_GATING
 GATING_BENCH_IDS: frozenset[str] = frozenset(
     {
         # VarInt + TransportError: ant_quic public types on the hot path.
@@ -45,9 +56,8 @@ GATING_BENCH_IDS: frozenset[str] = frozenset(
         "quic_benchmarks::varint/compare",
         "quic_benchmarks::transport_error/create_protocol_violation",
         "quic_benchmarks::transport_error/create_with_reason",
-        # PQC memory pool: ant_quic::crypto::pqc::memory_pool.
+        # PQC memory pool: ant_quic::crypto::pqc::memory_pool (observing only).
         "pqc_memory_pool_bench::pool_ml_kem_public_key",
-        "pqc_memory_pool_bench::direct_ml_kem_public_key",
         "pqc_memory_pool_bench::pool_ml_kem_secret_key",
         "pqc_memory_pool_bench::concurrent_pool_access",
     }
@@ -73,6 +83,8 @@ NON_GATING_BENCH_IDS: frozenset[str] = frozenset(
         "quic_benchmarks::duration/as_nanos",
         "quic_benchmarks::patterns/option_unwrap_or",
         "quic_benchmarks::patterns/result_ok",
+        # std Box heap alloc + imported size constant; no pool / ant-quic call.
+        "pqc_memory_pool_bench::direct_ml_kem_public_key",
     }
 )
 
@@ -120,6 +132,18 @@ def is_gating_bench_id(bench_id: str) -> bool:
 
 def qualify(suite: str, bench_id: str) -> str:
     return f"{suite}::{bench_id}"
+
+
+def split_qualified_id(bench_id: str) -> Tuple[str, str]:
+    """Split ``suite::criterion_full_id`` into suite and Criterion filter."""
+    suite, sep, rest = bench_id.partition("::")
+    if not sep or not suite or not rest:
+        raise ValueError(f"expected suite::id, got {bench_id!r}")
+    return suite, rest
+
+
+def gated_regression_ids(rows: Iterable[Comparison]) -> List[str]:
+    return [row.bench_id for row in rows if row.gated and row.status == "REGRESSION"]
 
 
 def _ci_bounds(mean_obj: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
@@ -329,12 +353,106 @@ def gate_should_fail(rows: Iterable[Comparison]) -> bool:
     return any(row.gated and row.status == "REGRESSION" for row in rows)
 
 
+def apply_interleaved_confirmation(
+    provisional_rows: Sequence[Comparison],
+    control: Mapping[str, Estimate],
+    pairs: Sequence[Tuple[Mapping[str, Estimate], Mapping[str, Estimate]]],
+) -> List[Comparison]:
+    """Keep a provisional REGRESSION only if every interleaved pair still regresses.
+
+    Runner drift after baseline+control (both measured before current) can look
+    like a real regression with ~0% control noise. Re-measuring flagged ids as
+    ABAB (baseline, current, baseline, current) clears unchanged-code noise.
+    """
+    if not pairs:
+        raise ValueError("at least one interleaved confirmation pair is required")
+
+    out: List[Comparison] = []
+    for row in provisional_rows:
+        if not (row.gated and row.status == "REGRESSION"):
+            out.append(row)
+            continue
+
+        pair_rows: List[Comparison] = []
+        missing = False
+        for pair_baseline, pair_current in pairs:
+            if row.bench_id not in pair_baseline or row.bench_id not in pair_current:
+                missing = True
+                break
+            pair_rows.append(
+                classify(
+                    row.bench_id,
+                    pair_baseline[row.bench_id],
+                    pair_current[row.bench_id],
+                    control.get(row.bench_id),
+                )
+            )
+        if missing:
+            out.append(
+                Comparison(
+                    bench_id=row.bench_id,
+                    baseline=row.baseline,
+                    current=row.current,
+                    control=row.control,
+                    change_ratio=row.change_ratio,
+                    control_noise=row.control_noise,
+                    status="UNAVAILABLE",
+                    gated=True,
+                    reason=(
+                        "provisional regression missing from interleaved confirmation; "
+                        "refusing to fail"
+                    ),
+                )
+            )
+            continue
+
+        if all(p.status == "REGRESSION" for p in pair_rows):
+            confirmed = pair_rows[-1]
+            out.append(
+                Comparison(
+                    bench_id=row.bench_id,
+                    baseline=confirmed.baseline,
+                    current=confirmed.current,
+                    control=row.control,
+                    change_ratio=confirmed.change_ratio,
+                    control_noise=confirmed.control_noise,
+                    status="REGRESSION",
+                    gated=True,
+                    reason=(
+                        f"confirmed by {len(pair_rows)} interleaved pair(s): "
+                        f"{confirmed.reason}"
+                    ),
+                )
+            )
+            continue
+
+        cleared = pair_rows[-1]
+        out.append(
+            Comparison(
+                bench_id=row.bench_id,
+                baseline=cleared.baseline,
+                current=cleared.current,
+                control=row.control,
+                change_ratio=cleared.change_ratio,
+                control_noise=cleared.control_noise,
+                status="NOISE",
+                gated=True,
+                reason=(
+                    "provisional regression cleared by interleaved confirmation "
+                    f"(pair statuses: {', '.join(p.status for p in pair_rows)})"
+                ),
+            )
+        )
+    return out
+
+
 def format_report(
     rows: Sequence[Comparison],
     *,
     merge_base: str,
     head: str,
     runner: str,
+    confirmation: Optional[str] = None,
 ) -> str:
     lines = [
         "### Same-host merge-base benchmark gate (#291)\n",
@@ -345,11 +463,19 @@ def format_report(
         f"- Collected suites (informational ids included): {', '.join(COLLECTED_SUITES)}",
         f"- Non-gating suites: {', '.join(NON_GATING_SUITES)}",
         f"- Rule: fail only if a gating bench has non-overlapping 95% CIs, "
-        f"current is slower, and the relative delta exceeds max("
-        f"{MIN_REGRESSION_RATIO:.0%}, same-commit control noise)\n",
-        "| Benchmark | Baseline mean | Current mean | Change | Control noise | Status |",
-        "|-----------|---------------|--------------|--------|---------------|--------|",
+        f"current is slower, the relative delta exceeds max("
+        f"{MIN_REGRESSION_RATIO:.0%}, same-commit control noise), and ABAB "
+        f"interleaved confirmation still regresses\n",
     ]
+    if confirmation:
+        lines.append(f"- Confirmation: {confirmation}")
+        lines.append("")
+    lines.extend(
+        [
+            "| Benchmark | Baseline mean | Current mean | Change | Control noise | Status |",
+            "|-----------|---------------|--------------|--------|---------------|--------|",
+        ]
+    )
     for row in rows:
         lines.append(
             "| {id} | {b:.4g} | {c:.4g} | {ch:+.1%} | {n:.1%} | {s} |".format(
@@ -401,6 +527,13 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_regression_ids(path: Optional[Path], rows: Sequence[Comparison]) -> None:
+    if path is None:
+        return
+    ids = gated_regression_ids(rows)
+    path.write_text("".join(f"{bench_id}\n" for bench_id in ids))
+
+
 def cmd_compare(args: argparse.Namespace) -> int:
     baseline = parse_estimates_map(args.baseline)
     current = parse_estimates_map(args.current)
@@ -413,9 +546,49 @@ def cmd_compare(args: argparse.Namespace) -> int:
         runner=args.runner,
     )
     args.report.write_text(report)
+    _write_regression_ids(args.regressions_out, rows)
     print(report)
     if gate_should_fail(rows):
         return 1
+    return 0
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Re-classify provisional regressions using ABAB interleaved pair maps."""
+    baseline = parse_estimates_map(args.baseline)
+    current = parse_estimates_map(args.current)
+    control = parse_estimates_map(args.control)
+    provisional = compare_sides(baseline, current, control, require_control=True)
+    pairs = [
+        (parse_estimates_map(args.pair1_baseline), parse_estimates_map(args.pair1_current)),
+        (parse_estimates_map(args.pair2_baseline), parse_estimates_map(args.pair2_current)),
+    ]
+    rows = apply_interleaved_confirmation(provisional, control, pairs)
+    report = format_report(
+        rows,
+        merge_base=args.merge_base,
+        head=args.head,
+        runner=args.runner,
+        confirmation="ABAB interleaved re-measure of provisional regressions",
+    )
+    args.report.write_text(report)
+    _write_regression_ids(args.regressions_out, rows)
+    print(report)
+    if gate_should_fail(rows):
+        return 1
+    return 0
+
+
+def cmd_filters(args: argparse.Namespace) -> int:
+    """Print ``suite\\tfilter`` lines for Criterion-filtered confirmation runs."""
+    ids = [
+        line.strip()
+        for line in args.regressions.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for bench_id in ids:
+        suite, filt = split_qualified_id(bench_id)
+        print(f"{suite}\t{filt}")
     return 0
 
 
@@ -435,10 +608,36 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--control", type=Path, required=True)
     compare.add_argument("--current", type=Path, required=True)
     compare.add_argument("--report", type=Path, required=True)
+    compare.add_argument("--regressions-out", type=Path, default=None)
     compare.add_argument("--merge-base", required=True)
     compare.add_argument("--head", required=True)
     compare.add_argument("--runner", default="unknown")
     compare.set_defaults(func=cmd_compare)
+
+    confirm = sub.add_parser(
+        "confirm",
+        help="Confirm provisional regressions with ABAB interleaved pair maps",
+    )
+    confirm.add_argument("--baseline", type=Path, required=True)
+    confirm.add_argument("--control", type=Path, required=True)
+    confirm.add_argument("--current", type=Path, required=True)
+    confirm.add_argument("--pair1-baseline", type=Path, required=True)
+    confirm.add_argument("--pair1-current", type=Path, required=True)
+    confirm.add_argument("--pair2-baseline", type=Path, required=True)
+    confirm.add_argument("--pair2-current", type=Path, required=True)
+    confirm.add_argument("--report", type=Path, required=True)
+    confirm.add_argument("--regressions-out", type=Path, default=None)
+    confirm.add_argument("--merge-base", required=True)
+    confirm.add_argument("--head", required=True)
+    confirm.add_argument("--runner", default="unknown")
+    confirm.set_defaults(func=cmd_confirm)
+
+    filters = sub.add_parser(
+        "filters",
+        help="Emit suite/filter pairs for Criterion-filtered confirmation runs",
+    )
+    filters.add_argument("--regressions", type=Path, required=True)
+    filters.set_defaults(func=cmd_filters)
     return parser
 
 
