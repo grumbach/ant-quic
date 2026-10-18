@@ -32,17 +32,24 @@ route. The caller can still have time left to finish that handshake.
 
 ## Decision
 
-Implement option C (option 3 above), as assigned by Engineer after the Claude
+Implement option 3 (consensus option C), as assigned by Engineer after the Claude
 and Codex votes on 18 October 2026. The direct-stage timer borrows the Happy
 Eyeballs future. If it expires on a coordinator-capable PeerId dial, the same
 future races the remaining fallback stages. Each stage retains its existing
-budget and retry policy. The overlap ends at the earlier of the caller and
-ladder deadlines. An exhausted fallback does not cancel a viable direct
-handshake before that deadline.
+budget and retry policy. The retained direct race ends at the earlier of the
+caller and ladder deadlines. Its expiry cancels only direct attempts: punching
+and relay continue within their existing budgets up to the ladder deadline,
+even if the direct pre-pass has already exhausted the caller budget. An
+exhausted fallback does not cancel a viable direct handshake before its deadline.
 
 The direct result goes through the existing lifecycle registration. Punch
 results keep the existing winner arbitration. Dropping the owned direct race
-aborts its pending attempts and releases unregistered results. No new timeout
+aborts its pending attempts and releases unregistered results. A fallback may
+register a punched connection before it returns. If direct wins during that
+interval, dropping fallback does not undo registration or immediately close
+the punched connection. Both connections can remain open until ADR-017's
+existing lifecycle and reader retirement rules permit cleanup. The overlap
+selector does not add a close path for registered connections. No new timeout
 constant, public API or wire codepoint is introduced.
 
 ## Consequences
@@ -54,7 +61,8 @@ constant, public API or wire codepoint is introduced.
 
 ### Negative / Trade-offs
 
-- Direct and fallback work can overlap within the original budget.
+- Direct and fallback work can overlap within the original direct budget;
+  fallback can continue after that budget expires.
 - Cleanup must cover caller cancellation and simultaneous completion, as well
   as successful selection of either path.
 
@@ -67,7 +75,11 @@ constant, public API or wire codepoint is introduced.
 
 Use real loopback QUIC connections with an injected gate that owns Connecting,
 and paused Tokio time. Assert late direct success, the unchanged punch-stage
-budget, caller-deadline expiry, cancellation and punch-winner loser cleanup.
+budget, direct cancellation at caller-deadline expiry while fallback continues,
+punching after the direct pre-pass exhausts the caller budget, fallback
+exhaustion before direct succeeds, caller cancellation and punch-winner loser
+cleanup. Cover a registered punch whose fallback future has not returned when
+direct wins, without imposing immediate retirement on registered connections.
 Run the existing Happy Eyeballs, direct-budget, lifecycle and punch-arbitration
 suites. Keep all previous assertions.
 

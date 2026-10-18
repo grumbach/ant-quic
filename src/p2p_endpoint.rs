@@ -5983,6 +5983,11 @@ impl P2pEndpoint {
                         .timeouts
                         .nat_traversal
                         .connection_establishment_timeout;
+                    #[cfg(all(test, feature = "network-discovery"))]
+                    if let Some(gate) = self.late_direct_gate.lock().as_ref() {
+                        *gate.direct_deadline.lock() =
+                            Some(tokio::time::Instant::now() + direct_timeout);
+                    }
 
                     info!(
                         "Happy Eyeballs: racing {} direct addresses (timeout: {:?})",
@@ -6039,7 +6044,9 @@ impl P2pEndpoint {
                         })
                         .await
                     };
-                    tokio::pin!(direct_race);
+                    // Move this owned future into the overlap after the cutoff,
+                    // so its deadline can drop the attempts while fallback runs.
+                    let mut direct_race = Box::pin(direct_race);
                     // Borrow the race: the stage timer must not drop its owned
                     // Connecting attempts when punching can start (#304).
                     let he_result = timeout(direct_timeout, &mut direct_race).await;
@@ -6121,7 +6128,13 @@ impl P2pEndpoint {
                                     overall_deadline,
                                 );
                                 return self
-                                    .race_late_direct(direct_race, fallback, peer_id, deadline)
+                                    .race_late_direct(
+                                        direct_race,
+                                        fallback,
+                                        peer_id,
+                                        deadline,
+                                        overall_deadline,
+                                    )
                                     .await;
                             }
                         }
@@ -6152,11 +6165,13 @@ impl P2pEndpoint {
         }
     }
 
-    /// Keep the owned direct race alive across fallback stages. Only raw
-    /// handshakes race here; registration runs after selection so cancellation
-    /// cannot strand a partially finalized direct connection. Dropping the
-    /// Happy Eyeballs future aborts its owned attempts and releases any raw
-    /// result. A registered punch winner keeps the existing lifecycle arbiter.
+    /// Keep the owned direct race alive across fallback stages. Direct
+    /// registration runs after selection, so dropping its Happy Eyeballs
+    /// future aborts pending attempts and releases unregistered results.
+    /// Fallback can register a punched connection before returning: dropping
+    /// that future does not undo registration. If direct then wins, both
+    /// connections can remain open under ADR-017's lifecycle and reader
+    /// retirement rules; this selector does not close registered losers.
     async fn race_late_direct(
         &self,
         direct: impl std::future::Future<
@@ -6169,34 +6184,54 @@ impl P2pEndpoint {
             Output = Result<(PeerConnection, ConnectionMethod), EndpointError>,
         >,
         peer_id: Option<PeerId>,
-        deadline: tokio::time::Instant,
+        direct_deadline: tokio::time::Instant,
+        overall_deadline: tokio::time::Instant,
     ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
         let _request = DialTraversalRequest {
             local_peer: self.inner.local_peer_id(),
             target_peer: peer_id,
         };
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= overall_deadline {
             return Err(EndpointError::Timeout);
         }
+        let direct = async move {
+            // The pre-pass may already have spent the caller budget. Expiry
+            // cancels only this owned race, not punching or relay.
+            if tokio::time::Instant::now() >= direct_deadline {
+                drop(direct);
+                return None;
+            }
+            tokio::time::timeout_at(direct_deadline, direct)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
         tokio::pin!(direct, fallback);
         let race = async {
             tokio::select! {
                 biased;
-                // A ready fallback result has already passed registration.
+                // Prefer a completed fallback. A pending fallback may also
+                // have registered a connection; see the lifecycle rule above.
                 result = &mut fallback => match result {
                     Ok(winner) => Ok(DialWinner::Fallback(winner)),
                     // Exhausted fallback stages must not cancel a handshake
                     // that can still finish within the original dial budget.
-                    Err(error) => direct.await.map(DialWinner::Direct).map_err(|_| error),
+                    Err(error) => {
+                        #[cfg(all(test, feature = "network-discovery"))]
+                        if let Some(gate) = self.late_direct_gate.lock().as_ref() {
+                            gate.fallback_exhausted.notify_one();
+                        }
+                        direct.await.map(DialWinner::Direct).ok_or(error)
+                    },
                 },
                 result = &mut direct => match result {
-                    Ok(winner) => Ok(DialWinner::Direct(winner)),
-                    Err(_) => fallback.await.map(DialWinner::Fallback),
+                    Some(winner) => Ok(DialWinner::Direct(winner)),
+                    None => fallback.await.map(DialWinner::Fallback),
                 },
             }
         };
         let result = tokio::select! {
-            result = tokio::time::timeout_at(deadline, race) =>
+            result = tokio::time::timeout_at(overall_deadline, race) =>
                 result.map_err(|_| EndpointError::Timeout)?,
             () = self.shutdown.cancelled() => return Err(EndpointError::ShuttingDown),
         };
