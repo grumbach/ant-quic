@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **#235 stale-holder redial is pinned.**
+  `regression_235_stale_redial` closes one side, keeps the peer busy on the
+  draining QUIC connection, and redials the same address eight times; the
+  handshake must complete and replace the stale handle. A
+  `ConnectionIndex` unit test also pins that Initial routing is by destination
+  CID, not by 4-tuple — the original timeout hypothesis. Confirmed fixed on
+  master by keepalive/close-reason work (#240/#241) and later lifecycle merges;
+  no production code change in this entry.
 - **Three replacement tests now make a genuinely new connection (#316).**
   `reconnect_reader_task::recv_after_reconnect`,
   `lifecycle_sender_stale::stale_sender_connection_fails_after_supersede` and

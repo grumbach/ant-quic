@@ -2188,8 +2188,45 @@ struct FourTuple {
 #[cfg(test)]
 mod tests {
     use super::is_cid_space_exhausted;
-    use super::{ConnectionHandle, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable};
-    use std::net::{Ipv4Addr, SocketAddr};
+    use super::{
+        ConnectionHandle, ConnectionIndex, FourTuple, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable,
+    };
+    use crate::Side;
+    use crate::shared::ConnectionId;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// #235: a fresh Initial must not be keyed to an existing peer by 4-tuple.
+    /// `ConnectionIndex` stores server-side Initial routing under the Initial
+    /// DCID; a new handshake uses a new DCID and therefore misses the stale
+    /// entry, so `handle_first_packet` can spawn a replacement connection.
+    #[test]
+    fn initial_routing_is_by_dst_cid_not_four_tuple() {
+        let mut index = ConnectionIndex::default();
+        let addresses = FourTuple {
+            remote: SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)),
+            local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        };
+        let stale_initial = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let fresh_initial = ConnectionId::new(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        let loc_cid = ConnectionId::new(&[9, 9, 9, 9, 9, 9, 9, 9]);
+        let stale = ConnectionHandle(7);
+
+        index.insert_initial(stale_initial, stale);
+        index.insert_conn(addresses, loc_cid, stale, Side::Server);
+
+        assert!(
+            index.connection_ids_initial.contains_key(&stale_initial),
+            "stale Initial DCID must still resolve to the existing connection"
+        );
+        assert!(
+            !index.connection_ids_initial.contains_key(&fresh_initial),
+            "a new Initial DCID from the same 4-tuple must not hit the stale connection"
+        );
+        assert!(
+            !index.incoming_connection_remotes.contains_key(&addresses),
+            "non-empty CIDs must not register the 4-tuple incoming map"
+        );
+    }
 
     #[test]
     fn cid_space_check_ignores_zero_and_large_lengths() {
