@@ -24069,9 +24069,13 @@ mod tests {
 
             /// Claim L, hold the drain before the stop, put L's reader into an
             /// inline ACK-v2 request without a FIN, then let the drain stop it
-            /// (the owner is cancelled but still runs).
+            /// (the owner is cancelled but still runs). Observe both boundaries:
+            /// sleeping after the write does not prove that the old reader
+            /// accepted the request, and releasing the drain does not prove
+            /// that it stopped the owner before the replacement closes.
             async fn stop_l_inside_an_inline_request(
                 a: &P2pEndpoint,
+                a_l: &QuicConnection,
                 b_l: &QuicConnection,
             ) -> (crate::high_level::SendStream, crate::high_level::RecvStream) {
                 let stop_gate = retirement_test_hooks::arm_point(
@@ -24083,9 +24087,39 @@ mod tests {
                     stop_gate.wait_until_parked(Duration::from_secs(10)).await,
                     "the drain parks before it stops L's reader"
                 );
+                // Park the existing owner after it accepts THIS connection's
+                // bidi stream. Otherwise a delayed reader can observe cancel
+                // first, leaving the unfinished request for its replacement;
+                // that new uncancelled reader would then wait for the missing
+                // FIN instead of accepting the test's application payload.
+                let accepted =
+                    reader_test_hooks::arm_bidi_pause(a.reader_hooks_key(), a_l.stable_id());
                 let request = open_unfinished_ack_request(b_l).await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::timeout(Duration::from_secs(5), accepted.wait_until_paused())
+                    .await
+                    .expect("L's existing reader accepted the unfinished request");
                 stop_gate.release();
+                // The caller shuts down the replacement next. If that wins
+                // the race with the drain's claim check, the old owner is
+                // correctly left uncancelled and the intended recovery case
+                // was never established.
+                wait_until(
+                    Duration::from_secs(5),
+                    "L's accepted owner is stopped",
+                    || {
+                        a.reader_handles.try_read().is_ok_and(|handles| {
+                            handles.values().flatten().any(|owner| {
+                                owner.conn_stable_id == a_l.stable_id()
+                                    && owner.is_running()
+                                    && !owner.abort_handle.is_finished()
+                                    && owner.retirement_stop
+                                    && owner.cancel.is_cancelled()
+                            })
+                        })
+                    },
+                )
+                .await;
+                accepted.release();
                 request
             }
 
@@ -24119,7 +24153,8 @@ mod tests {
                         finalize_supersede_fixture().await
                     };
                     let b_peer = b.peer_id();
-                    let (mut request, _response) = stop_l_inside_an_inline_request(&a, &b_l).await;
+                    let (mut request, _response) =
+                        stop_l_inside_an_inline_request(&a, &a_l, &b_l).await;
                     let owner_gate = retirement_test_hooks::arm_point(
                         a.reader_hooks_key(),
                         retirement_test_hooks::Point::RecoveryAfterAlreadyOwned,
@@ -24181,7 +24216,7 @@ mod tests {
                     finalize_supersede_fixture().await
                 };
                 let b_peer = b.peer_id();
-                let _request = stop_l_inside_an_inline_request(&a, &b_l).await;
+                let _request = stop_l_inside_an_inline_request(&a, &a_l, &b_l).await;
                 b2.shutdown().await;
                 wait_until(Duration::from_secs(10), "C2 closes", || {
                     a_c2.close_reason().is_some()
