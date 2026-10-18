@@ -22818,7 +22818,20 @@ mod tests {
                     }
                     let held = hold.wait_for_held(2).await;
 
+                    // Install D's shared exporter override before A can register it.
+                    // raw_dial only controls B's side: A's accept loop can finish
+                    // first and otherwise persist D's real, random lifecycle id.
+                    let hold_d = a.inner.arm_inbound_hold_for_test();
                     let d = raw_dial(&b, a_addr).await;
+                    let held_d =
+                        tokio::time::timeout(Duration::from_secs(10), hold_d.wait_for_held(1))
+                            .await
+                            .expect("A holds D before registration");
+                    assert_eq!(
+                        a.inner.open_lifecycle_entries_for_test(&b_peer).len(),
+                        2,
+                        "D is not registered at A before its forced id is installed"
+                    );
                     crate::nat_traversal_api::lifecycle_points::override_connection_id(
                         exporter_id(&d),
                         [0x80; 32],
@@ -22827,10 +22840,14 @@ mod tests {
                         .add_connection(a_peer, d.clone())
                         .expect("B registers D");
                     b.spawn_reader_task(a_peer, d.clone()).await;
+                    for (stable_id, _) in held_d {
+                        hold_d.release(stable_id);
+                    }
                     wait_until(Duration::from_secs(10), "A registers D last", || {
                         a.inner.open_lifecycle_entries_for_test(&b_peer).len() == 3
                     })
                     .await;
+                    drop(hold_d);
                     for (stable_id, _) in held {
                         let before = b.inner.lifecycle_entries_for_test(&a_peer).len();
                         hold.release(stable_id);
