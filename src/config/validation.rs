@@ -100,7 +100,7 @@ pub(crate) fn validate_socket_addr(addr: &SocketAddr, context: &str) -> Validati
 }
 
 /// Check if a privileged port is allowed for QUIC use
-fn is_allowed_privileged_port(port: u16) -> bool {
+pub(crate) fn is_allowed_privileged_port(port: u16) -> bool {
     // Common QUIC ports that might be used
     matches!(port, 443 | 80 | 853)
 }
