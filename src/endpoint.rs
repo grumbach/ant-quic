@@ -2189,11 +2189,52 @@ struct FourTuple {
 mod tests {
     use super::is_cid_space_exhausted;
     use super::{
-        ConnectionHandle, ConnectionIndex, FourTuple, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable,
+        ConnectionHandle, ConnectionIndex, FourTuple, RESET_TOKEN_SIZE, ResetToken,
+        ResetTokenTable, RouteDatagramTo,
     };
     use crate::Side;
+    use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
+    use crate::packet::{
+        FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, PartialDecode,
+    };
     use crate::shared::ConnectionId;
+    use bytes::Bytes;
+    use rustls::crypto::aws_lc_rs::default_provider;
+    use rustls::quic::Version;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    /// Build a parseable Initial `PartialDecode` whose destination CID is `dst_cid`.
+    fn initial_datagram(dst_cid: ConnectionId) -> PartialDecode {
+        let provider = default_provider();
+        let suite = initial_suite_from_provider(&Arc::new(provider))
+            .expect("initial cipher suite from aws-lc provider");
+        let client = initial_keys(Version::V1, dst_cid, Side::Client, &suite);
+        let mut buf = Vec::new();
+        let header = Header::Initial(InitialHeader {
+            number: PacketNumber::U8(0),
+            src_cid: ConnectionId::new(&[]),
+            dst_cid,
+            token: Bytes::new(),
+            version: crate::DEFAULT_SUPPORTED_VERSIONS[0],
+        });
+        let encode = header.encode(&mut buf);
+        let header_len = buf.len();
+        buf.resize(header_len + 16 + client.packet.local.tag_len(), 0);
+        encode.finish(
+            &mut buf,
+            &*client.header.local,
+            Some((0, &*client.packet.local)),
+        );
+        PartialDecode::new(
+            buf.as_slice().into(),
+            &FixedLengthConnectionIdParser::new(0),
+            &crate::DEFAULT_SUPPORTED_VERSIONS,
+            false,
+        )
+        .expect("Initial PartialDecode")
+        .0
+    }
 
     /// #235: a fresh Initial must not be keyed to an existing peer by 4-tuple.
     /// `ConnectionIndex` stores server-side Initial routing under the Initial
@@ -2225,6 +2266,26 @@ mod tests {
         assert!(
             !index.incoming_connection_remotes.contains_key(&addresses),
             "non-empty CIDs must not register the 4-tuple incoming map"
+        );
+
+        // Exercise the real demux path — map membership alone can pass while
+        // `ConnectionIndex::get` still misroutes an unknown Initial.
+        match index.get(&addresses, &initial_datagram(stale_initial)) {
+            Some(RouteDatagramTo::Connection(ch)) => {
+                assert_eq!(
+                    ch, stale,
+                    "stale Initial DCID must route to the existing connection handle"
+                );
+            }
+            other => {
+                panic!("stale Initial DCID must route to Connection({stale:?}), got {other:?}")
+            }
+        }
+        assert!(
+            index
+                .get(&addresses, &initial_datagram(fresh_initial))
+                .is_none(),
+            "fresh Initial DCID from the same 4-tuple must not route to any existing connection"
         );
     }
 

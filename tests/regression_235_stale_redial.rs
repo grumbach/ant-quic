@@ -85,10 +85,16 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
         // `quic_open_connections` counts the proto slab, including draining
         // entries. Lifecycle `get_quic_connection` can already be None while
         // the stale QUIC connection is still indexed — the #235 failure mode.
+        assert_eq!(
+            stale_on_b.stable_id(),
+            stale_stable_id,
+            "round {round}: stale handle identity must be stable before redial"
+        );
         let open_on_b = b.quic_open_connections();
         assert!(
             open_on_b >= 1,
-            "round {round}: B must still hold/drain the previous QUIC connection when redial starts \
+            "round {round}: B must still hold/drain the previous QUIC connection \
+             (stable_id={stale_stable_id}) when redial starts \
              (quic_open_connections={open_on_b})"
         );
 
@@ -99,6 +105,24 @@ async fn redial_succeeds_while_peer_holds_stale_connection() {
         assert_eq!(
             redial.peer_id, b_id,
             "round {round}: redial must reach the same peer"
+        );
+
+        // Handshake completed while the specific stale entry was still present:
+        // if it had drained mid-timeout, a retransmitted Initial could succeed
+        // even when earlier Initials were misrouted. Require stale+fresh overlap
+        // in the proto slab at the moment connect returns.
+        assert_eq!(
+            stale_on_b.stable_id(),
+            stale_stable_id,
+            "round {round}: stale handle must still identify the pre-redial entry \
+             through handshake completion"
+        );
+        let open_at_handshake = b.quic_open_connections();
+        assert!(
+            open_at_handshake >= 2,
+            "round {round}: stale stable_id={stale_stable_id} must still be indexed \
+             alongside the replacement when handshake completes \
+             (quic_open_connections={open_at_handshake})"
         );
 
         wait_until(CONNECT_TIMEOUT, || {
