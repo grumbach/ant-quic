@@ -196,6 +196,9 @@ nix = { version = "0.29", features = ["resource", "net"], optional = true }
 
 [dev-dependencies]
 ant-quic-workspace-hack = { path = "ant-quic-workspace-hack" }
+# Configure dual-stack test sockets even with --no-default-features. Version
+# 0.6.5 handles both Winsock IPV6_V6ONLY result sizes in the getter assertion.
+socket2-test = { package = "socket2", version = "0.6.5" }
 assert_matches = "1.1"
 hex-literal = "0.4"
 rand_pcg = "0.3"
