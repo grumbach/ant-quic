@@ -1,5 +1,6 @@
 # Benchmarks - Performance testing, profiling, and regression detection
-# Runs Criterion benchmarks, generates flamegraphs, and tracks performance history
+# Same-host merge-base gate (#291): never fail on mock benches, head-of-master
+# artifacts, cross-runner baselines, or raw mean deltas that ignore Criterion CIs.
 
 name: Benchmarks
 
@@ -11,6 +12,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "benches/**"
+      - "scripts/ci/bench_gate.py"
+      - "scripts/ci/test_bench_gate.py"
+      - ".github/workflows/benchmarks.yml"
   pull_request:
     branches: [master, main]
     paths:
@@ -18,10 +22,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "benches/**"
+      - "scripts/ci/bench_gate.py"
+      - "scripts/ci/test_bench_gate.py"
+      - ".github/workflows/benchmarks.yml"
   workflow_dispatch:
     inputs:
       baseline:
-        description: 'Baseline commit/tag to compare against'
+        description: 'Baseline commit/tag to compare against (optional; default merge-base)'
         required: false
         type: string
       run_profiling:
@@ -35,6 +42,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep Criterion runs bounded; gate quality comes from CIs + same-commit control.
+  BENCH_CRITERION_ARGS: "--sample-size 40 --warm-up-time 1 --measurement-time 2"
 
 # Required for posting comments on PRs
 permissions:
@@ -57,79 +66,179 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-criterion
-        run: cargo install cargo-criterion --locked || true
-
-      - name: Run NAT traversal benchmarks
-        run: cargo bench --bench nat_traversal_performance -- --save-baseline current-nat || true
-
-      - name: Run connection management benchmarks
-        run: cargo bench --bench connection_management -- --save-baseline current-conn || true
-
-      - name: Generate benchmark report
+      - name: Create fresh Criterion home
         run: |
-          echo "# Benchmark Results" > benchmark-report.md
-          echo "## NAT Traversal" >> benchmark-report.md
-          cat target/criterion/nat_traversal_performance/*/base/estimates.json >> benchmark-report.md 2>/dev/null || echo "No results" >> benchmark-report.md
+          # Keep samples outside rust-cache's compiler target cleanup.
+          criterion_home=$(mktemp -d "$RUNNER_TEMP/ant-quic-criterion.XXXXXXXX")
+          echo "CRITERION_HOME=$criterion_home" >> "$GITHUB_ENV"
+          mkdir -p "$criterion_home/sides"
 
-          # Create benchmark results JSON
-          echo '{"timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "commit": "'${{ github.sha }}'", "results": []}' > benchmark-results.json
-          if [ -d "target/criterion/nat_traversal_performance" ]; then
-            find target/criterion/nat_traversal_performance -name "estimates.json" -exec cat {} \; | jq -s '.' > temp-results.json 2>/dev/null || echo "[]" > temp-results.json
-            jq --argjson results "$(cat temp-results.json)" '.results = $results' benchmark-results.json > benchmark-results-final.json
-            mv benchmark-results-final.json benchmark-results.json
+      - name: Validate benchmark gate helpers
+        run: python3 -m unittest discover -s scripts/ci -p 'test_bench_gate.py' -v
+
+      - name: Resolve comparison commits
+        id: refs
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Need full history so merge-base is the PR branch point, not a shallow tip.
+            git fetch origin "${{ github.base_ref }}" --prune
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            git fetch origin "$HEAD_SHA" --prune
+            MERGE_BASE="$(git merge-base "origin/${{ github.base_ref }}" "$HEAD_SHA")"
+            echo "mode=pull_request" >> "$GITHUB_OUTPUT"
+            echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+            echo "Comparing merge-base $MERGE_BASE -> PR head $HEAD_SHA on this runner"
+          else
+            HEAD_SHA="${{ github.sha }}"
+            echo "mode=single" >> "$GITHUB_OUTPUT"
+            echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "merge_base=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "Single-side collection at $HEAD_SHA (no PR gate)"
+          fi
+
+      - name: Same-host gating benchmarks
+        id: gate
+        run: |
+          set -euo pipefail
+          GATE_ROOT="$CRITERION_HOME"
+          # Persist helpers outside the worktree: we checkout merge-base/head below.
+          cp -R scripts/ci "$GATE_ROOT/ci-scripts"
+          GATE_PY="$GATE_ROOT/ci-scripts/bench_gate.py"
+          GATING_BENCHES=(pqc_memory_pool_bench quic_benchmarks)
+
+          write_unavailable() {
+            local reason="$1"
+            {
+              echo "### Comparison unavailable"
+              echo
+              echo "$reason"
+              echo
+              echo "The job does not fail the PR for an unavailable comparison (#291)."
+            } | tee "$GATE_ROOT/comparison-report.md" comparison-report.md
+            echo "CRITERION_HOME=$GATE_ROOT" >> "$GITHUB_ENV"
+            echo "regression_found=false" >> "$GITHUB_OUTPUT"
+          }
+
+          run_gating() {
+            local label="$1"
+            local side_home="$GATE_ROOT/$label"
+            local out="$GATE_ROOT/sides/${label}.json"
+            mkdir -p "$side_home" "$GATE_ROOT/sides"
+            for bench in "${GATING_BENCHES[@]}"; do
+              # Criterion paths are group/function ids, not cargo bench names — give
+              # each suite its own CRITERION_HOME so collect can qualify by suite.
+              local suite_home="$side_home/$bench"
+              mkdir -p "$suite_home"
+              export CRITERION_HOME="$suite_home"
+              if ! cargo bench --bench "$bench" -- --save-baseline "$label" ${{ env.BENCH_CRITERION_ARGS }}; then
+                echo "gating bench '$bench' failed at $(git rev-parse HEAD)"
+                return 1
+              fi
+            done
+            python3 "$GATE_PY" collect \
+              --criterion-root "$side_home" \
+              --suite pqc_memory_pool_bench \
+              --suite quic_benchmarks \
+              --label "$label" \
+              --out "$out"
+          }
+
+          MODE="${{ steps.refs.outputs.mode }}"
+          HEAD="${{ steps.refs.outputs.head }}"
+          MERGE_BASE="${{ steps.refs.outputs.merge_base }}"
+
+          if [ "$MODE" = "pull_request" ]; then
+            echo "::group::Baseline at merge-base $MERGE_BASE"
+            git checkout --force "$MERGE_BASE"
+            if ! run_gating baseline; then
+              write_unavailable "Baseline gating benches unavailable at merge-base \`$MERGE_BASE\`."
+              exit 0
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Same-commit control at merge-base $MERGE_BASE"
+            if ! run_gating control; then
+              write_unavailable "Same-commit control run failed at merge-base \`$MERGE_BASE\`."
+              exit 0
+            fi
+            echo "::endgroup::"
+
+            echo "::group::Current at PR head $HEAD"
+            git checkout --force "$HEAD"
+            if ! run_gating current; then
+              echo "Current gating benches failed at PR head $HEAD" >&2
+              exit 1
+            fi
+            echo "::endgroup::"
+
+            # connection_management and nat_traversal_performance remain in the
+            # repo for local use but are intentionally not run or gated here
+            # (issue #291 defect 1: they cannot observe this crate).
+
+            set +e
+            python3 "$GATE_PY" compare \
+              --baseline "$GATE_ROOT/sides/baseline.json" \
+              --control "$GATE_ROOT/sides/control.json" \
+              --current "$GATE_ROOT/sides/current.json" \
+              --report "$GATE_ROOT/comparison-report.md" \
+              --merge-base "$MERGE_BASE" \
+              --head "$HEAD" \
+              --runner "${RUNNER_NAME:-$RUNNER_OS}"
+            rc=$?
+            set -e
+            cp "$GATE_ROOT/comparison-report.md" comparison-report.md
+            # Restore env for artifact upload paths.
+            echo "CRITERION_HOME=$GATE_ROOT" >> "$GITHUB_ENV"
+            if [ "$rc" -eq 1 ]; then
+              echo "regression_found=true" >> "$GITHUB_OUTPUT"
+            elif [ "$rc" -ne 0 ]; then
+              write_unavailable "Gate helper failed with status $rc."
+              exit 0
+            else
+              echo "regression_found=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            git checkout --force "$HEAD"
+            if ! run_gating current; then
+              echo "Gating benches failed at $HEAD" >&2
+              exit 1
+            fi
+            {
+              echo "# Benchmark Results"
+              echo
+              echo "Collected gating estimates at \`$HEAD\`."
+              echo "PR comparison (merge-base + same-commit control) runs only on pull_request."
+            } | tee "$GATE_ROOT/comparison-report.md" comparison-report.md
+            cp "$GATE_ROOT/sides/current.json" benchmark-results.json
+            echo "CRITERION_HOME=$GATE_ROOT" >> "$GITHUB_ENV"
+            echo "regression_found=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload benchmark results
+        if: always() && env.CRITERION_HOME != ''
         uses: actions/upload-artifact@v5
         with:
           name: benchmark-results-${{ github.sha }}
           path: |
-            benchmark-results.json
-            benchmark-report.md
-            target/criterion/
-
-      - name: Download baseline benchmarks
-        if: github.event_name == 'pull_request'
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          workflow: benchmarks.yml
-          branch: ${{ github.base_ref }}
-          name: benchmark-results-.*
-          name_is_regexp: true
-          path: baseline-benchmarks
-          if_no_artifact_found: warn
-
-      - name: Compare benchmarks
-        if: github.event_name == 'pull_request' && success()
-        id: compare
-        run: |
-          if [ -d "baseline-benchmarks" ]; then
-            python3 .github/scripts/compare-benchmarks.py \
-              baseline-benchmarks/*/benchmark-results.json \
-              benchmark-results.json \
-              > comparison-report.md 2>/dev/null || echo "Comparison script not available" > comparison-report.md
-
-            if grep -q "REGRESSION" comparison-report.md; then
-              echo "regression_found=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No baseline benchmarks found for comparison" > comparison-report.md
-          fi
+            ${{ env.CRITERION_HOME }}/
+            comparison-report.md
+          if-no-files-found: warn
 
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
             let comment = '## Benchmark Results\n\n';
-
             if (fs.existsSync('comparison-report.md')) {
               comment += fs.readFileSync('comparison-report.md', 'utf8');
             } else {
-              comment += fs.readFileSync('benchmark-report.md', 'utf8');
+              comment += 'Benchmark gate did not produce a comparison report.\n';
             }
+            comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, gating suites only, CI overlap required. Mock benches never fail the job._\n';
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -158,10 +267,10 @@ jobs:
               });
             }
 
-      - name: Fail if regression found
-        if: steps.compare.outputs.regression_found == 'true'
+      - name: Fail if gating regression found
+        if: steps.gate.outputs.regression_found == 'true'
         run: |
-          echo "Performance regression detected!"
+          echo "Gating performance regression detected (same-host merge-base + CI rule)."
           cat comparison-report.md
           exit 1
 
@@ -259,11 +368,22 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           name: benchmark-results-${{ github.sha }}
+          path: downloaded-benchmarks
 
       - name: Update benchmark history
         run: |
           mkdir -p .benchmarks
-          cp benchmark-results.json .benchmarks/results-$(date +%Y%m%d-%H%M%S)-${{ github.sha }}.json
+          # Prefer the gating current side map when present.
+          if [ -f downloaded-benchmarks/sides/current.json ]; then
+            cp downloaded-benchmarks/sides/current.json \
+              .benchmarks/results-$(date +%Y%m%d-%H%M%S)-${{ github.sha }}.json
+          elif [ -f downloaded-benchmarks/benchmark-results.json ]; then
+            cp downloaded-benchmarks/benchmark-results.json \
+              .benchmarks/results-$(date +%Y%m%d-%H%M%S)-${{ github.sha }}.json
+          else
+            echo "No benchmark results artifact to archive"
+            exit 0
+          fi
 
           # Keep only last 50 results
           ls -t .benchmarks/results-*.json | tail -n +51 | xargs rm -f || true
