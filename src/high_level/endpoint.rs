@@ -628,6 +628,33 @@ impl Endpoint {
             .unwrap_or(0)
     }
 
+    /// #235: true while the proto slab still holds `handle` (incl. draining /
+    /// drain-pinned). `#[doc(hidden)]` instrumentation — no behaviour change.
+    #[doc(hidden)]
+    pub fn quic_proto_contains(&self, handle: ConnectionHandle) -> bool {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.inner.contains_connection(handle))
+            .unwrap_or(false)
+    }
+
+    /// #235 test seam: defer proto `Drained` reap for `handle` until unpin.
+    #[doc(hidden)]
+    pub fn pin_quic_drain(&self, handle: ConnectionHandle) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.inner.pin_drain(handle);
+        }
+    }
+
+    /// #235 test seam: release a drain pin (completes a deferred reap).
+    #[doc(hidden)]
+    pub fn unpin_quic_drain(&self, handle: ConnectionHandle) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.inner.unpin_drain(handle);
+        }
+    }
+
     /// #368 gate 5: (send_unacked, recv_buffered, recv_streams_with_unread,
     /// connections_counted) summed over EVERY live proto connection including
     /// draining ones. `#[doc(hidden)]` instrumentation — no behaviour change.

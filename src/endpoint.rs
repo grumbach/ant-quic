@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustls;
 use slab::Slab;
 use thiserror::Error;
@@ -349,6 +349,11 @@ pub struct Endpoint {
     /// used to amortise `shrink_to_fit` so a mass reap releases index memory
     /// without per-removal churn (x0x#278).
     index_compacted_at_capacity: usize,
+    /// #235 test seam: proto handles whose `Drained` reap is deferred while
+    /// pinned. Empty unless a test explicitly pins; production never inserts.
+    drain_pins: FxHashSet<ConnectionHandle>,
+    /// Handles that observed `Drained` while pinned; reaped on unpin.
+    deferred_drains: FxHashSet<ConnectionHandle>,
 }
 
 impl Endpoint {
@@ -389,6 +394,8 @@ impl Endpoint {
             pending_relay_events: Vec::new(),
             pending_peer_address_updates: Vec::new(),
             index_compacted_at_capacity: 0,
+            drain_pins: FxHashSet::default(),
+            deferred_drains: FxHashSet::default(),
         }
     }
 
@@ -759,21 +766,15 @@ impl Endpoint {
                 // For now, this event is acknowledged but not acted upon at the endpoint level.
             }
             Drained => {
-                if let Some(conn) = self.connections.try_remove(ch.0) {
-                    self.index.remove(&conn);
-                    // Clean up peer connection mapping if this connection has a peer ID
-                    if let Some(peer_id) = conn.peer_id {
-                        self.peer_connections.remove(&peer_id);
-                        trace!("Cleaned up peer connection mapping for {:?}", peer_id);
-                    }
+                if self.drain_pins.contains(&ch) {
+                    // #235 test seam: keep the specific entry indexed through a
+                    // controlled window (e.g. overlapping handshake). Unpin
+                    // completes the reap. Production never inserts into
+                    // `drain_pins`, so this branch is unreachable there.
+                    self.deferred_drains.insert(ch);
                 } else {
-                    // This indicates a bug in downstream code, which could cause spurious
-                    // connection loss instead of this error if the CID was (re)allocated prior to
-                    // the illegal call.
-                    error!(id = ch.0, "unknown connection drained");
+                    self.reap_drained_connection(ch);
                 }
-                // Amortised index compaction after a reap (x0x#278).
-                self.maybe_shrink_index();
             }
         }
         None
@@ -1660,6 +1661,47 @@ impl Endpoint {
         self.connections.len()
     }
 
+    /// True while `ch` still occupies a slot in the proto connection slab
+    /// (including draining / drain-pinned entries).
+    #[doc(hidden)]
+    pub fn contains_connection(&self, ch: ConnectionHandle) -> bool {
+        self.connections.contains(ch.0)
+    }
+
+    /// #235 test seam: defer proto reap of `ch` on `Drained` until
+    /// [`Self::unpin_drain`]. No-op for production (pins are never inserted).
+    #[doc(hidden)]
+    pub fn pin_drain(&mut self, ch: ConnectionHandle) {
+        self.drain_pins.insert(ch);
+    }
+
+    /// #235 test seam: release a drain pin; if `Drained` already fired, reap now.
+    #[doc(hidden)]
+    pub fn unpin_drain(&mut self, ch: ConnectionHandle) {
+        self.drain_pins.remove(&ch);
+        if self.deferred_drains.remove(&ch) {
+            self.reap_drained_connection(ch);
+        }
+    }
+
+    fn reap_drained_connection(&mut self, ch: ConnectionHandle) {
+        if let Some(conn) = self.connections.try_remove(ch.0) {
+            self.index.remove(&conn);
+            // Clean up peer connection mapping if this connection has a peer ID
+            if let Some(peer_id) = conn.peer_id {
+                self.peer_connections.remove(&peer_id);
+                trace!("Cleaned up peer connection mapping for {:?}", peer_id);
+            }
+        } else {
+            // This indicates a bug in downstream code, which could cause spurious
+            // connection loss instead of this error if the CID was (re)allocated prior to
+            // the illegal call.
+            error!(id = ch.0, "unknown connection drained");
+        }
+        // Amortised index compaction after a reap (x0x#278).
+        self.maybe_shrink_index();
+    }
+
     /// Amortised compaction of the connection-index maps. Invoked after a
     /// connection is reaped (Drained): only when the live connection count has
     /// fallen to a quarter of the slab's allocated capacity — and only once per
@@ -2188,8 +2230,106 @@ struct FourTuple {
 #[cfg(test)]
 mod tests {
     use super::is_cid_space_exhausted;
-    use super::{ConnectionHandle, RESET_TOKEN_SIZE, ResetToken, ResetTokenTable};
-    use std::net::{Ipv4Addr, SocketAddr};
+    use super::{
+        ConnectionHandle, ConnectionIndex, FourTuple, RESET_TOKEN_SIZE, ResetToken,
+        ResetTokenTable, RouteDatagramTo,
+    };
+    use crate::Side;
+    use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
+    use crate::packet::{
+        FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, PartialDecode,
+    };
+    use crate::shared::ConnectionId;
+    use bytes::Bytes;
+    use rustls::crypto::aws_lc_rs::default_provider;
+    use rustls::quic::Version;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    /// Build a parseable Initial `PartialDecode` whose destination CID is `dst_cid`.
+    fn initial_datagram(dst_cid: ConnectionId) -> PartialDecode {
+        let provider = default_provider();
+        let suite = initial_suite_from_provider(&Arc::new(provider))
+            .expect("initial cipher suite from aws-lc provider");
+        let client = initial_keys(Version::V1, dst_cid, Side::Client, &suite);
+        let mut buf = Vec::new();
+        let header = Header::Initial(InitialHeader {
+            number: PacketNumber::U8(0),
+            src_cid: ConnectionId::new(&[]),
+            dst_cid,
+            token: Bytes::new(),
+            version: crate::DEFAULT_SUPPORTED_VERSIONS[0],
+        });
+        let encode = header.encode(&mut buf);
+        let header_len = buf.len();
+        buf.resize(header_len + 16 + client.packet.local.tag_len(), 0);
+        encode.finish(
+            &mut buf,
+            &*client.header.local,
+            Some((0, &*client.packet.local)),
+        );
+        PartialDecode::new(
+            buf.as_slice().into(),
+            &FixedLengthConnectionIdParser::new(0),
+            &crate::DEFAULT_SUPPORTED_VERSIONS,
+            false,
+        )
+        .expect("Initial PartialDecode")
+        .0
+    }
+
+    /// #235: a fresh Initial must not be keyed to an existing peer by 4-tuple.
+    /// `ConnectionIndex` stores server-side Initial routing under the Initial
+    /// DCID; a new handshake uses a new DCID and therefore misses the stale
+    /// entry, so `handle_first_packet` can spawn a replacement connection.
+    #[test]
+    fn initial_routing_is_by_dst_cid_not_four_tuple() {
+        let mut index = ConnectionIndex::default();
+        let addresses = FourTuple {
+            remote: SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)),
+            local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        };
+        let stale_initial = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let fresh_initial = ConnectionId::new(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        let loc_cid = ConnectionId::new(&[9, 9, 9, 9, 9, 9, 9, 9]);
+        let stale = ConnectionHandle(7);
+
+        index.insert_initial(stale_initial, stale);
+        index.insert_conn(addresses, loc_cid, stale, Side::Server);
+
+        assert!(
+            index.connection_ids_initial.contains_key(&stale_initial),
+            "stale Initial DCID must still resolve to the existing connection"
+        );
+        assert!(
+            !index.connection_ids_initial.contains_key(&fresh_initial),
+            "a new Initial DCID from the same 4-tuple must not hit the stale connection"
+        );
+        assert!(
+            !index.incoming_connection_remotes.contains_key(&addresses),
+            "non-empty CIDs must not register the 4-tuple incoming map"
+        );
+
+        // Exercise the real demux path — map membership alone can pass while
+        // `ConnectionIndex::get` still misroutes an unknown Initial.
+        match index.get(&addresses, &initial_datagram(stale_initial)) {
+            Some(RouteDatagramTo::Connection(ch)) => {
+                assert_eq!(
+                    ch, stale,
+                    "stale Initial DCID must route to the existing connection handle"
+                );
+            }
+            other => {
+                panic!("stale Initial DCID must route to Connection({stale:?}), got {other:?}")
+            }
+        }
+        assert!(
+            index
+                .get(&addresses, &initial_datagram(fresh_initial))
+                .is_none(),
+            "fresh Initial DCID from the same 4-tuple must not route to any existing connection"
+        );
+    }
 
     #[test]
     fn cid_space_check_ignores_zero_and_large_lengths() {
