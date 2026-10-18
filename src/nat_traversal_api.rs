@@ -14432,20 +14432,43 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_reuses_live_ipv4_peer_on_dual_stack_socket() {
+        use socket2::{Domain, Protocol, Socket, Type};
+
         let relay = crate::Node::bind("127.0.0.1:0".parse().expect("relay address"))
             .await
             .expect("relay binds");
         let relay_addr = relay.local_addr().expect("relay address");
         let relay_peer = relay.peer_id();
         let (identity, peer) = test_identity();
-        let mut endpoint = NatTraversalEndpoint::new(
+        // A plain [::] bind is IPv6-only by default on Windows. Configure the
+        // fixture before binding so every platform exercises the mapped-IPv4
+        // reuse path, including builds without network-discovery.
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
+            .expect("create dual-stack socket");
+        socket
+            .set_only_v6(false)
+            .expect("enable IPv4-mapped traffic");
+        socket.set_nonblocking(true).expect("nonblocking socket");
+        let bind_addr: SocketAddr = "[::]:0".parse().expect("dual-stack address");
+        socket
+            .bind(&bind_addr.into())
+            .expect("dual-stack socket binds");
+        assert!(!socket.only_v6().expect("read IPV6_V6ONLY"));
+        let mut endpoint = NatTraversalEndpoint::new_with_socket(
             NatTraversalConfig {
-                bind_addr: Some("[::]:0".parse().expect("dual-stack address")),
+                bind_addr: Some(
+                    socket
+                        .local_addr()
+                        .expect("socket address")
+                        .as_socket()
+                        .expect("IP socket"),
+                ),
                 identity_key: Some(identity),
                 ..Default::default()
             },
             None,
             None,
+            Some(socket.into()),
         )
         .await
         .expect("dual-stack endpoint binds");
