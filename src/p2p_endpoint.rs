@@ -6772,6 +6772,10 @@ impl P2pEndpoint {
         relay_addr: SocketAddr,
         hint_peer_id: Option<PeerId>,
     ) -> Result<PeerConnection, EndpointError> {
+        // Relay does not emit coordination or hole-punch start events. Count
+        // its attempt before setup so failed sessions are included as well.
+        self.stats.write().await.nat_traversal_attempts += 1;
+
         info!(
             "Attempting MASQUE relay connection to {} via {}",
             target, relay_addr
@@ -16785,6 +16789,38 @@ mod tests {
         assert_eq!(snapshot.nat_traversal_successes, 0);
     }
 
+    /// #262: a relay attempt that fails before establishing a session still
+    /// counts, without creating a traversal success.
+    #[tokio::test]
+    async fn failed_relay_connection_counts_attempt_without_success() {
+        let endpoint = P2pEndpoint::new(
+            P2pConfig::builder()
+                .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .port_mapping_enabled(false)
+                .build()
+                .expect("config should build"),
+        )
+        .await
+        .expect("endpoint should bind");
+
+        // Port zero is rejected synchronously by the QUIC endpoint, so this
+        // failure does not depend on a remote peer or a network timeout.
+        let result = endpoint
+            .try_relay_connection(
+                SocketAddr::from(([127, 0, 0, 1], 4433)),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(EndpointError::NatTraversal(_))));
+        let stats = endpoint.stats().await;
+        endpoint.shutdown().await;
+
+        assert_eq!(stats.nat_traversal_attempts, 1);
+        assert_eq!(stats.nat_traversal_successes, 0);
+        assert_eq!(stats.relayed_connections, 0);
+    }
+
     #[cfg(all(feature = "platform-verifier", feature = "network-discovery"))]
     /// #262 fix 5: the MASQUE relay data plane, end to end. Three nodes on
     /// loopback — A (client), R (public relay), B (target). The strategy is
@@ -16886,6 +16922,11 @@ mod tests {
         let _ = method;
 
         let stats_a = endpoint_a.stats().await;
+        assert_eq!(
+            stats_a.nat_traversal_attempts, 1,
+            "relay-only dial must count its attempt without coordination or punching"
+        );
+        assert_eq!(stats_a.nat_traversal_successes, 1);
         assert!(
             stats_a.relayed_connections >= 1,
             "relayed_connections must increment on the client (got {})",
