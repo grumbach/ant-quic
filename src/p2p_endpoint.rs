@@ -730,6 +730,10 @@ pub(crate) mod reader_test_hooks {
         /// #284: bit `attempt - 1` is set once that attempt's reader task
         /// reaches its loop head (it is about to poll accept).
         pub(crate) polled_attempts: AtomicUsize,
+        /// #284: reader tasks spawned for this connection, counted on the
+        /// starting task just before `tokio::spawn`, so the count is final
+        /// once every start call has returned.
+        pub(crate) spawned_readers: AtomicUsize,
         /// Attempt to park after it was found to be a duplicate (0 = none).
         pub(crate) park_after_duplicate_attempt: AtomicUsize,
         /// Attempt whose reader task panics at its loop head (0 = none).
@@ -843,6 +847,12 @@ pub(crate) mod reader_test_hooks {
                 (Some(hooks), attempt)
             }
             None => (None, 0),
+        }
+    }
+
+    pub(crate) fn note_spawn(hooks: Option<&Arc<ReaderHooks>>) {
+        if let Some(hooks) = hooks {
+            hooks.spawned_readers.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -11568,6 +11578,8 @@ impl P2pEndpoint {
         let task_exit_sent = Arc::clone(&exit_sent);
 
         #[cfg(all(test, feature = "network-discovery"))]
+        reader_test_hooks::note_spawn(test_hooks.as_ref());
+        #[cfg(all(test, feature = "network-discovery"))]
         let task_test_hooks = test_hooks.clone();
         let join_handle = tokio::spawn(async move {
             loop {
@@ -21065,20 +21077,22 @@ mod tests {
 
         /// #284: two reader starts racing for a connection that has no reader
         /// yet. Both are held just before the owner check and released
-        /// together; exactly one reader task may ever run (poll accept), and
-        /// exactly one owner record may be registered. Before the owner was
-        /// reserved ahead of `tokio::spawn`, both tasks were spawned and the
-        /// duplicate could accept a stream before its abort landed.
+        /// together; exactly one reader task may be spawned and ever run (poll
+        /// accept), and exactly one owner record may be registered. Before the
+        /// owner was reserved ahead of `tokio::spawn`, both tasks were spawned
+        /// and the duplicate could accept a stream before its abort landed.
+        /// Every round uses fresh endpoints, so X is the only A-B connection
+        /// and B's message can only reach A through X's reader.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn racing_reader_starts_spawn_a_single_accept_consumer() {
-            let a = shim_node().await;
-            let b = shim_node().await;
-            let b_addr = shim_addr(&b);
-            let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
-            let _accept_a = shim_accept(&a);
-            let _accept_b = shim_accept(&b);
-
             for round in 0..5 {
+                let a = shim_node().await;
+                let b = shim_node().await;
+                let b_addr = shim_addr(&b);
+                let (a_peer, b_peer) = (a.peer_id(), b.peer_id());
+                let accept_a = shim_accept(&a);
+                let accept_b = shim_accept(&b);
+
                 let x = raw_dial(&a, b_addr).await;
                 wait_for_generation(&b, &a_peer, "B registers X", |_| true).await;
                 assert!(!a.live_reader_for_test(&b_peer, x.stable_id()).await);
@@ -21106,6 +21120,7 @@ mod tests {
                 for start in starts {
                     start.await.expect("reader start task");
                 }
+                let spawned = hooks.spawned_readers.load(AtomicOrdering::SeqCst);
 
                 let payload = format!("284 round {round}: B to A after racing starts");
                 b.send(&a_peer, payload.as_bytes())
@@ -21127,6 +21142,10 @@ mod tests {
                 reader_test_hooks::disarm(a.reader_hooks_key(), x.stable_id());
 
                 assert_eq!(
+                    spawned, 1,
+                    "round {round}: racing reader starts spawned {spawned} reader tasks"
+                );
+                assert_eq!(
                     polled.count_ones(),
                     1,
                     "round {round}: racing reader starts ran {} accept loops (mask {polled:#b})",
@@ -21136,10 +21155,12 @@ mod tests {
                     owners, 1,
                     "round {round}: one owner record for the connection"
                 );
-            }
 
-            a.shutdown().await;
-            b.shutdown().await;
+                a.shutdown().await;
+                b.shutdown().await;
+                accept_a.abort();
+                accept_b.abort();
+            }
         }
 
         /// RED on master: an exit event from a task that does not own the
