@@ -7607,7 +7607,10 @@ impl NatTraversalEndpoint {
         // connection already carries a serving path.
         let existing_conn = self.connections.iter().find_map(|entry| {
             let conn = entry.value();
-            if conn.remote_address() == relay_addr && conn.close_reason().is_none() {
+            // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6.
+            if normalize_socket_addr(conn.remote_address()) == relay_addr
+                && conn.close_reason().is_none()
+            {
                 Some(conn.clone())
             } else {
                 None
@@ -14425,6 +14428,152 @@ mod tests {
             endpoint.transport_registry().is_none(),
             "Endpoint without registry config should have None"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_session_reuses_live_ipv4_peer_on_dual_stack_socket() {
+        let relay = crate::Node::bind("127.0.0.1:0".parse().expect("relay address"))
+            .await
+            .expect("relay binds");
+        let relay_addr = relay.local_addr().expect("relay address");
+        let relay_peer = relay.peer_id();
+        let (identity, peer) = test_identity();
+        let mut endpoint = NatTraversalEndpoint::new(
+            NatTraversalConfig {
+                bind_addr: Some("[::]:0".parse().expect("dual-stack address")),
+                identity_key: Some(identity),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("dual-stack endpoint binds");
+        endpoint.set_local_peer_id(peer);
+
+        // Serve every accepted connection so the old code completes its relay
+        // handshake too. The regression fails on connection identity, not time.
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let accepting_relay = relay.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(connection) = accepting_relay.accept().await {
+                if accepted_tx.send(connection).is_err() {
+                    break;
+                }
+            }
+        });
+
+        timeout(Duration::from_secs(10), async {
+            let quic = endpoint.get_endpoint().expect("QUIC endpoint");
+            let connection = quic
+                .connect(relay_addr, "peer")
+                .expect("dial relay peer")
+                .await
+                .expect("peer handshake");
+            assert!(relay_addr.is_ipv4());
+            assert!(connection.remote_address().is_ipv6());
+            assert_eq!(
+                normalize_socket_addr(connection.remote_address()),
+                relay_addr
+            );
+            endpoint
+                .add_connection(relay_peer, connection.clone())
+                .expect("register live peer connection");
+            assert_eq!(
+                accepted_rx
+                    .recv()
+                    .await
+                    .expect("relay accepted peer")
+                    .peer_id,
+                peer
+            );
+            let generation = endpoint.current_connection_generation(&relay_peer);
+            let remote_generation = relay.inner_endpoint().current_connection_generation(&peer);
+            assert!(generation.is_some());
+            assert!(remote_generation.is_some());
+            let remote_connection = relay
+                .inner_endpoint()
+                .get_quic_connection(&peer)
+                .expect("remote winner lookup")
+                .expect("remote winner");
+
+            let (public_address, relay_socket) = endpoint
+                .establish_relay_session(relay_addr)
+                .await
+                .expect("CONNECT-UDP handshake");
+            assert!(public_address.is_some());
+            assert!(relay_socket.is_some());
+            let session = endpoint
+                .relay_sessions
+                .get(&relay_addr)
+                .expect("relay session");
+            assert_eq!(
+                session.connection.stable_id(),
+                connection.stable_id(),
+                "relay must reuse the live peer connection despite its mapped IPv6 address"
+            );
+            assert!(session.is_active());
+            drop(session);
+            assert_eq!(
+                quic.open_connections(),
+                1,
+                "relay setup must not dial again"
+            );
+            assert_eq!(
+                endpoint.current_connection_generation(&relay_peer),
+                generation
+            );
+            assert_eq!(
+                relay.inner_endpoint().current_connection_generation(&peer),
+                remote_generation
+            );
+            assert_eq!(
+                relay
+                    .inner_endpoint()
+                    .get_quic_connection(&peer)
+                    .unwrap()
+                    .unwrap()
+                    .stable_id(),
+                remote_connection.stable_id()
+            );
+
+            // Application traffic still flows both ways on the original link
+            // while its CONNECT-UDP stream is held open by the relay socket.
+            let (mut send, mut recv) = connection.open_bi().await.expect("open app stream");
+            send.write_all(crate::p2p_endpoint::APP_BIDI_STREAM_MAGIC)
+                .await
+                .expect("app prefix");
+            send.write_all(b"request during relay")
+                .await
+                .expect("app request");
+            send.finish().expect("finish request");
+            let (from, mut reply, mut request) =
+                relay.accept_bi().await.expect("accept app stream");
+            assert_eq!(from, peer);
+            assert_eq!(
+                request.read_to_end(1024).await.expect("read request"),
+                b"request during relay"
+            );
+            reply
+                .write_all(b"reply during relay")
+                .await
+                .expect("app reply");
+            reply.finish().expect("finish reply");
+            assert_eq!(
+                recv.read_to_end(1024).await.expect("read reply"),
+                b"reply during relay"
+            );
+            assert!(connection.close_reason().is_none());
+            assert!(remote_connection.close_reason().is_none());
+            drop(relay_socket);
+        })
+        .await
+        .expect("loopback relay exchange must complete");
+
+        accept_task.abort();
+        let _ = accept_task.await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
+        relay.try_shutdown().await.expect("relay shutdown");
     }
 
     #[tokio::test]
