@@ -51,6 +51,8 @@
 
 #[cfg(test)]
 mod direct_stage_budget_tests;
+#[cfg(all(test, feature = "network-discovery"))]
+mod late_direct_tests;
 mod socket_binding;
 
 use std::collections::hash_map::DefaultHasher;
@@ -1304,6 +1306,25 @@ where
     None
 }
 
+enum DialWinner {
+    Direct((crate::high_level::Connection, SocketAddr)),
+    Fallback((PeerConnection, ConnectionMethod)),
+}
+
+/// Retire a coordinator request when an overlapping dial ends or is dropped.
+struct DialTraversalRequest {
+    local_peer: PeerId,
+    target_peer: Option<PeerId>,
+}
+
+impl Drop for DialTraversalRequest {
+    fn drop(&mut self) {
+        if let Some(peer) = self.target_peer {
+            let _ = clear_live_request(self.local_peer, peer);
+        }
+    }
+}
+
 /// Budget for the direct (Happy Eyeballs) stage of the fallback ladder.
 ///
 /// The adaptive direct budget (`configured_timeout`, 4 x RTT + 750 ms) is a
@@ -1533,6 +1554,9 @@ fn is_synthetic_peer_id(peer_id: &PeerId) -> bool {
 /// This struct provides the main interface for P2P communication with
 /// NAT traversal, connection management, and secure messaging.
 pub struct P2pEndpoint {
+    #[cfg(all(test, feature = "network-discovery"))]
+    late_direct_gate: Arc<ParkingMutex<Option<Arc<late_direct_tests::DialGate>>>>,
+
     /// Internal NAT traversal endpoint
     inner: Arc<NatTraversalEndpoint>,
 
@@ -4110,6 +4134,8 @@ impl P2pEndpoint {
         let peer_event_generations = Arc::new(ParkingRwLock::new(HashMap::new()));
 
         let endpoint = Self {
+            #[cfg(all(test, feature = "network-discovery"))]
+            late_direct_gate: Arc::default(),
             inner: inner_arc,
             // v0.2: auth_manager removed
             connected_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -4733,8 +4759,8 @@ impl P2pEndpoint {
         }
 
         // #304: the end of one establishment budget, counted from the start
-        // of this dial. The fallback ladder below uses it only as a cap on
-        // the direct-stage extension of a dial that cannot hole-punch. A
+        // of this dial. The fallback ladder uses it to cap a retained direct
+        // race and the direct-stage extension of a dial that cannot punch. A
         // re-dial after a direct pre-pass that used this budget therefore
         // gets the adaptive budget, not a second full budget. It is not an
         // end-to-end timeout: the pre-pass (one full handshake budget per
@@ -5722,7 +5748,10 @@ impl P2pEndpoint {
     /// Without a `strategy_config`, stage budgets are adaptive. The direct
     /// stage of a dial that can hole-punch (an authentic target `peer_id`
     /// and a coordinator) keeps the short adaptive budget, so a blocked
-    /// direct path quickly yields to hole punching. A dial that cannot
+    /// direct path quickly yields to hole punching. Its in-flight handshakes
+    /// keep racing the later stages within the caller's remaining budget;
+    /// the cutoff starts punching without cancelling direct progress (#304).
+    /// A dial that cannot
     /// hole-punch gives its direct stage the remaining connection
     /// establishment budget, less a reserve for a usable relay, so a slow
     /// handshake under CPU contention is not aborted while the budget
@@ -5741,8 +5770,8 @@ impl P2pEndpoint {
 
     /// [`Self::connect_with_fallback`] as one part of a larger dial whose
     /// budget ends at `caller_deadline` (#304). The ladder keeps its own
-    /// deadline; the deadline only caps how far the direct stage of a dial
-    /// that cannot hole-punch may extend past the adaptive budget.
+    /// deadline. The caller deadline caps both a no-coordinator direct-stage
+    /// extension and a direct race retained while fallback stages run.
     async fn connect_with_fallback_within(
         &self,
         target_ipv4: Option<SocketAddr>,
@@ -5974,13 +6003,30 @@ impl P2pEndpoint {
                     };
 
                     let addrs = direct_addresses.clone();
-                    let he_result = timeout(direct_timeout, async {
+                    let direct_race = async {
                         happy_eyeballs::race_connect(&addrs, &he_config, |addr| {
                             let ep = quic_endpoint.clone();
+                            #[cfg(all(test, feature = "network-discovery"))]
+                            let gate = self.late_direct_gate.lock().clone();
                             async move {
                                 let connecting = ep
                                     .connect(addr, "peer")
                                     .map_err(|e| format!("connect error: {e}"))?;
+                                #[cfg(all(test, feature = "network-discovery"))]
+                                let connecting = async move {
+                                    let cancellation = gate
+                                        .as_ref()
+                                        .map(|gate| gate.handshake_cancelled.clone().drop_guard());
+                                    if let Some(gate) = gate {
+                                        gate.handshake_entered.notify_one();
+                                        gate.handshake_release.notified().await;
+                                    }
+                                    let result = connecting.await;
+                                    if let Some(cancellation) = cancellation {
+                                        cancellation.disarm();
+                                    }
+                                    result
+                                };
                                 match timeout(handshake_timeout, connecting).await {
                                     Ok(Ok(conn)) => Ok(conn),
                                     Ok(Err(e)) => Err(format!("handshake error: {e}")),
@@ -5992,8 +6038,11 @@ impl P2pEndpoint {
                             }
                         })
                         .await
-                    })
-                    .await;
+                    };
+                    tokio::pin!(direct_race);
+                    // Borrow the race: the stage timer must not drop its owned
+                    // Connecting attempts when punching can start (#304).
+                    let he_result = timeout(direct_timeout, &mut direct_race).await;
 
                     match he_result {
                         Ok(Ok((connection, winning_addr))) => {
@@ -6060,6 +6109,21 @@ impl P2pEndpoint {
                             debug!("Happy Eyeballs: direct connection timed out");
                             strategy.transition_to_ipv6("Timeout");
                             strategy.transition_to_holepunch("Happy Eyeballs timed out");
+                            if holepunch_possible {
+                                let deadline = caller_deadline.map_or(overall_deadline, |caller| {
+                                    caller.min(overall_deadline)
+                                });
+                                let fallback = self.continue_fallback(
+                                    strategy,
+                                    target_ipv4,
+                                    target_ipv6,
+                                    peer_id,
+                                    overall_deadline,
+                                );
+                                return self
+                                    .race_late_direct(direct_race, fallback, peer_id, deadline)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -6073,6 +6137,99 @@ impl P2pEndpoint {
                     strategy.transition_to_holepunch("Handled by Happy Eyeballs");
                 }
 
+                _ => {
+                    return self
+                        .continue_fallback(
+                            strategy,
+                            target_ipv4,
+                            target_ipv6,
+                            peer_id,
+                            overall_deadline,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Keep the owned direct race alive across fallback stages. Only raw
+    /// handshakes race here; registration runs after selection so cancellation
+    /// cannot strand a partially finalized direct connection. Dropping the
+    /// Happy Eyeballs future aborts its owned attempts and releases any raw
+    /// result. A registered punch winner keeps the existing lifecycle arbiter.
+    async fn race_late_direct(
+        &self,
+        direct: impl std::future::Future<
+            Output = Result<
+                (crate::high_level::Connection, SocketAddr),
+                happy_eyeballs::HappyEyeballsError,
+            >,
+        >,
+        fallback: impl std::future::Future<
+            Output = Result<(PeerConnection, ConnectionMethod), EndpointError>,
+        >,
+        peer_id: Option<PeerId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
+        let _request = DialTraversalRequest {
+            local_peer: self.inner.local_peer_id(),
+            target_peer: peer_id,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(EndpointError::Timeout);
+        }
+        tokio::pin!(direct, fallback);
+        let race = async {
+            tokio::select! {
+                biased;
+                // A ready fallback result has already passed registration.
+                result = &mut fallback => match result {
+                    Ok(winner) => Ok(DialWinner::Fallback(winner)),
+                    // Exhausted fallback stages must not cancel a handshake
+                    // that can still finish within the original dial budget.
+                    Err(error) => direct.await.map(DialWinner::Direct).map_err(|_| error),
+                },
+                result = &mut direct => match result {
+                    Ok(winner) => Ok(DialWinner::Direct(winner)),
+                    Err(_) => fallback.await.map(DialWinner::Fallback),
+                },
+            }
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(deadline, race) =>
+                result.map_err(|_| EndpointError::Timeout)?,
+            () = self.shutdown.cancelled() => return Err(EndpointError::ShuttingDown),
+        };
+        match result? {
+            DialWinner::Direct((connection, addr)) => {
+                let method = if addr.is_ipv6() {
+                    ConnectionMethod::DirectIPv6
+                } else {
+                    ConnectionMethod::DirectIPv4
+                };
+                let peer = self
+                    .finalize_direct_connection(connection, addr, peer_id)
+                    .await?;
+                Ok((peer, method))
+            }
+            DialWinner::Fallback(winner) => Ok(winner),
+        }
+    }
+
+    /// Run the remaining stages without changing their budgets or retry policy.
+    async fn continue_fallback(
+        &self,
+        mut strategy: ConnectionStrategy,
+        target_ipv4: Option<SocketAddr>,
+        target_ipv6: Option<SocketAddr>,
+        peer_id: Option<PeerId>,
+        overall_deadline: tokio::time::Instant,
+    ) -> Result<(PeerConnection, ConnectionMethod), EndpointError> {
+        loop {
+            match strategy.current_stage().clone() {
+                ConnectionStage::DirectIPv4 { .. } | ConnectionStage::DirectIPv6 { .. } => {
+                    strategy.transition_to_holepunch("Handled by Happy Eyeballs");
+                }
                 ConnectionStage::HolePunching {
                     coordinator, round, ..
                 } => {
@@ -6137,6 +6294,17 @@ impl P2pEndpoint {
                     // #255: cover events between the session start and the
                     // `poll()` loop in `await_hole_punch_outcome`.
                     let _poll_wait = self.inner.poll_wait_guard();
+
+                    #[cfg(all(test, feature = "network-discovery"))]
+                    {
+                        let gate = self.late_direct_gate.lock().clone();
+                        if let Some(gate) = gate {
+                            *gate.punch_deadline.lock() = Some(stage_deadline);
+                            gate.punch_entered.notify_one();
+                            gate.punch_release.notified().await;
+                        }
+                    }
+
                     match self
                         .start_hole_punch_session(coordinator, target_peer_id)
                         .await
@@ -12759,6 +12927,8 @@ impl P2pEndpoint {
 impl Clone for P2pEndpoint {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(all(test, feature = "network-discovery"))]
+            late_direct_gate: Arc::clone(&self.late_direct_gate),
             inner: Arc::clone(&self.inner),
             // v0.2: auth_manager removed - TLS handles peer authentication
             connected_peers: Arc::clone(&self.connected_peers),
