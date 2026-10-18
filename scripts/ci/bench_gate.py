@@ -40,22 +40,21 @@ COLLECTED_SUITES: Tuple[str, ...] = (
 # measure the bytes crate / std / language idioms and do not execute ant-quic
 # (CI evidence: bytes/create_large +6% with 0.2% control noise on a no-Rust PR).
 #
-# RC2 audit (timed body must call ant-quic code):
+# RC2/RC3 audit (timed body must call ant-quic code):
 # - varint/*: VarInt::from_u32 / Ord — YES (ant_quic::VarInt)
-# - transport_error/*: TransportError { ... } — YES (ant_quic::TransportError)
+# - transport_error/*: TransportError { ... } + String::from — NO → NON_GATING
+#   (struct literal + std string alloc/drop; no ant-quic method)
 # - pool_ml_kem_public_key: PqcMemoryPool::acquire_ml_kem_public_key — YES
 # - pool_ml_kem_secret_key: PqcMemoryPool::acquire_ml_kem_secret_key — YES
 # - concurrent_pool_access: PqcMemoryPool::acquire_ml_kem_ciphertext — YES
 # - direct_ml_kem_public_key: Box::new([0u8; SIZE]) only — NO → NON_GATING
 GATING_BENCH_IDS: frozenset[str] = frozenset(
     {
-        # VarInt + TransportError: ant_quic public types on the hot path.
+        # VarInt: ant_quic public type with real method calls on the hot path.
         "quic_benchmarks::varint/create_small",
         "quic_benchmarks::varint/create_medium",
         "quic_benchmarks::varint/create_large",
         "quic_benchmarks::varint/compare",
-        "quic_benchmarks::transport_error/create_protocol_violation",
-        "quic_benchmarks::transport_error/create_with_reason",
         # PQC memory pool: ant_quic::crypto::pqc::memory_pool (observing only).
         "pqc_memory_pool_bench::pool_ml_kem_public_key",
         "pqc_memory_pool_bench::pool_ml_kem_secret_key",
@@ -83,6 +82,9 @@ NON_GATING_BENCH_IDS: frozenset[str] = frozenset(
         "quic_benchmarks::duration/as_nanos",
         "quic_benchmarks::patterns/option_unwrap_or",
         "quic_benchmarks::patterns/result_ok",
+        # Struct literal + std String alloc/drop; no ant-quic method call (RC3).
+        "quic_benchmarks::transport_error/create_protocol_violation",
+        "quic_benchmarks::transport_error/create_with_reason",
         # std Box heap alloc + imported size constant; no pool / ant-quic call.
         "pqc_memory_pool_bench::direct_ml_kem_public_key",
     }
@@ -221,11 +223,22 @@ def classify(
     baseline: Estimate,
     current: Estimate,
     control: Optional[Estimate],
+    *,
+    noise_override: Optional[float] = None,
 ) -> Comparison:
-    """Decide status for one bench. Only gating + CI-separated regressions fail."""
+    """Decide status for one bench. Only gating + CI-separated regressions fail.
+
+    ``noise_override`` preserves a previously measured same-commit noise ratio
+    (used by ABAB confirmation so a drifted absolute baseline cannot inflate
+    the noise floor against the original control).
+    """
     gated = is_gating_bench_id(bench_id)
     change = relative_change(baseline.mean, current.mean)
-    noise = control_noise_ratio(baseline, control)
+    noise = (
+        noise_override
+        if noise_override is not None
+        else control_noise_ratio(baseline, control)
+    )
 
     if not gated:
         return Comparison(
@@ -363,6 +376,12 @@ def apply_interleaved_confirmation(
     Runner drift after baseline+control (both measured before current) can look
     like a real regression with ~0% control noise. Re-measuring flagged ids as
     ABAB (baseline, current, baseline, current) clears unchanged-code noise.
+
+    Confirmation pairs reuse the provisional row's control-noise ratio rather
+    than recomputing noise against the original control absolute value: a
+    drifted pair baseline (e.g. 150 vs original control 100) would otherwise
+    inflate the noise floor and reclassify a persistent relative regression as
+    NOISE.
     """
     if not pairs:
         raise ValueError("at least one interleaved confirmation pair is required")
@@ -385,6 +404,7 @@ def apply_interleaved_confirmation(
                     pair_baseline[row.bench_id],
                     pair_current[row.bench_id],
                     control.get(row.bench_id),
+                    noise_override=row.control_noise,
                 )
             )
         if missing:

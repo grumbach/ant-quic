@@ -101,6 +101,27 @@ class NonObservingIdsInsideCollectedSuites(unittest.TestCase):
         self.assertFalse(rows[0].gated)
         self.assertFalse(gate.gate_should_fail(rows))
 
+    def test_transport_error_create_protocol_violation_never_gates(self):
+        # Timed body is TransportError { ... } + String::from; no ant-quic method (RC3).
+        bench_id = gate.qualify(
+            "quic_benchmarks", "transport_error/create_protocol_violation"
+        )
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        self.assertNotIn(bench_id, gate.GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(rows[0].gated)
+        self.assertFalse(gate.gate_should_fail(rows))
+
+    def test_transport_error_create_with_reason_never_gates(self):
+        bench_id = gate.qualify("quic_benchmarks", "transport_error/create_with_reason")
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        self.assertNotIn(bench_id, gate.GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(rows[0].gated)
+        self.assertFalse(gate.gate_should_fail(rows))
+
 
 class MergeBaseAndControlRequired(unittest.TestCase):
     """Defects 2–3: refuse to gate without same-commit control; report labels."""
@@ -446,6 +467,46 @@ class InterleavedConfirmation(unittest.TestCase):
             ],
         )
         self.assertEqual(confirmed[0].status, "REGRESSION")
+        self.assertIn("confirmed by 2 interleaved", confirmed[0].reason)
+        self.assertTrue(gate.gate_should_fail(confirmed))
+
+    def test_drifted_absolute_confirmation_baselines_preserve_noise_ratio(self):
+        # Codex RC3 repro: original baseline/control 100, current 120 (REGRESSION).
+        # Confirmation pairs both 150→180 with disjoint CIs. Comparing each fresh
+        # baseline against the ORIGINAL control would inflate noise to ~33% and
+        # wrongly clear the persistent 20% regression as NOISE. The gate must
+        # preserve the original 0% noise ratio and still fail.
+        bench_id = gate.qualify("pqc_memory_pool_bench", "pool_ml_kem_public_key")
+        baseline = est(100, lower=95, upper=105)
+        control = est(100, lower=95, upper=105)
+        current = est(120, lower=115, upper=125)
+        provisional = gate.compare_sides(
+            {bench_id: baseline},
+            {bench_id: current},
+            {bench_id: control},
+        )
+        self.assertEqual(provisional[0].status, "REGRESSION")
+        self.assertEqual(provisional[0].control_noise, 0.0)
+        self.assertTrue(gate.gate_should_fail(provisional))
+
+        pair1_b = est(150, lower=145, upper=155)
+        pair1_c = est(180, lower=175, upper=185)
+        pair2_b = est(150, lower=145, upper=155)
+        pair2_c = est(180, lower=175, upper=185)
+        # Pre-fix: original-control classification would clear (the bug).
+        buggy = gate.classify(bench_id, pair1_b, pair1_c, control)
+        self.assertEqual(buggy.status, "NOISE")
+
+        confirmed = gate.apply_interleaved_confirmation(
+            provisional,
+            {bench_id: control},
+            [
+                ({bench_id: pair1_b}, {bench_id: pair1_c}),
+                ({bench_id: pair2_b}, {bench_id: pair2_c}),
+            ],
+        )
+        self.assertEqual(confirmed[0].status, "REGRESSION")
+        self.assertEqual(confirmed[0].control_noise, 0.0)
         self.assertIn("confirmed by 2 interleaved", confirmed[0].reason)
         self.assertTrue(gate.gate_should_fail(confirmed))
 
