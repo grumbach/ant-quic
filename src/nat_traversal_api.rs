@@ -14432,7 +14432,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_session_reuses_live_ipv4_peer_on_dual_stack_socket() {
-        use socket2::{Domain, Protocol, Socket, Type};
+        use socket2_test::{Domain, Protocol, Socket, Type};
 
         let relay = crate::Node::bind("127.0.0.1:0".parse().expect("relay address"))
             .await

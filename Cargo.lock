@@ -169,6 +169,7 @@ dependencies = [
  "sha2",
  "slab",
  "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration",
  "tempfile",
  "thiserror 2.0.19",
