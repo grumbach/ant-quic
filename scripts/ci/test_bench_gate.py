@@ -48,6 +48,50 @@ class MockBenchNeverFails(unittest.TestCase):
         self.assertFalse(gate.gate_should_fail(rows))
 
 
+class NonObservingIdsInsideCollectedSuites(unittest.TestCase):
+    """Suite membership must not gate benches that never execute ant-quic."""
+
+    def _separated_regression_shape(self, bench_id: str):
+        baseline = est(100, lower=95, upper=105)
+        current = est(106, lower=105.5, upper=110)  # +6%, CIs separated
+        control = est(100.2, lower=95, upper=105)  # ~0.2% noise
+        return gate.compare_sides(
+            {bench_id: baseline},
+            {bench_id: current},
+            {bench_id: control},
+        )
+
+    def test_bytes_create_large_never_gates(self):
+        # Replays this PR's CI false alarm: bytes/create_large +6% / 0.2% noise.
+        bench_id = gate.qualify("quic_benchmarks", "bytes/create_large")
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(rows[0].gated)
+        self.assertFalse(gate.gate_should_fail(rows))
+
+    def test_duration_from_millis_never_gates(self):
+        bench_id = gate.qualify("quic_benchmarks", "duration/from_millis")
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(gate.gate_should_fail(rows))
+
+    def test_patterns_option_unwrap_or_never_gates(self):
+        bench_id = gate.qualify("quic_benchmarks", "patterns/option_unwrap_or")
+        self.assertIn(bench_id, gate.NON_GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "INFO")
+        self.assertFalse(gate.gate_should_fail(rows))
+
+    def test_varint_still_gates_on_same_shape(self):
+        bench_id = gate.qualify("quic_benchmarks", "varint/create_small")
+        self.assertIn(bench_id, gate.GATING_BENCH_IDS)
+        rows = self._separated_regression_shape(bench_id)
+        self.assertEqual(rows[0].status, "REGRESSION")
+        self.assertTrue(gate.gate_should_fail(rows))
+
+
 class MergeBaseAndControlRequired(unittest.TestCase):
     """Defects 2–3: refuse to gate without same-commit control; report labels."""
 
@@ -195,6 +239,56 @@ class CollectAndCompareCli(unittest.TestCase):
             key = "quic_benchmarks::varint/create_small"
             self.assertIn(key, data)
             self.assertEqual(data[key]["mean"], 42.0)
+
+    def test_collect_reads_benchmark_json_inside_label_dir(self):
+        """Some Criterion layouts put benchmark.json under the baseline label."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            suite = "quic_benchmarks"
+            label = "baseline"
+            snap = root / suite / "varint" / "create_medium" / label
+            snap.mkdir(parents=True)
+            (snap / "benchmark.json").write_text(
+                json.dumps(
+                    {
+                        "group_id": "varint",
+                        "full_id": "varint/create_medium",
+                        "directory_name": "varint/create_medium",
+                    }
+                )
+            )
+            (snap / "estimates.json").write_text(
+                json.dumps(
+                    {
+                        "mean": {
+                            "point_estimate": 7.0,
+                            "confidence_interval": {
+                                "confidence_level": 0.95,
+                                "lower_bound": 6.5,
+                                "upper_bound": 7.5,
+                            },
+                        },
+                        "median": {"point_estimate": 7.0},
+                    }
+                )
+            )
+            out = root / "out.json"
+            rc = gate.main(
+                [
+                    "collect",
+                    "--criterion-root",
+                    str(root),
+                    "--suite",
+                    suite,
+                    "--label",
+                    label,
+                    "--out",
+                    str(out),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            data = json.loads(out.read_text())
+            self.assertEqual(data["quic_benchmarks::varint/create_medium"]["mean"], 7.0)
 
     def test_compare_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:

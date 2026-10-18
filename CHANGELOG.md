@@ -11,11 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The Run Benchmarks PR gate no longer fails on false regressions (#291).**
   Comparison is same-host against the PR merge-base with a same-commit control,
-  gates only suites that execute ant-quic code (`pqc_memory_pool_bench`,
-  `quic_benchmarks`), and requires non-overlapping Criterion confidence
-  intervals beyond measured control noise. Mock suites
-  (`connection_management`, `nat_traversal_performance`) stay in the tree for
-  local use but are excluded from the gate. Cross-runner head-of-master
+  gates only individual benchmark ids that execute ant-quic code (VarInt,
+  TransportError, PQC memory pool — not `bytes/*`, `duration/*`, or
+  `patterns/*`), and requires non-overlapping Criterion confidence intervals
+  beyond measured control noise. Mock suites (`connection_management`,
+  `nat_traversal_performance`) stay in the tree for local use but are
+  excluded from the gate. Benchmark artifacts upload only the Criterion root
+  so history archiving finds `sides/current.json`. Cross-runner head-of-master
   artifact baselines are no longer used to fail PRs.
 - **Peer lifecycle streams agree on event order.** Each lifecycle event is now
   sent to the all-peer and per-peer streams under one lock, so concurrent

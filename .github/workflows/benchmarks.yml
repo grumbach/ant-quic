@@ -188,15 +188,18 @@ jobs:
               --runner "${RUNNER_NAME:-$RUNNER_OS}"
             rc=$?
             set -e
-            cp "$GATE_ROOT/comparison-report.md" comparison-report.md
             # Restore env for artifact upload paths.
             echo "CRITERION_HOME=$GATE_ROOT" >> "$GITHUB_ENV"
+            # Check helper status before copying the report: compare may exit 2
+            # without writing comparison-report.md (set -e would skip write_unavailable).
             if [ "$rc" -eq 1 ]; then
+              cp "$GATE_ROOT/comparison-report.md" comparison-report.md
               echo "regression_found=true" >> "$GITHUB_OUTPUT"
             elif [ "$rc" -ne 0 ]; then
               write_unavailable "Gate helper failed with status $rc."
               exit 0
             else
+              cp "$GATE_ROOT/comparison-report.md" comparison-report.md
               echo "regression_found=false" >> "$GITHUB_OUTPUT"
             fi
           else
@@ -221,10 +224,12 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: benchmark-results-${{ github.sha }}
-          path: |
-            ${{ env.CRITERION_HOME }}/
-            comparison-report.md
-          if-no-files-found: warn
+          # Upload only the Criterion root. Mixing $RUNNER_TEMP paths with a
+          # workspace file roots the artifact at their common ancestor, so
+          # sides/current.json lands under _temp/... and history never finds it.
+          # comparison-report.md is already written inside CRITERION_HOME.
+          path: ${{ env.CRITERION_HOME }}/
+          if-no-files-found: error
 
       - name: Comment on PR
         if: always() && github.event_name == 'pull_request'
@@ -238,7 +243,7 @@ jobs:
             } else {
               comment += 'Benchmark gate did not produce a comparison report.\n';
             }
-            comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, gating suites only, CI overlap required. Mock benches never fail the job._\n';
+            comment += '\n_Gate rules (#291): merge-base baseline, same-runner control, allowlisted ant-quic bench ids only, CI overlap required. Mock/non-observing benches never fail the job._\n';
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -381,8 +386,9 @@ jobs:
             cp downloaded-benchmarks/benchmark-results.json \
               .benchmarks/results-$(date +%Y%m%d-%H%M%S)-${{ github.sha }}.json
           else
-            echo "No benchmark results artifact to archive"
-            exit 0
+            echo "::error::benchmark-history: expected sides/current.json (or benchmark-results.json) under downloaded-benchmarks; artifact layout is broken"
+            find downloaded-benchmarks -maxdepth 4 -type f | head -50 || true
+            exit 1
           fi
 
           # Keep only last 50 results

@@ -25,19 +25,55 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-# Suites that execute ant-quic code and may fail a PR.
-GATING_BENCHES: Tuple[str, ...] = (
+# Suites collected in CI. Still run their Criterion binary so informational
+# (non-ant-quic) benches appear in the report; only GATING_BENCH_IDS can fail.
+COLLECTED_SUITES: Tuple[str, ...] = (
     "pqc_memory_pool_bench",
     "quic_benchmarks",
+)
+
+# Exact qualified ids that may fail a PR. Suite-wide allowlists are unsafe:
+# quic_benchmarks also contains bytes/*, duration/*, and patterns/* which
+# measure the bytes crate / std / language idioms and do not execute ant-quic
+# (CI evidence: bytes/create_large +6% with 0.2% control noise on a no-Rust PR).
+GATING_BENCH_IDS: frozenset[str] = frozenset(
+    {
+        # VarInt + TransportError: ant_quic public types on the hot path.
+        "quic_benchmarks::varint/create_small",
+        "quic_benchmarks::varint/create_medium",
+        "quic_benchmarks::varint/create_large",
+        "quic_benchmarks::varint/compare",
+        "quic_benchmarks::transport_error/create_protocol_violation",
+        "quic_benchmarks::transport_error/create_with_reason",
+        # PQC memory pool: ant_quic::crypto::pqc::memory_pool.
+        "pqc_memory_pool_bench::pool_ml_kem_public_key",
+        "pqc_memory_pool_bench::direct_ml_kem_public_key",
+        "pqc_memory_pool_bench::pool_ml_kem_secret_key",
+        "pqc_memory_pool_bench::concurrent_pool_access",
+    }
 )
 
 # Suites retained for local/informational runs. They do not observe production
 # paths in a way that can justify a merge gate (issue #291 defect 1).
 # connection_management: PeerId newtype + local VecDeque/RwLock mocks.
 # nat_traversal_performance: tokio::sleep / Vec sort simulations, no ant-quic.
-NON_GATING_BENCHES: Tuple[str, ...] = (
+NON_GATING_SUITES: Tuple[str, ...] = (
     "connection_management",
     "nat_traversal_performance",
+)
+
+# Non-observing ids inside COLLECTED_SUITES (documented for tests/reports).
+NON_GATING_BENCH_IDS: frozenset[str] = frozenset(
+    {
+        "quic_benchmarks::bytes/create_small",
+        "quic_benchmarks::bytes/create_medium",
+        "quic_benchmarks::bytes/create_large",
+        "quic_benchmarks::bytes/clone_1kb",
+        "quic_benchmarks::duration/from_millis",
+        "quic_benchmarks::duration/as_nanos",
+        "quic_benchmarks::patterns/option_unwrap_or",
+        "quic_benchmarks::patterns/result_ok",
+    }
 )
 
 # Relative floor so tiny absolute CI gaps on nanosecond benches do not flake.
@@ -78,15 +114,8 @@ class Comparison:
 
 
 def is_gating_bench_id(bench_id: str) -> bool:
-    """Return True when the Criterion id belongs to a gating suite."""
-    # Criterion full_id is typically "group/function" or "group/param".
-    # Suite membership is tracked via the snapshot label directory we store
-    # under, so callers pass "suite::id" or we check prefixes from known groups.
-    if "::" in bench_id:
-        suite, _ = bench_id.split("::", 1)
-        return suite in GATING_BENCHES
-    # Fallback: treat unknown bare ids as non-gating (fail-closed for mocks).
-    return False
+    """Return True only for exact allowlisted ant-quic-observing bench ids."""
+    return bench_id in GATING_BENCH_IDS
 
 
 def qualify(suite: str, bench_id: str) -> str:
@@ -124,7 +153,11 @@ def collect_suite_estimates(criterion_root: Path, suite: str, baseline_label: st
     for estimates in root.glob(f"**/{baseline_label}/estimates.json"):
         # .../<directory_name>/<label>/estimates.json
         bench_dir = estimates.parent.parent
+        # Criterion may place benchmark.json beside the baseline label dir or
+        # inside it depending on version / --save-baseline layout.
         meta = bench_dir / "benchmark.json"
+        if not meta.is_file():
+            meta = estimates.parent / "benchmark.json"
         if meta.is_file():
             identity = json.loads(meta.read_text()).get("full_id")
             if not isinstance(identity, str) or not identity:
@@ -180,7 +213,7 @@ def classify(
             control_noise=noise,
             status="INFO",
             gated=False,
-            reason="non-gating suite (mock or non-observing); never fails the job",
+            reason="non-gating bench (mock or non-observing); never fails the job",
         )
 
     if control is None:
@@ -308,8 +341,9 @@ def format_report(
         f"- Merge-base: `{merge_base}`",
         f"- PR head: `{head}`",
         f"- Runner: `{runner}` (baseline, same-commit control, and current in one job)",
-        f"- Gating suites: {', '.join(GATING_BENCHES)}",
-        f"- Non-gating (informational) suites: {', '.join(NON_GATING_BENCHES)}",
+        f"- Gating benchmarks: {', '.join(sorted(GATING_BENCH_IDS))}",
+        f"- Collected suites (informational ids included): {', '.join(COLLECTED_SUITES)}",
+        f"- Non-gating suites: {', '.join(NON_GATING_SUITES)}",
         f"- Rule: fail only if a gating bench has non-overlapping 95% CIs, "
         f"current is slower, and the relative delta exceeds max("
         f"{MIN_REGRESSION_RATIO:.0%}, same-commit control noise)\n",
