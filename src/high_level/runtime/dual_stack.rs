@@ -390,7 +390,15 @@ fn to_mapped_v6(v4: SocketAddrV4) -> SocketAddrV6 {
 const SHARED_PORT_BIND_ATTEMPTS: u32 = 16;
 
 fn is_port_conflict(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::AddrInUse
+    match err.kind() {
+        io::ErrorKind::AddrInUse => true,
+        // Windows can surface excluded/reserved UDP port conflicts as WSAEACCES
+        // (PermissionDenied) rather than WSAEADDRINUSE. Treat that as a conflict
+        // for the ephemeral shared-port retry path only.
+        #[cfg(windows)]
+        io::ErrorKind::PermissionDenied => true,
+        _ => false,
+    }
 }
 
 /// Create a dual-stack socket binding separate IPv4 and IPv6 sockets.
@@ -418,15 +426,31 @@ pub fn create_dual_stack_sockets(
 
 fn create_dual_stack_sockets_ephemeral()
 -> io::Result<(Option<std::net::UdpSocket>, Option<std::net::UdpSocket>)> {
+    create_dual_stack_sockets_ephemeral_with(create_v6_socket, create_v4_socket)
+}
+
+/// Ephemeral shared-port allocator with injectable binders (test seam).
+///
+/// Production callers use [`create_dual_stack_sockets_ephemeral`]; tests inject an
+/// IPv4 binder that fails with [`io::ErrorKind::AddrInUse`] for the first N
+/// attempts so conflict → retry → success and retry exhaustion are deterministic.
+fn create_dual_stack_sockets_ephemeral_with<V6, V4>(
+    mut bind_v6: V6,
+    mut bind_v4: V4,
+) -> io::Result<(Option<std::net::UdpSocket>, Option<std::net::UdpSocket>)>
+where
+    V6: FnMut(u16) -> io::Result<std::net::UdpSocket>,
+    V4: FnMut(u16) -> io::Result<std::net::UdpSocket>,
+{
     let mut last_conflict: Option<io::Error> = None;
 
     for attempt in 0..SHARED_PORT_BIND_ATTEMPTS {
-        let v6 = match create_v6_socket(0) {
+        let v6 = match bind_v6(0) {
             Ok(socket) => socket,
             Err(e) => {
                 debug!("IPv6 socket creation failed: {e}");
                 // IPv6 unavailable — fall back to IPv4-only.
-                return match create_v4_socket(0) {
+                return match bind_v4(0) {
                     Ok(v4) => {
                         log_dual_stack_result(Some(&v4), None);
                         Ok((Some(v4), None))
@@ -444,7 +468,7 @@ fn create_dual_stack_sockets_ephemeral()
 
         let assigned = v6.local_addr()?.port();
 
-        match create_v4_socket(assigned) {
+        match bind_v4(assigned) {
             Ok(v4) => {
                 log_dual_stack_result(Some(&v4), Some(&v6));
                 return Ok((Some(v4), Some(v6)));
@@ -567,13 +591,64 @@ fn create_v4_socket(port: u16) -> io::Result<std::net::UdpSocket> {
 fn create_v6_socket(port: u16) -> io::Result<std::net::UdpSocket> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    // Prefer atomic close-on-exec at creation time (matches std/socket2). Apple
+    // platforms (and other Unixes without `SOCK_CLOEXEC` in libc) fall back to
+    // `fcntl(FD_CLOEXEC)` immediately below.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    let type_flags = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    let type_flags = libc::SOCK_DGRAM;
+
+    // SAFETY: `socket` is a standard POSIX syscall; AF_INET6 / SOCK_DGRAM /
+    // IPPROTO_UDP (and SOCK_CLOEXEC where set) are valid type flags. A negative
+    // return is converted to `io::Error` before the fd is wrapped.
+    let fd = unsafe { libc::socket(libc::AF_INET6, type_flags, libc::IPPROTO_UDP) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` is a freshly created socket descriptor we exclusively own.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    // Portable close-on-exec: always set via fcntl so platforms that lack atomic
+    // SOCK_CLOEXEC (or whose socket() ignores the flag) still get FD_CLOEXEC.
+    // SAFETY: `owned` is a live socket fd we exclusively own; F_SETFD with
+    // FD_CLOEXEC is a documented fcntl operation on that descriptor.
+    let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        // SAFETY: same exclusive fd; only toggling the close-on-exec bit.
+        let set =
+            unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if set < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
     let enabled: libc::c_int = 1;
+    // SAFETY: `owned` is a live AF_INET6 socket; IPV6_V6ONLY takes a c_int and
+    // the pointer/len describe that value for the life of the call.
     let ret = unsafe {
         libc::setsockopt(
             owned.as_raw_fd(),
@@ -587,23 +662,34 @@ fn create_v6_socket(port: u16) -> io::Result<std::net::UdpSocket> {
         return Err(io::Error::last_os_error());
     }
 
-    let storage = libc::sockaddr_in6 {
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-        sin6_family: libc::AF_INET6 as libc::sa_family_t,
-        sin6_port: port.to_be(),
-        sin6_flowinfo: 0,
-        // SAFETY: `in6addr_any` is the immutable IPv6 wildcard constant.
-        sin6_addr: unsafe { libc::in6addr_any },
-        sin6_scope_id: 0,
-    };
+    // Zero then assign known fields so targets with extra sockaddr_in6 members
+    // (e.g. illumos/Solaris `__sin6_src_id`) still compile and bind correctly.
+    // SAFETY: `sockaddr_in6` is a C POD; zeroed bytes are a valid all-zero
+    // representation before we overwrite the fields bind requires.
+    let mut storage: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        storage.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+    }
+    storage.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    storage.sin6_port = port.to_be();
+    storage.sin6_flowinfo = 0;
+    // SAFETY: `in6addr_any` is the immutable IPv6 wildcard constant.
+    storage.sin6_addr = unsafe { libc::in6addr_any };
+    storage.sin6_scope_id = 0;
+
+    // SAFETY: `owned` is a live AF_INET6 datagram socket; `storage` is a fully
+    // initialized sockaddr_in6 whose size matches the socklen passed to bind.
     let bind_ret = unsafe {
         libc::bind(
             owned.as_raw_fd(),
@@ -886,6 +972,9 @@ mod tests {
     /// Occupy an IPv4 port, then prove the shared-port allocator either retries
     /// onto a free shared port with working v4+v6, or returns a clear
     /// [`io::ErrorKind::AddrInUse`] — never a silent v6-only / split-port result.
+    ///
+    /// Both address families are proven available before the allocator call, so
+    /// a single-stack `Ok` is rejected (that would be the #246 silent fallback).
     #[test]
     fn create_dual_stack_sockets_retries_past_occupied_v4_port() {
         let blocker =
@@ -899,10 +988,7 @@ mod tests {
             Err(_) => return,
         }
 
-        // Force the first ephemeral attempt onto the occupied port by binding v6
-        // there ourselves is impossible through the public API; instead hold the
-        // blocker and call the allocator — it must not return mismatched ports.
-        // Separately, exercise the conflict path directly on `busy_port`.
+        // Both families work: v4 conflicts on the occupied port, v6 bound above.
         let conflict = create_v4_socket(busy_port);
         assert!(
             conflict.as_ref().err().is_some_and(is_port_conflict),
@@ -969,7 +1055,10 @@ mod tests {
                 assert!(got, "v6 socket on shared port must receive traffic");
             }
             Ok((None, Some(_))) | Ok((Some(_), None)) => {
-                // Genuine single-stack host (one AF missing) — acceptable.
+                panic!(
+                    "both address families were proven available; \
+                     silent single-stack success is the #246 failure mode"
+                );
             }
             Ok((None, None)) => panic!("empty Ok from create_dual_stack_sockets"),
             Err(e) => {
@@ -982,9 +1071,63 @@ mod tests {
         }
     }
 
-    /// Deterministic conflict: binding the shared pair onto a v4-occupied port
-    /// must fail with [`io::ErrorKind::AddrInUse`], and a subsequent ephemeral
-    /// allocation must still produce a working shared-port dual bind.
+    /// Deterministic conflict → retry → success via an injected IPv4 binder that
+    /// fails with AddrInUse on the first attempt, then delegates to the real binder.
+    #[test]
+    fn create_dual_stack_sockets_conflict_then_retry_succeeds() {
+        let mut v4_calls = 0u32;
+        let (v4, v6) = create_dual_stack_sockets_ephemeral_with(create_v6_socket, |port| {
+            v4_calls += 1;
+            if v4_calls == 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "injected first-attempt conflict",
+                ));
+            }
+            create_v4_socket(port)
+        })
+        .expect("allocator must recover after one injected conflict");
+
+        let (Some(v4), Some(v6)) = (v4, v6) else {
+            panic!("both families available: must not degrade to single-stack after a conflict");
+        };
+        assert!(
+            v4_calls >= 2,
+            "injected conflict must force at least one retry, got {v4_calls} v4 calls"
+        );
+        let v4_port = v4.local_addr().unwrap().port();
+        let v6_port = v6.local_addr().unwrap().port();
+        assert_eq!(v4_port, v6_port, "retry must keep a shared port");
+        assert_ne!(v4_port, 0);
+    }
+
+    /// Deterministic retry exhaustion: IPv4 binder always reports AddrInUse.
+    #[test]
+    fn create_dual_stack_sockets_retry_exhaustion_returns_addr_in_use() {
+        let mut v4_calls = 0u32;
+        let err = create_dual_stack_sockets_ephemeral_with(create_v6_socket, |_port| {
+            v4_calls += 1;
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "injected persistent conflict",
+            ))
+        })
+        .expect_err("persistent conflict must exhaust retries");
+
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert!(
+            err.to_string()
+                .contains(&SHARED_PORT_BIND_ATTEMPTS.to_string()),
+            "error should mention attempt budget, got: {err}"
+        );
+        assert_eq!(
+            v4_calls, SHARED_PORT_BIND_ATTEMPTS,
+            "every attempt must try the IPv4 binder"
+        );
+    }
+
+    /// Live occupied-port smoke: fixed-port bind against a busy v4 port, then a
+    /// fresh ephemeral allocation must still produce a shared-port dual bind.
     #[test]
     fn create_dual_stack_sockets_shared_port_conflict_then_ephemeral_ok() {
         let blocker =
@@ -993,7 +1136,8 @@ mod tests {
 
         // Direct fixed-port attempt: v6 may bind, v4 conflicts → single-stack or
         // dual failure is fine for a *requested* busy port; the ephemeral path
-        // below is what must recover.
+        // below is what must recover. (Whether fixed-port should error instead
+        // of silent v6-only is deferred — see QUESTIONS.md.)
         let _ = create_dual_stack_sockets(busy_port);
 
         let (v4, v6) = match create_dual_stack_sockets(0) {
@@ -1004,12 +1148,43 @@ mod tests {
             }
         };
         let (Some(v4), Some(v6)) = (v4, v6) else {
+            // Only acceptable if this host cannot bind both families at all.
+            // The injected-binder tests above cover the dual-stack contract.
             return;
         };
         let v4_port = v4.local_addr().unwrap().port();
         let v6_port = v6.local_addr().unwrap().port();
         assert_eq!(v4_port, v6_port, "ephemeral allocation must share a port");
         assert_ne!(v4_port, busy_port);
+    }
+
+    /// Dual-stack UDP sockets must be close-on-exec so exec'd children cannot
+    /// inherit the listener and hold the port after endpoint shutdown.
+    #[cfg(unix)]
+    #[test]
+    fn create_dual_stack_sockets_set_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let (v4, v6) = create_dual_stack_sockets(0).expect("bind dual-stack");
+        assert!(v4.is_some() || v6.is_some());
+
+        for (label, sock) in [("v4", v4.as_ref()), ("v6", v6.as_ref())] {
+            let Some(sock) = sock else {
+                continue;
+            };
+            // SAFETY: sock is a live UdpSocket; F_GETFD is valid on its fd.
+            let flags = unsafe { libc::fcntl(sock.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "{label}: F_GETFD failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "{label}: FD_CLOEXEC must be set (flags={flags:#x})"
+            );
+        }
     }
 
     #[tokio::test]
