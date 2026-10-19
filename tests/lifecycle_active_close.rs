@@ -2,7 +2,7 @@
 
 mod support;
 
-use ant_quic::{ConnectionCloseReason, ConnectionError, PeerLifecycleEvent};
+use ant_quic::{ConnectionCloseReason, ConnectionError, P2pEndpoint};
 use std::time::{Duration, Instant};
 use support::{
     CONNECT_TIMEOUT, RETIREMENT_WAIT, connect_pair, make_isolated_node_with_keypair, make_node,
@@ -52,10 +52,6 @@ async fn peer_shutdown_cleans_up_remote_view_without_waiting_for_reaper() {
     accept_b.abort();
 }
 
-/// Upper bound for the peer of a rejected newcomer to observe its close. The
-/// registrar rejects and closes it at registration.
-const REJECTED_CLOSE_WAIT: Duration = Duration::from_secs(20);
-
 /// How long a follower is watched for a retirement it must never make: more
 /// than Q plus the executor's passes.
 const FOLLOWER_KEEPS_FOR: Duration = Duration::from_secs(40);
@@ -74,28 +70,28 @@ fn assert_superseded_application_close(close_reason: &ConnectionError, view: &st
     );
 }
 
-/// #307, role-aware for ADR-017. A opens C1 to B and both ends register it;
-/// then B' (a second endpoint with B's identity) opens C2 to A. C1 and C2
-/// have different initiators, so A picks the winner by the shared
-/// TLS-exporter connection id, as in a simultaneous open, and the winner
-/// changes from run to run. Both outcomes are checked, and they differ:
-///
-/// - C2 loses: A rejects it at registration and closes it at once with the
-///   reserved Superseded code, whatever A's role is. B' reports the close.
-/// - C1 loses: C1 is an admitted, superseded connection. Only the arbiter of
-///   the pair retires it. If A is the arbiter, B sees C1 closed with the
-///   Superseded code once A has evidence that B' reads C2. If A is the
-///   follower, A never retires C1: it stays open and A still reads it.
-///
-/// The previous version dialled from both sides at once and held the two
-/// handles `get_quic_connection` returned; when the winner registered first
-/// on both sides, both handles were the winner and the test timed out. Here
-/// the order is fixed and A is the only endpoint that holds both
-/// connections.
-async fn run_superseded_close_reason(a_is_arbiter: bool) {
-    let _guard = test_guard().await;
-    reset_lifecycle_events();
+/// Complete the inbound accept as well as the outbound dial. A winner-map
+/// entry alone does not prove that the accepted connection has a reader.
+async fn connect_and_accept(from: &P2pEndpoint, to: &P2pEndpoint) {
+    let addr = normalize_local_addr(to.local_addr().expect("bound addr"));
+    timeout(CONNECT_TIMEOUT, async {
+        let (connected, accepted) = tokio::join!(from.connect_addr(addr), to.accept());
+        assert_eq!(connected.expect("connect").peer_id, to.peer_id());
+        assert_eq!(accepted.expect("accept").peer_id, from.peer_id());
+    })
+    .await
+    .expect("connect and accept timeout");
+}
 
+/// #307: retain C1 before opening its replacement. B and B' share an identity
+/// and both dial A, so C2 is in the same initiator family and always wins.
+/// Await each accept so C1 has a reader before it is superseded, and C2 has
+/// one before retirement is observed. Only the ADR-017 arbiter may retire C1.
+///
+/// Simultaneous dials can return two views of the winner, not the loser. The
+/// later cross-family fixture also let random exporter ids choose rejection
+/// of C2 instead of superseding C1, so a pass did not prove retirement.
+async fn run_superseded_close_reason(a_is_arbiter: bool) {
     let (arbiter_key, follower_key) = ordered_keypairs();
     let (a_key, b_key) = if a_is_arbiter {
         (arbiter_key, follower_key)
@@ -104,23 +100,11 @@ async fn run_superseded_close_reason(a_is_arbiter: bool) {
     };
     let a = make_isolated_node_with_keypair(a_key).await;
     let b = make_isolated_node_with_keypair(b_key.clone()).await;
-    let a_addr = normalize_local_addr(a.local_addr().expect("a addr"));
-    let b_addr = normalize_local_addr(b.local_addr().expect("b addr"));
     let a_id = a.peer_id();
     let b_id = b.peer_id();
-    let accept_a = spawn_accept_loop(a.clone());
-    let accept_b = spawn_accept_loop(b.clone());
 
-    // C1, opened by A. Wait until both ends have registered it.
-    timeout(CONNECT_TIMEOUT, a.connect_addr(b_addr))
-        .await
-        .expect("C1 connect timeout")
-        .expect("C1 connect");
-    wait_until(CONNECT_TIMEOUT, || {
-        a.get_quic_connection(&b_id).ok().flatten().is_some()
-            && b.get_quic_connection(&a_id).ok().flatten().is_some()
-    })
-    .await;
+    // Hold both views of C1 while it is the only connection and A reads it.
+    connect_and_accept(&b, &a).await;
     let a_view_c1 = a
         .get_quic_connection(&b_id)
         .expect("a lookup")
@@ -133,69 +117,33 @@ async fn run_superseded_close_reason(a_is_arbiter: bool) {
     // C2, opened by B' (a second endpoint with B's identity).
     let b2 = make_isolated_node_with_keypair(b_key).await;
     assert_eq!(b2.peer_id(), b_id, "B' must have B's identity");
-    let accept_b2 = spawn_accept_loop(b2.clone());
-    let mut b2_events = b2.subscribe_peer_events(&a_id);
-    timeout(CONNECT_TIMEOUT, b2.connect_addr(a_addr))
-        .await
-        .expect("C2 connect timeout")
-        .expect("C2 connect");
-    // If A has already closed C2, the lookup can miss. B's peer event below
-    // still reports the close.
-    let b2_view_c2 = b2.get_quic_connection(&a_id).ok().flatten();
+    connect_and_accept(&b2, &a).await;
+    let b2_view_c2 = b2
+        .get_quic_connection(&a_id)
+        .expect("B' lookup")
+        .expect("B' view of C2");
 
-    // Which connection did A keep? Either B' sees the rejection of C2, or
-    // A's winner moves to C2.
-    let mut b2_closed_reason = None;
-    wait_until(REJECTED_CLOSE_WAIT, || {
-        while let Ok(event) = b2_events.try_recv() {
-            if let PeerLifecycleEvent::Closed { reason, .. } = event {
-                b2_closed_reason.get_or_insert(reason);
-            }
-        }
-        b2_closed_reason.is_some()
-            || a.get_quic_connection(&b_id)
-                .ok()
-                .flatten()
-                .is_some_and(|live| live.stable_id() != a_view_c1.stable_id())
-    })
-    .await;
     let a_live = a
         .get_quic_connection(&b_id)
         .expect("a lookup")
         .expect("A keeps the winner live");
-    if a_live.stable_id() == a_view_c1.stable_id() {
-        // C2 lost: A rejected it at registration and closed it at once.
-        println!("#307 outcome (a_is_arbiter={a_is_arbiter}): C1 won, C2 rejected");
-        assert_eq!(
-            b2_closed_reason,
-            Some(ConnectionCloseReason::Superseded),
-            "B' must report the Superseded close of the rejected C2"
-        );
-        if let Some(b2_view_c2) = b2_view_c2 {
-            let close_reason = b2_view_c2.close_reason().expect("C2 closed");
-            assert_superseded_application_close(&close_reason, "B' view of C2");
-        }
-        assert!(
-            b_view_c1.close_reason().is_none(),
-            "C1 won, so B must keep it"
-        );
-    } else if a_is_arbiter {
-        // C1 lost and A is the arbiter: A retires C1.
-        println!("#307 outcome (arbiter A): C2 won, C1 superseded and retired");
-        wait_until(RETIREMENT_WAIT, || b_view_c1.close_reason().is_some()).await;
-        let close_reason = b_view_c1.close_reason().expect("C1 closed");
+    assert_ne!(
+        a_live.stable_id(),
+        a_view_c1.stable_id(),
+        "the fixture must supersede C1, not merely reject a newcomer"
+    );
+    if a_is_arbiter {
+        // Await the actual remote close, not a local lifecycle notification.
+        let close_reason = timeout(RETIREMENT_WAIT, b_view_c1.closed())
+            .await
+            .expect("the arbiter must retire C1");
         assert_superseded_application_close(&close_reason, "B view of C1");
-        assert_eq!(b2_closed_reason, None, "C2 won, so B' must keep it");
-        assert!(
-            b2_view_c2.is_some_and(|c2| c2.close_reason().is_none()),
-            "C2 won, so B' keeps it open"
-        );
     } else {
         // C1 lost and A is the follower: A never retires C1.
-        println!("#307 outcome (follower A): C2 won, C1 superseded and kept");
-        tokio::time::sleep(FOLLOWER_KEEPS_FOR).await;
         assert!(
-            b_view_c1.close_reason().is_none(),
+            timeout(FOLLOWER_KEEPS_FOR, b_view_c1.closed())
+                .await
+                .is_err(),
             "the follower A must not retire C1: {:?}",
             b_view_c1.close_reason()
         );
@@ -213,15 +161,14 @@ async fn run_superseded_close_reason(a_is_arbiter: bool) {
         .await
         .unwrap_or(false);
         assert!(received, "the follower A still reads C1");
-        assert_eq!(b2_closed_reason, None, "C2 won, so B' must keep it");
     }
+
+    assert!(a_live.close_reason().is_none(), "A keeps C2 open");
+    assert!(b2_view_c2.close_reason().is_none(), "B' keeps C2 open");
 
     a.shutdown().await;
     b.shutdown().await;
     b2.shutdown().await;
-    accept_a.abort();
-    accept_b.abort();
-    accept_b2.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
