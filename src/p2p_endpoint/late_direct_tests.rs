@@ -198,7 +198,57 @@ impl Fixture {
         self.target.shutdown().await;
         self.coordinator.shutdown().await;
     }
+
+    /// Let the endpoint driver reap connections whose close has already
+    /// happened but whose draining period outlives the establishment window
+    /// the test just advanced. The reap deadline is `Close` timer expiry —
+    /// `3 × PTO` past the close — and under the paused clock PTO inherits
+    /// RTT samples measured across the test's `advance()` jumps, so it can
+    /// overshoot the window by tens of seconds. No amount of yielding fires
+    /// a virtual timer, so step virtual time in bounded increments until
+    /// the live count reaches `expected`, offering scheduling rounds after
+    /// each step for the reap's task hop (connection driver emits `Drained`,
+    /// endpoint driver collects it). The bound stays far inside the idle
+    /// window that live connections' keep-alives guard, and a drain that
+    /// never lands still fails the caller's exact count assertion instead
+    /// of being masked here.
+    async fn wait_until_drained_connections(&self, expected: usize) {
+        for _ in 0..DRAIN_REAP_ADVANCE_STEPS {
+            if self.open_connections() <= expected {
+                return;
+            }
+            tokio::time::advance(DRAIN_REAP_ADVANCE_STEP).await;
+            for _ in 0..DRAIN_REAP_YIELD_ROUNDS {
+                if self.open_connections() <= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn open_connections(&self) -> usize {
+        self.dialer
+            .inner
+            .get_endpoint()
+            .expect("quic")
+            .open_connections()
+    }
 }
+
+/// Virtual time granted to the endpoint driver, beyond the establishment
+/// window each test has already advanced, while waiting for a closed
+/// connection's reap. The worst inflation observed comes from an RTT sample
+/// spanning the tests' multi-second jumps: a ~2 s sample yields a close
+/// deadline ~18 s past the close. Sixty one-second steps cover that with
+/// room to spare while live connections keep-alive (15 s interval against a
+/// 30 s idle timeout) keeps the winners alive throughout.
+const DRAIN_REAP_ADVANCE_STEPS: usize = 60;
+const DRAIN_REAP_ADVANCE_STEP: Duration = Duration::from_secs(1);
+/// Scheduling rounds offered after each step so the fired `Close` timer's
+/// reap chain (connection driver to endpoint driver) can complete before
+/// the next step is taken.
+const DRAIN_REAP_YIELD_ROUNDS: usize = 1_000;
 
 #[tokio::test]
 async fn late_direct_completes_after_coordinator_stage_cutoff() {
@@ -264,7 +314,7 @@ async fn punch_winner_closes_the_owned_late_direct_loser() {
     // QUIC retains closed routes for its draining period. Advance the
     // existing establishment window, then let the driver deliver Drained.
     tokio::time::advance(Duration::from_secs(12)).await;
-    tokio::task::yield_now().await;
+    f.wait_until_drained_connections(2).await;
     let winner = f
         .dialer
         .inner
@@ -342,7 +392,7 @@ async fn late_direct_is_cancelled_at_the_original_caller_deadline() {
     // QUIC retains closed routes for its draining period. Advance the
     // existing establishment window, then let the driver deliver Drained.
     tokio::time::advance(Duration::from_secs(12)).await;
-    tokio::task::yield_now().await;
+    f.wait_until_drained_connections(2).await;
     assert!(f.dialer.inner.is_peer_connected(&f.target.peer_id()));
     assert_eq!(
         f.dialer
@@ -374,7 +424,7 @@ async fn cancelling_the_dial_closes_the_owned_late_direct() {
     // QUIC retains closed routes for its draining period. Advance the
     // existing establishment window, then let the driver deliver Drained.
     tokio::time::advance(Duration::from_secs(12)).await;
-    tokio::task::yield_now().await;
+    f.wait_until_drained_connections(1).await;
     assert!(!f.dialer.inner.is_peer_connected(&f.target.peer_id()));
     assert_eq!(
         f.dialer
@@ -617,7 +667,7 @@ async fn ready_punch_winner_closes_an_already_completed_direct_result() {
     );
     remote_direct.closed().await;
     tokio::time::advance(Duration::from_secs(12)).await;
-    tokio::task::yield_now().await;
+    f.wait_until_drained_connections(2).await;
     assert_eq!(
         f.dialer.inner.open_lifecycle_entries_for_test(&peer).len(),
         1
