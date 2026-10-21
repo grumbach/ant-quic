@@ -1003,29 +1003,21 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 if !self.spaces[space_id].pending_acks.ranges().is_empty() {
-                    if Self::populate_acks(
+                    // Reserve room for CONNECTION_CLOSE even when an Initial token leaves
+                    // little space after the header. Same budget as quinn-proto 0.11.19
+                    // (a6e78d1c8b).
+                    Self::try_populate_acks(
                         now,
                         self.receiving_ecn,
                         &mut SentFrames::default(),
                         &mut self.spaces[space_id],
                         buf,
                         &mut self.stats,
-                    )
-                    .is_err()
-                    {
-                        self.handle_encode_error(now, "ACK (close)");
-                        return None;
-                    }
+                        builder.max_size - frame::ConnectionClose::SIZE_BOUND,
+                    );
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-                debug_assert!(
-                    buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size,
-                    "ACKs should leave space for ConnectionClose"
-                );
-                if buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size {
+                if buf.len() + frame::ConnectionClose::SIZE_BOUND <= builder.max_size {
                     let max_frame_size = builder.max_size - buf.len();
                     match self.state {
                         State::Closed(state::Closed { ref reason }) => {
@@ -4415,6 +4407,47 @@ impl Connection {
         frame::Ack::try_encode(delay as _, space.pending_acks.ranges(), ecn, buf)?;
         stats.frame_tx.acks += 1;
         Ok(())
+    }
+
+    /// Write pending ACKs if they fit in `max_size`.
+    ///
+    /// An ACK that would pass `max_size` is removed and not counted as sent. Used when a
+    /// CONNECTION_CLOSE must still fit after the ACK, including an Initial whose token
+    /// leaves only [`frame::ConnectionClose::SIZE_BOUND`] bytes.
+    fn try_populate_acks(
+        now: Instant,
+        receiving_ecn: bool,
+        sent: &mut SentFrames,
+        space: &mut PacketSpace,
+        buf: &mut Vec<u8>,
+        stats: &mut ConnectionStats,
+        max_size: usize,
+    ) {
+        debug_assert!(!space.pending_acks.ranges().is_empty());
+        debug_assert!(space.crypto.is_some(), "tried to send ACK in 0-RTT");
+        let ecn = if receiving_ecn {
+            Some(&space.ecn_counters)
+        } else {
+            None
+        };
+        let delay_micros = space.pending_acks.ack_delay(now).as_micros() as u64;
+        let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
+        let delay = delay_micros >> ack_delay_exp.into_inner();
+        trace!(
+            "ACK {:?}, Delay = {}us",
+            space.pending_acks.ranges(),
+            delay_micros
+        );
+
+        let no_acks_len = buf.len();
+        if frame::Ack::try_encode(delay as _, space.pending_acks.ranges(), ecn, buf).is_err()
+            || buf.len() > max_size
+        {
+            buf.truncate(no_acks_len);
+            return;
+        }
+        sent.largest_acked = space.pending_acks.ranges().max();
+        stats.frame_tx.acks += 1;
     }
 
     fn close_common(&mut self) {
