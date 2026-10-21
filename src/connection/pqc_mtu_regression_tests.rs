@@ -27,6 +27,7 @@
 //! `Transmit` boundary.
 
 use std::{
+    io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
@@ -34,13 +35,14 @@ use std::{
 use bytes::BytesMut;
 
 use crate::{
-    ClientConfig, Connection, ConnectionHandle, EndpointConfig, Event, ServerConfig,
-    TransportConfig,
+    ClientConfig, Connection, ConnectionError, ConnectionHandle, ConnectionId, EndpointConfig,
+    Event, ServerConfig, TransportConfig, TransportErrorCode,
     crypto::{
         pqc::PqcConfig,
         rustls::{QuicClientConfig, QuicServerConfig, configured_provider_with_pqc},
     },
     endpoint::{DatagramEvent, Endpoint},
+    packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader},
 };
 
 /// Smallest allowed maximum datagram size (RFC 9000 §14); the crate's `MIN_INITIAL_SIZE`.
@@ -501,4 +503,98 @@ fn coordinated_path_challenge_is_padded_and_decoded_by_peer() {
         "peer must authenticate and decode the coordinated challenge"
     );
     assert_eq!(transmit.size, MIN_INITIAL_SIZE);
+}
+
+/// GHSA-wppq-2f6r-wfvm: a Retry whose token leaves no room for a CRYPTO or
+/// CONNECTION_CLOSE frame must close the connection instead of building an Initial.
+/// The limit is quinn-proto 0.11.19's `max(Crypto::SIZE_BOUND + 1, ConnectionClose::SIZE_BOUND)`.
+/// Impact on this tree was not confirmed before the port.
+#[test]
+fn oversized_retry_token_is_rejected() {
+    // Token lengths from quinn-proto 0.11.19's `oversized_retry_token`: 64 still fits a
+    // 1200-byte Initial; 1200 does not. The boundary in between depends on header size.
+    for (token_len, fits) in [(64usize, true), (1200, false)] {
+        let (mut client, _server) = make_peer_pair();
+        let now = crate::Instant::now();
+        let mut buf = Vec::new();
+        let transmit = client
+            .conn
+            .as_mut()
+            .unwrap()
+            .poll_transmit(now, 1, &mut buf)
+            .expect("client Initial");
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&buf[..transmit.size]);
+        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
+            &mut Cursor::new(bytes),
+            &FixedLengthConnectionIdParser::new(0),
+            crate::DEFAULT_SUPPORTED_VERSIONS,
+            true,
+        )
+        .expect("client Initial header") else {
+            panic!("expected an Initial packet");
+        };
+
+        let header = Header::Retry {
+            src_cid: ConnectionId::new(&[1; 20]),
+            dst_cid: initial.src_cid,
+            version: initial.version,
+        };
+        let mut retry = Vec::new();
+        header.encode(&mut retry);
+        retry.resize(retry.len() + token_len, 0);
+        let tag = server_config()
+            .crypto
+            .retry_tag(initial.version, &initial.dst_cid, &retry);
+        retry.extend_from_slice(&tag);
+
+        let Some(DatagramEvent::ConnectionEvent(_, event)) = client.endpoint.handle(
+            now,
+            SERVER_ADDR,
+            None,
+            None,
+            BytesMut::from(&retry[..]),
+            &mut buf,
+        ) else {
+            panic!("Retry must be routed to the client connection");
+        };
+        client.conn.as_mut().unwrap().handle_event(event);
+
+        let now = now + crate::Duration::from_secs(1);
+        let crypto_before = client.conn.as_ref().unwrap().stats().frame_tx.crypto;
+        buf.clear();
+        buf.shrink_to_fit();
+        let sent = client
+            .conn
+            .as_mut()
+            .unwrap()
+            .poll_transmit(now, 1, &mut buf)
+            .is_some();
+        assert_eq!(sent, fits, "token {token_len}");
+        if fits {
+            assert!(client.conn.as_ref().unwrap().stats().frame_tx.crypto > crypto_before);
+            assert!(buf.len() <= MIN_INITIAL_SIZE);
+        } else {
+            assert!(
+                buf.capacity() < 64 * 1024,
+                "poll_transmit retained {} bytes after a {}-byte Retry token",
+                buf.capacity(),
+                token_len
+            );
+            assert!(buf.is_empty());
+            let conn = client.conn.as_mut().unwrap();
+            let mut lost = None;
+            while let Some(event) = conn.poll() {
+                if let Event::ConnectionLost { reason } = event {
+                    lost = Some(reason);
+                }
+            }
+            match lost {
+                Some(ConnectionError::TransportError(err))
+                    if err.code == TransportErrorCode::PROTOCOL_VIOLATION => {}
+                other => panic!("expected PROTOCOL_VIOLATION, got {other:?}"),
+            }
+            assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+        }
+    }
 }
