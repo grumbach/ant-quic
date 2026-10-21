@@ -1,0 +1,92 @@
+{
+  "pqc_memory_pool_bench::concurrent_pool_access": {
+    "mean": 136619.97838206365,
+    "lower": 136054.51679969064,
+    "upper": 137117.41684635638
+  },
+  "pqc_memory_pool_bench::direct_ml_kem_public_key": {
+    "mean": 0.3517170348225249,
+    "lower": 0.3513919030789928,
+    "upper": 0.3522670062473734
+  },
+  "pqc_memory_pool_bench::pool_ml_kem_public_key": {
+    "mean": 39.660678704872126,
+    "lower": 39.53959152731634,
+    "upper": 39.80734050755954
+  },
+  "pqc_memory_pool_bench::pool_ml_kem_secret_key": {
+    "mean": 69.43113013412115,
+    "lower": 69.31537524669015,
+    "upper": 69.54622970239933
+  },
+  "quic_benchmarks::bytes/clone_1kb": {
+    "mean": 4.719743082058882,
+    "lower": 4.701552793045722,
+    "upper": 4.7411656172491545
+  },
+  "quic_benchmarks::bytes/create_large": {
+    "mean": 1540.6573392543812,
+    "lower": 1538.4163912297504,
+    "upper": 1544.2694020335036
+  },
+  "quic_benchmarks::bytes/create_medium": {
+    "mean": 25.313439624952263,
+    "lower": 25.262787841684673,
+    "upper": 25.368817514063075
+  },
+  "quic_benchmarks::bytes/create_small": {
+    "mean": 1.7602398625395153,
+    "lower": 1.7577039132398409,
+    "upper": 1.7644822584476718
+  },
+  "quic_benchmarks::duration/as_nanos": {
+    "mean": 1.0548479205628107,
+    "lower": 1.0542975153318466,
+    "upper": 1.0555802760334356
+  },
+  "quic_benchmarks::duration/from_millis": {
+    "mean": 7.027940663385943,
+    "lower": 7.02560843448103,
+    "upper": 7.0306834148704604
+  },
+  "quic_benchmarks::patterns/option_unwrap_or": {
+    "mean": 0.7038955836656557,
+    "lower": 0.7030654400485487,
+    "upper": 0.7049603876657067
+  },
+  "quic_benchmarks::patterns/result_ok": {
+    "mean": 0.7087762417482566,
+    "lower": 0.7077109513362628,
+    "upper": 0.7104395102110532
+  },
+  "quic_benchmarks::transport_error/create_protocol_violation": {
+    "mean": 10.541780860350718,
+    "lower": 10.514938729737636,
+    "upper": 10.583135415650462
+  },
+  "quic_benchmarks::transport_error/create_with_reason": {
+    "mean": 10.556537278515098,
+    "lower": 10.547582294737074,
+    "upper": 10.570161341100217
+  },
+  "quic_benchmarks::varint/compare": {
+    "mean": 1.0790006885608574,
+    "lower": 1.073419600739137,
+    "upper": 1.0863429885908236
+  },
+  "quic_benchmarks::varint/create_large": {
+    "mean": 0.7033666404322545,
+    "lower": 0.7028301149034865,
+    "upper": 0.7040675800065285
+  },
+  "quic_benchmarks::varint/create_medium": {
+    "mean": 0.7088461634245352,
+    "lower": 0.7038948302627505,
+    "upper": 0.7166768605153533
+  },
+  "quic_benchmarks::varint/create_small": {
+    "mean": 0.7032735712915843,
+    "lower": 0.7026910363709775,
+    "upper": 0.704270479030944
+  }
+}
