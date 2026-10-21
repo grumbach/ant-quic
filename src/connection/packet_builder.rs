@@ -38,7 +38,8 @@ impl PacketBuilder {
     /// Write a new packet header to `buffer` and determine the packet's properties
     ///
     /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated, or an Initial token leaves insufficient space for frames.
+    /// violated, or a Retry token leaves insufficient space for frames. An oversized cached
+    /// NEW_TOKEN is discarded and the Initial is rebuilt without it.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -178,8 +179,36 @@ impl PacketBuilder {
         if space_id == SpaceId::Initial
             && (max_size < min_size || max_size.saturating_sub(buffer.len()) < required_frame_space)
         {
+            // A cached NEW_TOKEN is optional. Drop it and connect without it. A Retry token
+            // is not: the peer required it, and it stays a connection error.
+            let cached_new_token = match &conn.side {
+                ConnectionSide::Client { token, .. } => !token.is_empty(),
+                ConnectionSide::Server { .. } => false,
+            } && conn.retry_src_cid.is_none();
             buffer.truncate(partial_encode.start);
-            // Both Retry and cached address validation tokens originate from the peer.
+            if cached_new_token {
+                if let ConnectionSide::Client { token, .. } = &mut conn.side {
+                    *token = Bytes::new();
+                }
+                // `get_tx_number` already consumed this packet number. Rewind so the
+                // rebuilt Initial keeps it.
+                {
+                    let space = &mut conn.spaces[space_id];
+                    debug_assert!(space.next_packet_number > 0);
+                    space.next_packet_number -= 1;
+                    space.sent_with_keys -= 1;
+                }
+                return Self::new(
+                    now,
+                    space_id,
+                    dst_cid,
+                    buffer,
+                    buffer_capacity,
+                    datagram_start,
+                    ack_eliciting,
+                    conn,
+                );
+            }
             conn.kill(
                 TransportError::PROTOCOL_VIOLATION(
                     "Initial token leaves insufficient packet space",
