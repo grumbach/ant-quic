@@ -86,145 +86,139 @@ impl PacketBuilder {
             }
         }
 
-        let space = &mut conn.spaces[space_id];
-        let exact_number = match space_id {
-            SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
-            _ => space.get_tx_number(),
+        let (exact_number, number, sample_size, tag_len) = {
+            let space = &mut conn.spaces[space_id];
+            let exact_number = match space_id {
+                SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
+                _ => space.get_tx_number(),
+            };
+            let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+            let (sample_size, tag_len) = if let Some(ref crypto) = space.crypto {
+                (
+                    crypto.header.local.sample_size(),
+                    crypto.packet.local.tag_len(),
+                )
+            } else if space_id == SpaceId::Data {
+                let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
+                (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
+            } else {
+                unreachable!();
+            };
+            (exact_number, number, sample_size, tag_len)
         };
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
-
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
-        let header = match space_id {
-            SpaceId::Data if space.crypto.is_some() => Header::Short {
-                dst_cid,
-                number,
-                spin: if conn.spin_enabled {
-                    conn.spin
-                } else {
-                    conn.rng.r#gen::<bool>()
-                },
-                key_phase: conn.key_phase,
-            },
-            SpaceId::Data => Header::Long {
-                ty: LongType::ZeroRtt,
-                src_cid: conn.handshake_cid,
-                dst_cid,
-                number,
-                version,
-            },
-            SpaceId::Handshake => Header::Long {
-                ty: LongType::Handshake,
-                src_cid: conn.handshake_cid,
-                dst_cid,
-                number,
-                version,
-            },
-            SpaceId::Initial => Header::Initial(InitialHeader {
-                src_cid: conn.handshake_cid,
-                dst_cid,
-                token: match &conn.side {
-                    ConnectionSide::Client { token, .. } => token.clone(),
-                    ConnectionSide::Server { .. } => Bytes::new(),
-                },
-                number,
-                version,
-            }),
-        };
-        let partial_encode = match header.try_encode(buffer) {
-            Ok(encode) => encode,
-            Err(_) => {
-                conn.handle_encode_error(now, "Header");
-                return None;
-            }
-        };
-        if conn.peer_params.grease_quic_bit && conn.rng.r#gen::<bool>() {
-            buffer[partial_encode.start] ^= FIXED_BIT;
-        }
-
-        let (sample_size, tag_len) = if let Some(ref crypto) = space.crypto {
-            (
-                crypto.header.local.sample_size(),
-                crypto.packet.local.tag_len(),
-            )
-        } else if space_id == SpaceId::Data {
-            let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
-            (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
-        } else {
-            unreachable!();
-        };
 
         // Each packet must be large enough for header protection sampling, i.e. the combined
         // lengths of the encoded packet number and protected payload must be at least 4 bytes
         // longer than the sample required for header protection. Further, each packet should be at
         // least tag_len + 6 bytes larger than the destination CID on incoming packets so that the
         // peer may send stateless resets that are indistinguishable from regular traffic.
-
+        //
         // pn_len + payload_len + tag_len >= sample_size + 4
         // payload_len >= sample_size + 4 - pn_len - tag_len
-        let min_size = Ord::max(
-            buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
-            partial_encode.start + dst_cid.len() + 6,
-        );
-        let max_size = buffer_capacity.saturating_sub(tag_len);
+        //
         // A peer-provided Initial token can consume the space needed after the header.
         // Leave room for both a CONNECTION_CLOSE and a CRYPTO frame with data. The
         // CRYPTO writer uses a strict `< max_size` check, hence the extra byte;
         // CONNECTION_CLOSE can exactly fill the available space.
         // Same limit as quinn-proto 0.11.19 (GHSA-wppq-2f6r-wfvm).
-        let required_frame_space = Ord::max(
-            frame::Crypto::SIZE_BOUND + 1,
-            frame::ConnectionClose::SIZE_BOUND,
-        );
-        if space_id == SpaceId::Initial
-            && (max_size < min_size || max_size.saturating_sub(buffer.len()) < required_frame_space)
-        {
-            // A cached NEW_TOKEN is optional. Drop it and connect without it. A Retry token
-            // is not: the peer required it, and it stays a connection error.
-            let cached_new_token = match &conn.side {
-                ConnectionSide::Client { token, .. } => !token.is_empty(),
-                ConnectionSide::Server { .. } => false,
-            } && conn.retry_src_cid.is_none();
-            buffer.truncate(partial_encode.start);
-            if cached_new_token {
-                if let ConnectionSide::Client { token, .. } = &mut conn.side {
-                    *token = Bytes::new();
-                }
-                // `get_tx_number` already consumed this packet number. Rewind so the
-                // rebuilt Initial keeps it.
-                {
-                    let space = &mut conn.spaces[space_id];
-                    debug_assert!(space.next_packet_number > 0);
-                    space.next_packet_number -= 1;
-                    space.sent_with_keys -= 1;
-                }
-                return Self::new(
-                    now,
-                    space_id,
+        // A cached NEW_TOKEN that does not fit is cleared and this header is rebuilt with the
+        // packet number already allocated. A Retry token that does not fit is fatal.
+        let mut dropped_cached_token = false;
+        let (partial_encode, min_size, max_size, short_header) = loop {
+            let header = match space_id {
+                SpaceId::Data if conn.spaces[space_id].crypto.is_some() => Header::Short {
                     dst_cid,
-                    buffer,
-                    buffer_capacity,
-                    datagram_start,
-                    ack_eliciting,
-                    conn,
-                );
+                    number,
+                    spin: if conn.spin_enabled {
+                        conn.spin
+                    } else {
+                        conn.rng.r#gen::<bool>()
+                    },
+                    key_phase: conn.key_phase,
+                },
+                SpaceId::Data => Header::Long {
+                    ty: LongType::ZeroRtt,
+                    src_cid: conn.handshake_cid,
+                    dst_cid,
+                    number,
+                    version,
+                },
+                SpaceId::Handshake => Header::Long {
+                    ty: LongType::Handshake,
+                    src_cid: conn.handshake_cid,
+                    dst_cid,
+                    number,
+                    version,
+                },
+                SpaceId::Initial => Header::Initial(InitialHeader {
+                    src_cid: conn.handshake_cid,
+                    dst_cid,
+                    token: match &conn.side {
+                        ConnectionSide::Client { token, .. } => token.clone(),
+                        ConnectionSide::Server { .. } => Bytes::new(),
+                    },
+                    number,
+                    version,
+                }),
+            };
+            let partial_encode = match header.try_encode(buffer) {
+                Ok(encode) => encode,
+                Err(_) => {
+                    conn.handle_encode_error(now, "Header");
+                    return None;
+                }
+            };
+            if conn.peer_params.grease_quic_bit && conn.rng.r#gen::<bool>() {
+                buffer[partial_encode.start] ^= FIXED_BIT;
             }
-            conn.kill(
-                TransportError::PROTOCOL_VIOLATION(
-                    "Initial token leaves insufficient packet space",
-                )
-                .into(),
+
+            let min_size = Ord::max(
+                buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
+                partial_encode.start + dst_cid.len() + 6,
             );
-            return None;
-        }
-        debug_assert!(max_size >= min_size);
+            let max_size = buffer_capacity.saturating_sub(tag_len);
+            let required_frame_space = Ord::max(
+                frame::Crypto::SIZE_BOUND + 1,
+                frame::ConnectionClose::SIZE_BOUND,
+            );
+            if space_id == SpaceId::Initial
+                && (max_size < min_size
+                    || max_size.saturating_sub(buffer.len()) < required_frame_space)
+            {
+                let cached_new_token = !dropped_cached_token
+                    && conn.retry_src_cid.is_none()
+                    && matches!(
+                        &conn.side,
+                        ConnectionSide::Client { token, .. } if !token.is_empty()
+                    );
+                buffer.truncate(partial_encode.start);
+                if cached_new_token {
+                    if let ConnectionSide::Client { token, .. } = &mut conn.side {
+                        *token = Bytes::new();
+                    }
+                    dropped_cached_token = true;
+                    continue;
+                }
+                conn.kill(
+                    TransportError::PROTOCOL_VIOLATION(
+                        "Initial token leaves insufficient packet space",
+                    )
+                    .into(),
+                );
+                return None;
+            }
+            debug_assert!(max_size >= min_size);
+            break (partial_encode, min_size, max_size, header.is_short());
+        };
 
         Some(Self {
             datagram_start,
             space: space_id,
             partial_encode,
             exact_number,
-            short_header: header.is_short(),
+            short_header,
             min_size,
             max_size,
             tag_len,

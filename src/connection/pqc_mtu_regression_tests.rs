@@ -37,16 +37,17 @@ use bytes::{Bytes, BytesMut};
 use super::ConnectionSide;
 use crate::{
     ClientConfig, Connection, ConnectionError, ConnectionHandle, ConnectionId, EndpointConfig,
-    Event, ServerConfig, TransportConfig, TransportErrorCode,
+    Event, ServerConfig, TransportConfig, TransportErrorCode, VarInt,
     crypto::{
+        self,
         pqc::PqcConfig,
         rustls::{QuicClientConfig, QuicServerConfig, configured_provider_with_pqc},
     },
     endpoint::{DatagramEvent, Endpoint},
-    frame::{self, FrameStruct},
+    frame::{self, Frame, FrameStruct},
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, ProtectedHeader,
-        SpaceId,
+        FixedLengthConnectionIdParser, Header, InitialHeader, PacketNumber, PartialDecode,
+        ProtectedHeader, SpaceId,
     },
 };
 
@@ -510,373 +511,223 @@ fn coordinated_path_challenge_is_padded_and_decoded_by_peer() {
     assert_eq!(transmit.size, MIN_INITIAL_SIZE);
 }
 
-/// GHSA-wppq-2f6r-wfvm: a Retry whose token leaves no room for a CRYPTO or
-/// CONNECTION_CLOSE frame must close the connection instead of building an Initial.
-/// The limit is quinn-proto 0.11.19's `max(Crypto::SIZE_BOUND + 1, ConnectionClose::SIZE_BOUND)`.
-/// Impact on this tree was not confirmed before the port.
-#[test]
-fn oversized_retry_token_is_rejected() {
-    // Token lengths from quinn-proto 0.11.19's `oversized_retry_token`: 64 still fits a
-    // 1200-byte Initial; 1200 does not. The boundary in between depends on header size.
-    for (token_len, fits) in [(64usize, true), (1200, false)] {
-        let (mut client, _server) = make_peer_pair();
-        let now = crate::Instant::now();
-        let mut buf = Vec::new();
-        let transmit = client
-            .conn
-            .as_mut()
-            .unwrap()
-            .poll_transmit(now, 1, &mut buf)
-            .expect("client Initial");
-        let mut bytes = BytesMut::new();
-        bytes.extend_from_slice(&buf[..transmit.size]);
-        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
-            &mut Cursor::new(bytes),
-            &FixedLengthConnectionIdParser::new(0),
-            crate::DEFAULT_SUPPORTED_VERSIONS,
-            true,
-        )
-        .expect("client Initial header") else {
-            panic!("expected an Initial packet");
-        };
-
-        let header = Header::Retry {
-            src_cid: ConnectionId::new(&[1; 20]),
-            dst_cid: initial.src_cid,
-            version: initial.version,
-        };
-        let mut retry = Vec::new();
-        header.encode(&mut retry);
-        retry.resize(retry.len() + token_len, 0);
-        let tag = server_config()
-            .crypto
-            .retry_tag(initial.version, &initial.dst_cid, &retry);
-        retry.extend_from_slice(&tag);
-
-        let Some(DatagramEvent::ConnectionEvent(_, event)) = client.endpoint.handle(
-            now,
-            SERVER_ADDR,
-            None,
-            None,
-            BytesMut::from(&retry[..]),
-            &mut buf,
-        ) else {
-            panic!("Retry must be routed to the client connection");
-        };
-        client.conn.as_mut().unwrap().handle_event(event);
-
-        let now = now + crate::Duration::from_secs(1);
-        let crypto_before = client.conn.as_ref().unwrap().stats().frame_tx.crypto;
-        buf.clear();
-        buf.shrink_to_fit();
-        let sent = client
-            .conn
-            .as_mut()
-            .unwrap()
-            .poll_transmit(now, 1, &mut buf)
-            .is_some();
-        assert_eq!(sent, fits, "token {token_len}");
-        if fits {
-            assert!(client.conn.as_ref().unwrap().stats().frame_tx.crypto > crypto_before);
-            assert!(buf.len() <= MIN_INITIAL_SIZE);
-        } else {
-            assert!(
-                buf.capacity() < 64 * 1024,
-                "poll_transmit retained {} bytes after a {}-byte Retry token",
-                buf.capacity(),
-                token_len
-            );
-            assert!(buf.is_empty());
-            let conn = client.conn.as_mut().unwrap();
-            let mut lost = None;
-            while let Some(event) = conn.poll() {
-                if let Event::ConnectionLost { reason } = event {
-                    lost = Some(reason);
-                }
-            }
-            match lost {
-                Some(ConnectionError::TransportError(err))
-                    if err.code == TransportErrorCode::PROTOCOL_VIOLATION => {}
-                other => panic!("expected PROTOCOL_VIOLATION, got {other:?}"),
-            }
-            assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
-        }
+fn decode_initial(buf: &[u8]) -> crate::packet::ProtectedInitialHeader {
+    let bytes = BytesMut::from(buf);
+    match ProtectedHeader::decode(
+        &mut Cursor::new(bytes),
+        &FixedLengthConnectionIdParser::new(0),
+        crate::DEFAULT_SUPPORTED_VERSIONS,
+        true,
+    )
+    .expect("Initial header")
+    {
+        ProtectedHeader::Initial(initial) => initial,
+        _ => panic!("expected an Initial packet"),
     }
 }
 
-/// Bytes of an Initial header with a token of `token_len`, using the same layout
-/// `PacketBuilder` writes (empty buffer, so the header starts at 0).
-fn encoded_initial_header_len(
-    src_cid: ConnectionId,
-    dst_cid: ConnectionId,
-    version: u32,
-    packet_number: u64,
-    largest_acked: u64,
-    token_len: usize,
-) -> usize {
+fn inject_retry(client: &mut Peer, token_len: usize) {
+    let now = crate::Instant::now();
+    let mut buf = Vec::new();
+    let transmit = client
+        .conn
+        .as_mut()
+        .unwrap()
+        .poll_transmit(now, 1, &mut buf)
+        .expect("client Initial");
+    let initial = decode_initial(&buf[..transmit.size]);
+    let header = Header::Retry {
+        src_cid: ConnectionId::new(&[1; 20]),
+        dst_cid: initial.src_cid,
+        version: initial.version,
+    };
+    let mut retry = Vec::new();
+    header.encode(&mut retry);
+    retry.resize(retry.len() + token_len, 0);
+    let tag = server_config()
+        .crypto
+        .retry_tag(initial.version, &initial.dst_cid, &retry);
+    retry.extend_from_slice(&tag);
+    let Some(DatagramEvent::ConnectionEvent(_, event)) = client.endpoint.handle(
+        now,
+        SERVER_ADDR,
+        None,
+        None,
+        BytesMut::from(&retry[..]),
+        &mut buf,
+    ) else {
+        panic!("Retry must be routed to the client connection");
+    };
+    client.conn.as_mut().unwrap().handle_event(event);
+}
+
+fn assert_closed_with_protocol_violation(conn: &mut Connection) {
+    let mut lost = None;
+    while let Some(event) = conn.poll() {
+        if let Event::ConnectionLost { reason } = event {
+            lost = Some(reason);
+        }
+    }
+    match lost {
+        Some(ConnectionError::TransportError(err))
+            if err.code == TransportErrorCode::PROTOCOL_VIOLATION => {}
+        other => panic!("expected PROTOCOL_VIOLATION, got {other:?}"),
+    }
+}
+
+fn encoded_initial_header_len(conn: &Connection, token_len: usize) -> usize {
+    let space = &conn.spaces[SpaceId::Initial];
     let header = Header::Initial(InitialHeader {
-        src_cid,
-        dst_cid,
+        src_cid: conn.handshake_cid,
+        dst_cid: conn.rem_cids.active(),
         token: Bytes::from(vec![0u8; token_len]),
-        number: PacketNumber::new(packet_number, largest_acked),
-        version,
+        number: PacketNumber::new(
+            space.next_packet_number,
+            space.largest_acked_packet.unwrap_or(0),
+        ),
+        version: conn.version,
     });
     let mut encoded = Vec::new();
     header.encode(&mut encoded);
     encoded.len()
 }
 
-/// Token length that leaves exactly `frame_space` bytes between the encoded Initial
-/// header and the AEAD tag. The caller checks that `max_size >= min_size`, which is
-/// the other arm of the same `if`.
-fn token_len_leaving_frame_space(
-    src_cid: ConnectionId,
-    dst_cid: ConnectionId,
-    version: u32,
-    packet_number: u64,
-    largest_acked: u64,
-    sample_size: usize,
-    tag_len: usize,
-    mtu: usize,
-    frame_space: usize,
-) -> usize {
-    let max_size = mtu - tag_len;
-    // 64 shares the two-byte token-length varint with the lengths this derives.
-    let overhead =
-        encoded_initial_header_len(src_cid, dst_cid, version, packet_number, largest_acked, 64)
-            - 64;
+/// Token length that leaves exactly `frame_space` bytes after the Initial header.
+/// Asserts `max_size >= min_size`, so only the frame-space check can reject it.
+fn token_len_leaving_frame_space(conn: &Connection, frame_space: usize) -> usize {
+    let crypto = conn.spaces[SpaceId::Initial]
+        .crypto
+        .as_ref()
+        .expect("initial keys");
+    let tag_len = crypto.packet.local.tag_len();
+    let sample_size = crypto.header.local.sample_size();
+    let max_size = usize::from(conn.current_mtu()) - tag_len;
+    let overhead = encoded_initial_header_len(conn, 64) - 64;
     let token_len = max_size - frame_space - overhead;
-    let header_len = encoded_initial_header_len(
-        src_cid,
-        dst_cid,
-        version,
-        packet_number,
-        largest_acked,
-        token_len,
+    let header_len = encoded_initial_header_len(conn, token_len);
+    assert_eq!(max_size - header_len, frame_space, "token {token_len}");
+    let number = PacketNumber::new(
+        conn.spaces[SpaceId::Initial].next_packet_number,
+        conn.spaces[SpaceId::Initial]
+            .largest_acked_packet
+            .unwrap_or(0),
     );
-    assert_eq!(
-        max_size.saturating_sub(header_len),
-        frame_space,
-        "token {token_len} produced header {header_len}, not {frame_space} bytes of frame space"
-    );
-    let number = PacketNumber::new(packet_number, largest_acked);
     let min_size = Ord::max(
         header_len + (sample_size + 4).saturating_sub(number.len() + tag_len),
-        dst_cid.len() + 6,
+        conn.rem_cids.active().len() + 6,
     );
     assert!(
         max_size >= min_size,
-        "token {token_len} has max_size {max_size} < min_size {min_size}; only the frame-space check may decide this case"
+        "token {token_len} has max_size {max_size} < min_size {min_size}"
     );
     token_len
 }
 
 fn required_initial_frame_space() -> usize {
-    // Same expression as `PacketBuilder::new`. 25 in this tree: Crypto::SIZE_BOUND is 17.
     Ord::max(
         frame::Crypto::SIZE_BOUND + 1,
         frame::ConnectionClose::SIZE_BOUND,
     )
 }
 
-/// GHSA-wppq-2f6r-wfvm frame-space arm, on its own.
-///
-/// A Retry token that leaves exactly `required_frame_space` bytes still carries a CRYPTO
-/// frame. One byte less closes with PROTOCOL_VIOLATION. Both lengths satisfy
-/// `max_size >= min_size`, so deleting the 25-byte comparison makes the short case pass.
+fn non_padding_frames(conn: &Connection, datagram: &[u8]) -> Vec<Frame> {
+    let keys = conn.spaces[SpaceId::Initial]
+        .crypto
+        .as_ref()
+        .expect("initial keys");
+    let (partial, rest) = PartialDecode::new(
+        BytesMut::from(datagram),
+        &FixedLengthConnectionIdParser::new(0),
+        crate::DEFAULT_SUPPORTED_VERSIONS,
+        true,
+    )
+    .expect("decode datagram");
+    assert!(rest.is_none());
+    let mut packet = partial
+        .finish(Some(&*keys.header.local as &dyn crypto::HeaderKey))
+        .expect("unprotect header");
+    let pn = packet.header.number().unwrap().expand(0);
+    keys.packet
+        .local
+        .decrypt(pn, &packet.header_data, &mut packet.payload)
+        .expect("decrypt payload");
+    frame::Iter::new(packet.payload.freeze())
+        .expect("frames")
+        .map(|frame| frame.expect("frame"))
+        .filter(|frame| !matches!(frame, Frame::Padding))
+        .collect()
+}
+
+/// GHSA-wppq-2f6r-wfvm. 64 and exactly 25 bytes of frame space still send.
+/// 24 bytes is rejected only by the frame-space check. 1200 bytes also fails
+/// `max_size < min_size`.
 #[test]
 fn retry_token_frame_space_boundary() {
     let required = required_initial_frame_space();
-    assert_eq!(required, 25, "quinn-proto 0.11.19 frame-space cap");
+    assert_eq!(required, 25);
+    let (probe, _) = make_peer_pair();
+    let probe = probe.conn.as_ref().unwrap();
+    assert_eq!(probe.rem_cids.active().len(), 20);
+    let exact = token_len_leaving_frame_space(probe, required);
+    let short = token_len_leaving_frame_space(probe, required - 1);
 
-    for frame_space in [required, required - 1] {
+    for (label, token_len, fits) in [
+        ("64", 64usize, true),
+        ("25 bytes", exact, true),
+        ("24 bytes", short, false),
+        ("1200", 1200, false),
+    ] {
         let (mut client, _server) = make_peer_pair();
-        let now = crate::Instant::now();
-        let mut buf = Vec::new();
-        let transmit = client
-            .conn
-            .as_mut()
-            .unwrap()
-            .poll_transmit(now, 1, &mut buf)
-            .expect("client Initial");
-        let mut bytes = BytesMut::new();
-        bytes.extend_from_slice(&buf[..transmit.size]);
-        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
-            &mut Cursor::new(bytes),
-            &FixedLengthConnectionIdParser::new(0),
-            crate::DEFAULT_SUPPORTED_VERSIONS,
-            true,
-        )
-        .expect("client Initial header") else {
-            panic!("expected an Initial packet");
-        };
-
-        let (token_len, src_cid, packet_number) = {
-            let conn = client.conn.as_ref().unwrap();
-            let crypto = conn.spaces[SpaceId::Initial]
-                .crypto
-                .as_ref()
-                .expect("initial keys");
-            let packet_number = conn.spaces[SpaceId::Initial].next_packet_number;
-            let token_len = token_len_leaving_frame_space(
-                conn.handshake_cid,
-                ConnectionId::new(&[1; 20]),
-                conn.version,
-                packet_number,
-                0,
-                crypto.header.local.sample_size(),
-                crypto.packet.local.tag_len(),
-                usize::from(conn.current_mtu()),
-                frame_space,
-            );
-            (token_len, conn.handshake_cid, packet_number)
-        };
-
-        let header = Header::Retry {
-            src_cid: ConnectionId::new(&[1; 20]),
-            dst_cid: initial.src_cid,
-            version: initial.version,
-        };
-        let mut retry = Vec::new();
-        header.encode(&mut retry);
-        retry.resize(retry.len() + token_len, 0);
-        let tag = server_config()
-            .crypto
-            .retry_tag(initial.version, &initial.dst_cid, &retry);
-        retry.extend_from_slice(&tag);
-        let Some(DatagramEvent::ConnectionEvent(_, event)) = client.endpoint.handle(
-            now,
-            SERVER_ADDR,
-            None,
-            None,
-            BytesMut::from(&retry[..]),
-            &mut buf,
-        ) else {
-            panic!("Retry must be routed to the client connection");
-        };
-        client.conn.as_mut().unwrap().handle_event(event);
-
-        {
-            let conn = client.conn.as_ref().unwrap();
-            assert_eq!(conn.handshake_cid, src_cid);
-            assert_eq!(conn.rem_cids.active(), ConnectionId::new(&[1; 20]));
-            assert_eq!(
-                conn.spaces[SpaceId::Initial].next_packet_number,
-                packet_number
-            );
-            assert!(conn.spaces[SpaceId::Initial].largest_acked_packet.is_none());
-            assert!(conn.retry_src_cid.is_some());
-        }
-
-        let now = now + crate::Duration::from_secs(1);
+        inject_retry(&mut client, token_len);
+        let now = crate::Instant::now() + crate::Duration::from_secs(1);
         let crypto_before = client.conn.as_ref().unwrap().stats().frame_tx.crypto;
-        buf.clear();
-        buf.shrink_to_fit();
+        let mut buf = Vec::new();
         let sent = client
             .conn
             .as_mut()
             .unwrap()
             .poll_transmit(now, 1, &mut buf);
-        if frame_space == required {
-            let transmit = sent.expect("exactly 25 bytes of frame space still sends");
+        if fits {
+            assert!(sent.is_some(), "{label} (token {token_len}) must send");
             assert!(client.conn.as_ref().unwrap().stats().frame_tx.crypto > crypto_before);
             assert!(buf.len() <= MIN_INITIAL_SIZE);
-            let ProtectedHeader::Initial(sent_initial) = ProtectedHeader::decode(
-                &mut Cursor::new(BytesMut::from(&buf[..transmit.size])),
-                &FixedLengthConnectionIdParser::new(0),
-                crate::DEFAULT_SUPPORTED_VERSIONS,
-                true,
-            )
-            .expect("sent Initial header") else {
-                panic!("expected an Initial packet");
-            };
-            assert_eq!(sent_initial.token_pos.len(), token_len);
-            let mut lost = false;
-            while let Some(event) = client.conn.as_mut().unwrap().poll() {
-                if matches!(event, Event::ConnectionLost { .. }) {
-                    lost = true;
-                }
-            }
-            assert!(!lost, "a token that leaves exactly 25 bytes must not close");
         } else {
-            assert!(sent.is_none(), "24 bytes of frame space must not send");
+            assert!(sent.is_none(), "{label} (token {token_len}) must not send");
+            assert!(buf.is_empty());
             assert!(
                 buf.capacity() < 64 * 1024,
-                "poll_transmit retained {} bytes",
+                "retained {} bytes",
                 buf.capacity()
             );
-            assert!(buf.is_empty());
-            let conn = client.conn.as_mut().unwrap();
-            let mut lost = None;
-            while let Some(event) = conn.poll() {
-                if let Event::ConnectionLost { reason } = event {
-                    lost = Some(reason);
-                }
-            }
-            match lost {
-                Some(ConnectionError::TransportError(err))
-                    if err.code == TransportErrorCode::PROTOCOL_VIOLATION => {}
-                other => panic!("expected PROTOCOL_VIOLATION, got {other:?}"),
-            }
-            assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+            assert_closed_with_protocol_violation(client.conn.as_mut().unwrap());
         }
     }
 }
 
-/// A cached NEW_TOKEN that fails the frame-space check is discarded. The client sends
-/// the Initial without it and stays open. The same length in a Retry is fatal.
+/// A cached NEW_TOKEN that leaves 24 bytes of frame space is dropped. The same
+/// length carried by a Retry is fatal.
 #[test]
 fn oversized_cached_new_token_is_dropped() {
     let (mut client, _server) = make_peer_pair();
-    let frame_space = required_initial_frame_space() - 1;
-    let token_len = {
-        let conn = client.conn.as_ref().unwrap();
-        let crypto = conn.spaces[SpaceId::Initial]
-            .crypto
-            .as_ref()
-            .expect("initial keys");
-        assert!(conn.retry_src_cid.is_none());
-        token_len_leaving_frame_space(
-            conn.handshake_cid,
-            conn.rem_cids.active(),
-            conn.version,
-            conn.spaces[SpaceId::Initial].next_packet_number,
-            conn.spaces[SpaceId::Initial]
-                .largest_acked_packet
-                .unwrap_or(0),
-            crypto.header.local.sample_size(),
-            crypto.packet.local.tag_len(),
-            usize::from(conn.current_mtu()),
-            frame_space,
-        )
-    };
+    let token_len = token_len_leaving_frame_space(
+        client.conn.as_ref().unwrap(),
+        required_initial_frame_space() - 1,
+    );
     match &mut client.conn.as_mut().unwrap().side {
         ConnectionSide::Client { token, .. } => *token = Bytes::from(vec![0u8; token_len]),
         ConnectionSide::Server { .. } => panic!("expected a client connection"),
     }
-
     let now = crate::Instant::now();
     let mut buf = Vec::new();
-    let crypto_before = client.conn.as_ref().unwrap().stats().frame_tx.crypto;
     let transmit = client
         .conn
         .as_mut()
         .unwrap()
         .poll_transmit(now, 1, &mut buf)
         .expect("cached NEW_TOKEN is dropped and the Initial is sent");
-    assert!(client.conn.as_ref().unwrap().stats().frame_tx.crypto > crypto_before);
     assert!(transmit.size <= MIN_INITIAL_SIZE);
-    assert!(buf.capacity() < 64 * 1024);
-    let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
-        &mut Cursor::new(BytesMut::from(&buf[..transmit.size])),
-        &FixedLengthConnectionIdParser::new(0),
-        crate::DEFAULT_SUPPORTED_VERSIONS,
-        true,
-    )
-    .expect("sent Initial header") else {
-        panic!("expected an Initial packet");
-    };
-    assert_eq!(initial.token_pos.len(), 0, "cached token must not be sent");
+    assert_eq!(decode_initial(&buf[..transmit.size]).token_pos.len(), 0);
+    assert!(client.conn.as_ref().unwrap().stats().frame_tx.crypto > 0);
     let mut lost = false;
     while let Some(event) = client.conn.as_mut().unwrap().poll() {
         if matches!(event, Event::ConnectionLost { .. }) {
@@ -884,4 +735,38 @@ fn oversized_cached_new_token_is_dropped() {
         }
     }
     assert!(!lost);
+}
+
+/// Closing at exactly 25 bytes of frame space must emit CONNECTION_CLOSE and
+/// must not panic, even when ACKs are pending.
+#[test]
+fn retry_boundary_emits_connection_close() {
+    let (mut client, _server) = make_peer_pair();
+    let token_len = token_len_leaving_frame_space(
+        client.conn.as_ref().unwrap(),
+        required_initial_frame_space(),
+    );
+    inject_retry(&mut client, token_len);
+    let now = crate::Instant::now();
+    let conn = client.conn.as_mut().unwrap();
+    for pn in (0..32).step_by(2) {
+        conn.spaces[SpaceId::Initial]
+            .pending_acks
+            .insert_one(pn, now);
+    }
+    conn.close(now, VarInt::from_u32(0), Bytes::new());
+    let mut buf = Vec::new();
+    let transmit = conn
+        .poll_transmit(now, 1, &mut buf)
+        .expect("close packet at the 25-byte boundary");
+    assert!(buf.len() <= MIN_INITIAL_SIZE);
+    let frames = non_padding_frames(conn, &buf[..transmit.size]);
+    assert!(
+        frames.iter().any(|frame| matches!(frame, Frame::Close(_))),
+        "expected CONNECTION_CLOSE, got {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|frame| !matches!(frame, Frame::Ack(_))),
+        "ACK must yield the 25-byte close budget, got {frames:?}"
+    );
 }
